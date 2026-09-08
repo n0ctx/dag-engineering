@@ -777,6 +777,15 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
     reseal = dag.get("reseal")
     if reseal is not None and not (isinstance(reseal, dict) and is_text(reseal.get("reason"))):
         errors.append("reseal: must be null or an object carrying a reason")
+
+    replans = dag.get("replans")
+    if replans is not None:
+        if not isinstance(replans, list):
+            errors.append("replans: must be null or an array")
+        else:
+            for index, entry in enumerate(replans):
+                if not isinstance(entry, dict) or not is_text(entry.get("ref")) or not is_timestamp(entry.get("at")):
+                    errors.append(f"replans[{index}]: must record a draft ref and a UTC timestamp")
     review = dag.get("decomposition_review")
     if review is not None:
         if not isinstance(review, dict):
@@ -1625,16 +1634,8 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     return f"created {candidate['dag_id']} with {len(candidate['nodes'])} nodes from {draft_ref}"
 
 
-def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
-    """Replace an unapproved plan from a draft, which is how review findings get fixed."""
-    if dag["planning_status"] not in {"draft", "awaiting_approval"}:
-        raise DagError(
-            f"planning_status is {dag['planning_status']!r}; an approved plan changes through "
-            "--planning-status replan_required or a gap-plan import, not --amend"
-        )
-    started = [node["id"] for node in dag["nodes"] if node["attempts"]]
-    if started:
-        raise DagError(f"nodes already have attempts and cannot be replanned this way: {', '.join(started)}")
+def load_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> tuple[dict[str, Any], Path]:
+    """Load and validate a proposed plan, refusing one that belongs to a different effort."""
     draft = Path(draft_ref)
     if not draft.is_absolute():
         draft = project_root(dag_path) / draft
@@ -1646,13 +1647,93 @@ def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
         raise DagError("draft is not a valid DAG: " + "; ".join(errors))
     if candidate["dag_id"] != dag["dag_id"]:
         raise DagError(f"draft dag_id must stay {dag['dag_id']!r}; a different effort is a new control plane")
+    return candidate, draft.resolve()
+
+
+def replan_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
+    """Rework an approved plan mid-flight without losing what already ran.
+
+    Work the controller has not started is fully editable: nodes can be added, dropped, and
+    re-sliced. What ran is not. Attempts and handoffs are the audit trail, and a completed
+    node's contract is frozen too, because its diff was accepted against that exact contract.
+    """
+    if dag["planning_status"] != "replan_required":
+        raise DagError(
+            f"planning_status is {dag['planning_status']!r}; record why the plan no longer fits with "
+            "--planning-status replan_required --reference \"<durable path>\" before replanning"
+        )
+    if dag["convergence"]["status"] == "failed":
+        raise DagError(
+            "failed convergence is repaired with --add-gap-nodes, which must address exactly the recorded gaps"
+        )
+    running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
+    if running:
+        raise DagError(f"settle running nodes before replanning: {', '.join(running)}")
+
+    candidate, _ = load_draft(dag_path, dag, draft_ref)
+    proposed = node_map(candidate)
+    current = node_map(dag)
+    kept, dropped = [], []
+    for node_id, node in current.items():
+        if not node["attempts"]:
+            if node_id not in proposed:
+                dropped.append(node_id)
+            continue
+        replacement = proposed.get(node_id)
+        if replacement is None:
+            raise DagError(f"{node_id!r} has an execution record and cannot be dropped by a replan")
+        for field in ("status", "attempts", "handoff"):
+            if replacement.get(field) != node[field]:
+                raise DagError(f"{node_id!r}: a replan cannot rewrite {field}, which is the execution record")
+        if node["status"] == "done":
+            changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node[field]]
+            if changed:
+                raise DagError(
+                    f"{node_id!r} is done and its contract is frozen, because its diff was accepted "
+                    f"against it; changed: {', '.join(changed)}"
+                )
+        kept.append(node_id)
+    added = [node_id for node_id in proposed if node_id not in current]
+
+    candidate["decomposition_review"] = None
+    candidate["planning_session"] = dag.get("planning_session")
+    candidate["planning_status"] = "awaiting_approval"
+    candidate["approval_ref"] = None
+    candidate["replans"] = list(dag.get("replans") or []) + [
+        {"ref": draft_ref, "at": utc_now(), "added": added, "dropped": dropped, "kept": kept}
+    ]
+    errors, _ = validate_dag(candidate)
+    if errors:
+        raise DagError("replan would produce invalid DAG: " + "; ".join(errors))
+    dag.clear()
+    dag.update(candidate)
+    return (
+        f"replanned {dag['dag_id']}: +{len(added)} -{len(dropped)} node(s), {len(kept)} with an "
+        "execution record preserved; planning_status -> awaiting_approval"
+    )
+
+
+def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
+    """Replace an unapproved plan from a draft, which is how review findings get fixed."""
+    if dag["planning_status"] not in {"draft", "awaiting_approval"}:
+        raise DagError(
+            f"planning_status is {dag['planning_status']!r}; an approved plan is reworked with "
+            "--planning-status replan_required followed by --replan, not --amend"
+        )
+    started = [node["id"] for node in dag["nodes"] if node["attempts"]]
+    if started:
+        raise DagError(
+            f"nodes already have an execution record and --amend would discard it: {', '.join(started)}; "
+            "use --planning-status replan_required followed by --replan"
+        )
+    candidate, draft = load_draft(dag_path, dag, draft_ref)
     if candidate["planning_status"] not in {"draft", "awaiting_approval"}:
         raise DagError("an amended plan is still unapproved; approval runs through --planning-status")
     candidate["decomposition_review"] = None
     candidate["planning_session"] = dag.get("planning_session")
     dag.clear()
     dag.update(candidate)
-    draft.resolve().unlink()
+    draft.unlink()
     return f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes; decomposition review cleared"
 
 
@@ -1702,6 +1783,7 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
+    parser.add_argument("--replan", metavar="DRAFT", help="rework an approved plan, preserving every execution record")
     parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
@@ -1729,6 +1811,7 @@ def cmd_update(argv: list[str]) -> int:
             args.init,
             args.decomposition_review,
             args.amend,
+            args.replan,
             args.reseal,
             args.archive,
             args.abandon,
@@ -1738,7 +1821,7 @@ def cmd_update(argv: list[str]) -> int:
     if operations != 1:
         parser.error(
             "choose exactly one node, planning-status, convergence, gap-plan, init, "
-            "decomposition-review, amend, reseal, archive, or abandon operation"
+            "decomposition-review, amend, replan, reseal, archive, or abandon operation"
         )
     if args.reseal and not args.reason:
         parser.error("--reseal requires --reason recording why the control file needed repair")
@@ -1770,6 +1853,8 @@ def cmd_update(argv: list[str]) -> int:
                 message = record_design_review(args.dag, dag, args.decomposition_review)
             elif args.amend:
                 message = amend_dag(args.dag, dag, args.amend)
+            elif args.replan:
+                message = replan_dag(args.dag, dag, args.replan)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),

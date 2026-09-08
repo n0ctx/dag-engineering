@@ -587,6 +587,95 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("update-task", "--amend", ref, expect=3)
         self.assertIn("must stay 'fixture'", result.stderr)
 
+    def broken_plan(self, nodes):
+        """An approved DAG with A done, declared no longer fit for purpose."""
+        self.awaiting(nodes)
+        self.approve_as("session-plan")
+        self.complete("A")
+        self.run_cmd("update-task", "--planning-status", "replan_required",
+                     "--reference", ".dag/sources/fixture.md")
+        return json.loads(self.path.read_text())
+
+    def test_replan_reworks_unstarted_work_and_keeps_the_record(self):
+        current = self.broken_plan([node("A"), node("B")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"] = [proposed["nodes"][0], node("C", depends=("A",))]
+        ref = self.draft(proposed, name="replan.json")
+        self.run_cmd("update-task", "--replan", ref)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual([n["id"] for n in saved["nodes"]], ["A", "C"])
+        self.assertEqual(saved["nodes"][0]["attempts"], current["nodes"][0]["attempts"])
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertIsNone(saved["decomposition_review"])
+        self.assertEqual(saved["replans"][-1]["added"], ["C"])
+        self.assertEqual(saved["replans"][-1]["dropped"], ["B"])
+        self.assertEqual(saved["replans"][-1]["kept"], ["A"])
+        self.design_review()
+        self.approve_as("session-plan")
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
+
+    def test_replan_cannot_rewrite_an_execution_record(self):
+        current = self.broken_plan([node("A"), node("B")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["attempts"] = []
+        proposed["nodes"][0]["status"] = "pending"
+        ref = self.draft(proposed, name="replan.json")
+        result = self.run_cmd("update-task", "--replan", ref, expect=3)
+        self.assertIn("execution record", result.stderr)
+
+    def test_replan_cannot_drop_or_retouch_a_done_node(self):
+        current = self.broken_plan([node("A"), node("B")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"] = [proposed["nodes"][1]]
+        result = self.run_cmd("update-task", "--replan", self.draft(proposed, name="d1.json"), expect=3)
+        self.assertIn("cannot be dropped", result.stderr)
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["scope"]["files"] = ["src/A.py", "src/extra.py"]
+        result = self.run_cmd("update-task", "--replan", self.draft(proposed, name="d2.json"), expect=3)
+        self.assertIn("frozen", result.stderr)
+
+    def test_replan_can_reslice_a_failed_node(self):
+        self.awaiting([node("A"), node("B")])
+        self.approve_as("session-plan")
+        self.start("B")
+        self.run_cmd("update-task", "B", "failed", "--reason", "contract was wrong")
+        self.run_cmd("update-task", "--planning-status", "replan_required",
+                     "--reference", ".dag/sources/fixture.md")
+        proposed = json.loads(self.path.read_text())
+        proposed["nodes"][1]["objective"] = "Deliver B, correctly sliced this time"
+        ref = self.draft(proposed, name="replan.json")
+        self.run_cmd("update-task", "--replan", ref)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][1]["objective"], "Deliver B, correctly sliced this time")
+        self.assertEqual(len(saved["nodes"][1]["attempts"]), 1)
+
+    def test_replan_requires_a_declared_break_and_a_settled_graph(self):
+        self.awaiting([node("A"), node("B")])
+        self.approve_as("session-plan")
+        proposed = json.loads(self.path.read_text())
+        result = self.run_cmd("update-task", "--replan", self.draft(proposed, name="d1.json"), expect=3)
+        self.assertIn("replan_required", result.stderr)
+        self.start("A")
+        self.run_cmd("update-task", "--planning-status", "replan_required",
+                     "--reference", ".dag/sources/fixture.md")
+        proposed = json.loads(self.path.read_text())
+        result = self.run_cmd("update-task", "--replan", self.draft(proposed, name="d2.json"), expect=3)
+        self.assertIn("settle running nodes", result.stderr)
+
+    def test_failed_convergence_still_belongs_to_gap_nodes(self):
+        self.awaiting([node("A")])
+        self.approve_as("session-plan")
+        self.complete("A")
+        report = self.root / ".dag" / "artifacts" / "conv.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("gap\n", encoding="utf-8")
+        self.run_cmd("update-task", "--convergence", "failed",
+                     "--reference", ".dag/artifacts/conv.md", "--gap", "G1 uncovered")
+        proposed = json.loads(self.path.read_text())
+        self.assertEqual(proposed["planning_status"], "replan_required")
+        result = self.run_cmd("update-task", "--replan", self.draft(proposed, name="d.json"), expect=3)
+        self.assertIn("--add-gap-nodes", result.stderr)
+
     def test_archive_requires_a_complete_dag(self):
         self.write(dag([node("A")]))
         result = self.run_cmd("update-task", "--archive", expect=3)

@@ -109,7 +109,7 @@ The reviewer checks both acceptance/scope compliance and code quality. It cannot
 
 The runtime derives `approved`, `needs_fixes`, `cannot_verify`, or `escalated` from the artifact and binds it to the reviewed head. Deterministic defects go back to the original implementer, followed by a scoped fresh re-review.
 
-`escalated` means the reviewer found a blocking problem this diff caused outside `scope.files`, typically a caller the worker was not allowed to touch. Do not send it back as a fix round: the worker would have to leave its scope, and the scope gate will refuse the result. Give those paths an owner instead — `--add-gap-nodes`, or a replan if the contract itself was wrong — then re-review the same head, which passes once the problem belongs to someone.
+`escalated` means the reviewer found a blocking problem this diff caused outside `scope.files`, typically a caller the worker was not allowed to touch. Do not send it back as a fix round: the worker would have to leave its scope, and the scope gate will refuse the result. Give those paths an owner through a replan (below), then re-review the same head, which passes once the problem belongs to someone.
 
 Run at most three review/fix rounds. `update-task` rejects a fourth round. After round three with open Critical/Important or spec findings, stop that loop and choose explicitly: add context, use a stronger model, re-slice, re-plan, or mark blocked. Never waive a load-bearing finding merely because the loop reached its cap.
 
@@ -129,6 +129,21 @@ Only after all four checks pass may the controller record completion:
 The runtime refuses completion unless the worktree is clean outside `.dag/`, the base-to-head diff stays inside node scope, referenced artifacts exist and parse, the final review is approved for that head, and the master artifact records a passing check against declared acceptance.
 
 For a failed or blocked attempt, record a short reason and durable evidence reference. Never put a transcript in `dag.json`.
+
+## Rework the plan when execution disproves it
+
+A plan is a hypothesis, and execution is what tests it. When the graph no longer matches reality — a node nobody needs, work no node owns, a slice that turned out to be two, an escalation with no owner — change the plan. Do not absorb the mismatch into a node's scope, and do not abandon the effort to rebuild it.
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --planning-status replan_required --reference "<durable path recording why>"
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --replan ".dag/replan.json"
+```
+
+Write the draft by copying the current control file and editing it. Nodes that have not started are yours to add, drop, re-slice, and re-wire. Nodes that ran are not: their `status`, `attempts`, and `handoff` must survive verbatim, and a `done` node's contract must too, because a reviewer accepted its diff against exactly that contract. The runtime refuses a draft that rewrites either, and refuses to replan at all while a node is running — settle in-flight work first.
+
+Replanning returns `planning_status` to `awaiting_approval` and clears the decomposition review, so the reworked plan goes back through a fresh review and the user's approval before anything new is dispatched. That is the point: the controller may change the plan, but it does not get to approve its own change.
+
+Failed convergence is different and keeps its own path, `--add-gap-nodes`, which forces the additions to address exactly the recorded gaps.
 
 ## Integrate accepted nodes
 

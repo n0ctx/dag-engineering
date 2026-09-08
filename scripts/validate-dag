@@ -1694,12 +1694,12 @@ def revise_dag(
 
     Scheduling is the controller's job, so re-slicing, re-wiring, and dropping unstarted work
     stays with it. What the project promises is not its to change: the deliverable fields are
-    frozen here and move only through --replan, where the user approves them.
+    frozen here and move only through a replan the user approves.
     """
     if dag["planning_status"] != "approved":
         raise DagError(
             f"planning_status is {dag['planning_status']!r}; --revise reorganises an approved plan. "
-            "An unapproved one changes with --amend, and a changed deliverable with --replan"
+            "An unapproved one changes with --amend, which is also where a rejected plan is repaired"
         )
     if not is_text(reason):
         raise DagError("--revise requires --reason recording why the plan no longer fits")
@@ -1709,7 +1709,7 @@ def revise_dag(
     if changed_deliverable:
         raise DagError(
             f"--revise cannot change what the project delivers ({', '.join(changed_deliverable)}); "
-            "that is the user's call, so use --planning-status replan_required and --replan"
+            "that is the user's call, so use --planning-status replan_required and --amend"
         )
 
     proposed, current = node_map(candidate), node_map(dag)
@@ -1794,17 +1794,17 @@ def revise_dag(
     return "\n".join(lines)
 
 
-def replan_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
-    """Rework an approved plan mid-flight without losing what already ran.
+def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
+    """Replace a plan that is not approved, which is how review findings get fixed.
 
-    Work the controller has not started is fully editable: nodes can be added, dropped, and
-    re-sliced. What ran is not. Attempts and handoffs are the audit trail, and a completed
-    node's contract is frozen too, because its diff was accepted against that exact contract.
+    Whether execution has started changes what may be edited, never whether editing is
+    possible: a plan awaiting approval is the one state a blocking review verdict lands in,
+    so it must always be repairable from here. What already ran is preserved regardless.
     """
-    if dag["planning_status"] != "replan_required":
+    if dag["planning_status"] == "approved":
         raise DagError(
-            f"planning_status is {dag['planning_status']!r}; record why the plan no longer fits with "
-            "--planning-status replan_required --reference \"<durable path>\" before replanning"
+            "an approved plan is reorganised with --revise, or sent back for rework with "
+            "--planning-status replan_required followed by --amend"
         )
     if dag["convergence"]["status"] == "failed":
         raise DagError(
@@ -1812,23 +1812,29 @@ def replan_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
         )
     running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
     if running:
-        raise DagError(f"settle running nodes before replanning: {', '.join(running)}")
+        raise DagError(f"settle running nodes before amending the plan: {', '.join(running)}")
 
-    candidate, _ = load_draft(dag_path, dag, draft_ref)
-    proposed = node_map(candidate)
-    current = node_map(dag)
+    candidate, draft = load_draft(dag_path, dag, draft_ref)
+    if candidate["planning_status"] in {"approved", "complete"}:
+        raise DagError(
+            f"the draft declares itself {candidate['planning_status']!r}; an amended plan is still "
+            "unapproved, and approval runs through --planning-status"
+        )
+
+    proposed, current = node_map(candidate), node_map(dag)
     kept, dropped = [], []
     for node_id, node in current.items():
-        if not node["attempts"]:
-            if node_id not in proposed:
-                dropped.append(node_id)
-            continue
         replacement = proposed.get(node_id)
         if replacement is None:
-            raise DagError(f"{node_id!r} has an execution record and cannot be dropped by a replan")
+            if node["attempts"]:
+                raise DagError(f"{node_id!r} has an execution record and cannot be dropped by an amendment")
+            dropped.append(node_id)
+            continue
+        if not node["attempts"]:
+            continue
         for field in ("status", "attempts", "handoff"):
             if replacement.get(field) != node[field]:
-                raise DagError(f"{node_id!r}: a replan cannot rewrite {field}, which is the execution record")
+                raise DagError(f"{node_id!r}: an amendment cannot rewrite {field}, which is the execution record")
         if node["status"] == "done":
             changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node[field]]
             if changed:
@@ -1841,44 +1847,25 @@ def replan_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
 
     candidate["decomposition_review"] = None
     candidate["planning_session"] = dag.get("planning_session")
-    candidate["planning_status"] = "awaiting_approval"
     candidate["approval_ref"] = None
-    candidate["replans"] = list(dag.get("replans") or []) + [
-        {"ref": draft_ref, "at": utc_now(), "added": added, "dropped": dropped, "kept": kept}
-    ]
+    candidate["planning_status"] = "draft" if dag["planning_status"] == "draft" else "awaiting_approval"
+    if kept or dropped or added:
+        candidate["replans"] = list(dag.get("replans") or []) + [
+            {"ref": draft_ref, "at": utc_now(), "kind": "amendment",
+             "added": added, "dropped": dropped, "kept": kept}
+        ]
+    else:
+        candidate["replans"] = list(dag.get("replans") or []) or None
     errors, _ = validate_dag(candidate)
     if errors:
-        raise DagError("replan would produce invalid DAG: " + "; ".join(errors))
-    dag.clear()
-    dag.update(candidate)
-    return (
-        f"replanned {dag['dag_id']}: +{len(added)} -{len(dropped)} node(s), {len(kept)} with an "
-        "execution record preserved; planning_status -> awaiting_approval"
-    )
-
-
-def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
-    """Replace an unapproved plan from a draft, which is how review findings get fixed."""
-    if dag["planning_status"] not in {"draft", "awaiting_approval"}:
-        raise DagError(
-            f"planning_status is {dag['planning_status']!r}; an approved plan is reworked with "
-            "--planning-status replan_required followed by --replan, not --amend"
-        )
-    started = [node["id"] for node in dag["nodes"] if node["attempts"]]
-    if started:
-        raise DagError(
-            f"nodes already have an execution record and --amend would discard it: {', '.join(started)}; "
-            "use --planning-status replan_required followed by --replan"
-        )
-    candidate, draft = load_draft(dag_path, dag, draft_ref)
-    if candidate["planning_status"] not in {"draft", "awaiting_approval"}:
-        raise DagError("an amended plan is still unapproved; approval runs through --planning-status")
-    candidate["decomposition_review"] = None
-    candidate["planning_session"] = dag.get("planning_session")
+        raise DagError("amendment would produce invalid DAG: " + "; ".join(errors))
     dag.clear()
     dag.update(candidate)
     draft.unlink()
-    return f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes; decomposition review cleared"
+    detail = f", {len(kept)} with an execution record preserved" if kept else ""
+    return (
+        f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes{detail}; decomposition review cleared"
+    )
 
 
 def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, reference: str | None) -> str:
@@ -1927,7 +1914,6 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
-    parser.add_argument("--replan", metavar="DRAFT", help="rework an approved plan, preserving every execution record")
     parser.add_argument("--revise", metavar="DRAFT", help="reorganise an approved plan without changing what it delivers")
     parser.add_argument("--revision-review", metavar="REF", help="scoped review of a revision that drops or re-wires a node")
     parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
@@ -1957,7 +1943,6 @@ def cmd_update(argv: list[str]) -> int:
             args.init,
             args.decomposition_review,
             args.amend,
-            args.replan,
             args.revise,
             args.reseal,
             args.archive,
@@ -1968,7 +1953,7 @@ def cmd_update(argv: list[str]) -> int:
     if operations != 1:
         parser.error(
             "choose exactly one node, planning-status, convergence, gap-plan, init, "
-            "decomposition-review, amend, replan, revise, reseal, archive, or abandon operation"
+            "decomposition-review, amend, revise, reseal, archive, or abandon operation"
         )
     if args.reseal and not args.reason:
         parser.error("--reseal requires --reason recording why the control file needed repair")
@@ -2000,8 +1985,6 @@ def cmd_update(argv: list[str]) -> int:
                 message = record_design_review(args.dag, dag, args.decomposition_review)
             elif args.amend:
                 message = amend_dag(args.dag, dag, args.amend)
-            elif args.replan:
-                message = replan_dag(args.dag, dag, args.replan)
             elif args.revise:
                 message = revise_dag(args.dag, dag, args.revise, args.reason, args.revision_review)
             elif args.archive or args.abandon:

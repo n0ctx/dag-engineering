@@ -109,7 +109,7 @@ The reviewer checks both acceptance/scope compliance and code quality. It cannot
 
 The runtime derives `approved`, `needs_fixes`, `cannot_verify`, or `escalated` from the artifact and binds it to the reviewed head. Deterministic defects go back to the original implementer, followed by a scoped fresh re-review.
 
-`escalated` means the reviewer found a blocking problem this diff caused outside `scope.files`, typically a caller the worker was not allowed to touch. Do not send it back as a fix round: the worker would have to leave its scope, and the scope gate will refuse the result. Give those paths an owner through a replan (below), then re-review the same head, which passes once the problem belongs to someone.
+`escalated` means the reviewer found a blocking problem this diff caused outside `scope.files`, typically a caller the worker was not allowed to touch. Do not send it back as a fix round: the worker would have to leave its scope, and the scope gate will refuse the result. Give those paths an owner with `--revise` (below), then re-review the same head, which passes once the problem belongs to someone.
 
 Run at most three review/fix rounds. `update-task` rejects a fourth round. After round three with open Critical/Important or spec findings, stop that loop and choose explicitly: add context, use a stronger model, re-slice, re-plan, or mark blocked. Never waive a load-bearing finding merely because the loop reached its cap.
 
@@ -157,11 +157,11 @@ Give that reviewer the change, why it happened, and the dependent contracts — 
 
 ### Changing the deliverable: the user's
 
-Changing `objective`, `global_acceptance`, `assumptions`, or `source_refs` renegotiates what the project promises. `--revise` refuses it. That goes through a full replan, a fresh decomposition review, and the user's approval:
+Changing `objective`, `global_acceptance`, `assumptions`, or `source_refs` renegotiates what the project promises. `--revise` refuses it. That goes back through approval: send the plan for rework, amend it, review it afresh, and let the user approve it. `--amend` preserves every execution record, so nothing already delivered is lost, and it is also where a plan whose review came back with blocking findings is repaired.
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --planning-status replan_required --reference "<durable path recording why>"
-"${CLAUDE_SKILL_DIR}/scripts/update-task" --replan ".dag/replan.json"
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --amend ".dag/amendment.json"
 ```
 
 Failed convergence keeps its own path, `--add-gap-nodes`, which forces the additions to address exactly the recorded gaps.

@@ -28,6 +28,8 @@ ${CLAUDE_SKILL_DIR}/skills/dag-planning/SKILL.md
 
 When no DAG existed at the start of the turn, that turn is planning-only unless the request points to a durable plan that was already approved before this turn. “Start,” “do it,” “execute,” or equivalent wording cannot approve a DAG the user has not seen. If planning creates `awaiting_approval`, present it and end the turn: do not load execution, approve it, dispatch, or edit project implementation files.
 
+Recording a user's approval of a pending DAG is a planning action: load the planning module, record it, and end the turn there. Approval never authorizes execution inside the session that planned the DAG.
+
 Use execution when `.dag/dag.json` exists and the user explicitly asks to run, execute, continue, resume, or finish the remaining work. Explicitly read:
 
 ```text

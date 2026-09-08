@@ -146,4 +146,4 @@ Validation success is not product approval. After explicit approval, the control
 
 For an approval given in chat, first persist the exact approval and the DAG version it accepts under `.dag/sources/`, then pass that project-relative path. The runtime rejects a missing local approval artifact.
 
-Only then may execution routing begin.
+Recording approval ends the planning turn. Do not route to execution from here: report that the DAG is approved and ask the user to start a new session and run `/dag-engineering continue`. Execution belongs to a session that never held the planning context, and the runtime refuses to start a node from the session stamped in `planning_session`. Compacting this session is not a substitute, because it keeps the same session and carries planning residue forward.

@@ -535,6 +535,7 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         "global_acceptance",
         "planning_status",
         "approval_ref",
+        "planning_session",
         "max_parallel",
         "created_at",
         "updated_at",
@@ -568,6 +569,9 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         errors.append(f"approval_ref: required when planning_status is {planning_status!r}")
     if approval_ref is not None and is_text(approval_ref) and not is_source_ref(approval_ref):
         errors.append("approval_ref: must be a durable project path, URL, issue ID, or commit reference")
+    planning_session = dag.get("planning_session")
+    if planning_session is not None and not is_text(planning_session):
+        errors.append("planning_session: must be null or a non-empty string")
 
     max_parallel = dag.get("max_parallel")
     if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or not 1 <= max_parallel <= HARD_MAX_PARALLEL:
@@ -1031,6 +1035,12 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
     if target == "running":
         if dag["planning_status"] != "approved":
             raise DagError("cannot start a node before planning_status is 'approved'")
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if session and session == dag.get("planning_session"):
+            raise DagError(
+                "cannot execute in the session that planned this DAG; start a new session "
+                "and run '/dag-engineering continue'"
+            )
         incomplete = [dependency for dependency in node["depends_on"] if nodes[dependency]["status"] != "done"]
         if incomplete:
             raise DagError(f"cannot start {args.node_id!r}; incomplete dependencies: {', '.join(incomplete)}")
@@ -1162,6 +1172,8 @@ def transition_planning(dag_path: Path, dag: dict[str, Any], target: str, refere
     dag["planning_status"] = target
     if target == "approved":
         dag["approval_ref"] = reference
+        if dag.get("planning_session") is None:
+            dag["planning_session"] = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     return f"planning_status: {current} -> {target}"
 
 

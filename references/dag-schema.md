@@ -16,6 +16,7 @@
   ],
   "planning_status": "awaiting_approval",
   "approval_ref": null,
+  "planning_session": null,
   "max_parallel": 2,
   "created_at": "2026-09-08T12:00:00Z",
   "updated_at": "2026-09-08T12:00:00Z",
@@ -100,6 +101,7 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 - Every verification entry covers at least one acceptance ID, and every acceptance ID has coverage.
 - `depends_on` and `conflicts_with` reference existing nodes and cannot reference self.
 - `conflicts_with` is symmetric. The validator rejects one-sided conflicts.
+- `planning_session` is stamped by the runtime at the first approval and is never rewritten, including after a replan. Node execution is refused from that same session, so planning context cannot leak into execution. It stays null when no session identity is available, and the check then passes.
 - Two nodes that can run concurrently, meaning neither depends on the other, cannot have overlapping `scope.files` without a `conflicts_with` edge. The validator rejects the undeclared collision.
 - A done or running node cannot depend on a non-done node.
 - A done node has an existing structured handoff, a final approved review, a master verification artifact, and a Git head that all identify the same node revision.

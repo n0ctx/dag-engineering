@@ -483,11 +483,13 @@ def plan_fingerprint(dag: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def validate_design_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any]) -> dict[str, Any]:
+def validate_design_review_artifact(
+    dag_path: Path, ref: str, dag: dict[str, Any], extra_nodes: set[str] | None = None
+) -> dict[str, Any]:
     value = load_json_artifact(dag_path, ref, "decomposition review artifact")
     if value.get("dag_id") != dag["dag_id"]:
         raise DagError(f"decomposition review artifact dag_id must be {dag['dag_id']!r}")
-    known = {node["id"] for node in dag["nodes"]}
+    known = {node["id"] for node in dag["nodes"]} | (extra_nodes or set())
     findings = value.get("findings")
     if not isinstance(findings, list):
         raise DagError("decomposition review artifact findings must be an array")
@@ -1078,6 +1080,14 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
     if all_done and convergence_status == "pending":
         warnings.append("all nodes are done but final convergence is still pending")
 
+    review = dag.get("decomposition_review")
+    if review and review.get("fingerprint") != plan_fingerprint(dag):
+        revisions = len([entry for entry in (dag.get("replans") or []) if entry.get("kind") == "revision"])
+        warnings.append(
+            f"the plan has been revised {revisions} time(s) since its decomposition review; "
+            "convergence is what checks that it still delivers the approved outcome"
+        )
+
     return errors, warnings
 
 
@@ -1660,6 +1670,130 @@ def load_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> tuple[dic
     return candidate, draft.resolve()
 
 
+DELIVERABLE_FIELDS = ("objective", "global_acceptance", "assumptions", "source_refs")
+FROZEN_CONTRACT_STATUSES = {"done", "running"}
+INTERFACE_FIELDS = ("outputs", "depends_on")
+
+
+def unfinished_dependents(nodes: dict[str, dict[str, Any]], targets: set[str]) -> dict[str, list[str]]:
+    """Map each target to the unfinished nodes that transitively depend on it."""
+    closure = dependency_closure(nodes)
+    blast: dict[str, list[str]] = {}
+    for node_id, node in nodes.items():
+        if node["status"] in {"done", "running"}:
+            continue
+        for target in targets & closure.get(node_id, set()):
+            blast.setdefault(target, []).append(node_id)
+    return {target: sorted(dependents) for target, dependents in blast.items()}
+
+
+def revise_dag(
+    dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str, review_ref: str | None
+) -> str:
+    """Let the controller re-organise live work without renegotiating what it delivers.
+
+    Scheduling is the controller's job, so re-slicing, re-wiring, and dropping unstarted work
+    stays with it. What the project promises is not its to change: the deliverable fields are
+    frozen here and move only through --replan, where the user approves them.
+    """
+    if dag["planning_status"] != "approved":
+        raise DagError(
+            f"planning_status is {dag['planning_status']!r}; --revise reorganises an approved plan. "
+            "An unapproved one changes with --amend, and a changed deliverable with --replan"
+        )
+    if not is_text(reason):
+        raise DagError("--revise requires --reason recording why the plan no longer fits")
+
+    candidate, _ = load_draft(dag_path, dag, draft_ref)
+    changed_deliverable = [field for field in DELIVERABLE_FIELDS if candidate.get(field) != dag.get(field)]
+    if changed_deliverable:
+        raise DagError(
+            f"--revise cannot change what the project delivers ({', '.join(changed_deliverable)}); "
+            "that is the user's call, so use --planning-status replan_required and --replan"
+        )
+
+    proposed, current = node_map(candidate), node_map(dag)
+    dropped = [node_id for node_id in current if node_id not in proposed]
+    added = [node_id for node_id in proposed if node_id not in current]
+    interface_changed, retouched = [], []
+    for node_id, node in current.items():
+        replacement = proposed.get(node_id)
+        if replacement is None:
+            if node["attempts"]:
+                raise DagError(f"{node_id!r} has an execution record and cannot be dropped by a revision")
+            continue
+        for field in ("status", "attempts", "handoff"):
+            if replacement.get(field) != node[field]:
+                raise DagError(f"{node_id!r}: a revision cannot rewrite {field}, which is the execution record")
+        changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node[field]]
+        if changed and node["status"] in FROZEN_CONTRACT_STATUSES:
+            raise DagError(
+                f"{node_id!r} is {node['status']} and its contract is frozen; changed: {', '.join(changed)}"
+            )
+        if changed:
+            retouched.append(node_id)
+        if any(field in changed for field in INTERFACE_FIELDS):
+            interface_changed.append(node_id)
+
+    # Reorganising a leaf costs nothing to get wrong. Dropping a node, or moving what one
+    # produces or waits on, propagates along edges the machine cannot read the meaning of.
+    blast = unfinished_dependents(current, set(dropped) | set(interface_changed))
+    if (dropped or interface_changed) and not review_ref:
+        why = []
+        if dropped:
+            why.append(
+                f"drops {', '.join(sorted(dropped))}, and nothing checks that the approved deliverable is "
+                "still covered once work leaves the plan"
+            )
+        for node_id in sorted(interface_changed):
+            dependents = blast.get(node_id)
+            why.append(
+                f"moves what {node_id} produces or waits on"
+                + (f", which {', '.join(dependents)} was written against" if dependents else "")
+            )
+        raise DagError(
+            "this revision " + "; it ".join(why) + ". Dispatch a scoped decomposition review of the change "
+            "against those nodes and pass it with --revision-review"
+        )
+    verdict = None
+    if review_ref:
+        artifact = validate_design_review_artifact(dag_path, review_ref, candidate, extra_nodes=set(current))
+        blocking = [f for f in artifact["findings"] if f["severity"] in {"critical", "important"}]
+        if blocking:
+            raise DagError(
+                f"the scoped review reported {len(blocking)} blocking finding(s); "
+                "resolve them in the draft and re-review"
+            )
+        verdict = review_ref
+
+    candidate["planning_session"] = dag.get("planning_session")
+    candidate["planning_status"] = "approved"
+    candidate["approval_ref"] = dag["approval_ref"]
+    candidate["decomposition_review"] = dag.get("decomposition_review")
+    candidate["replans"] = list(dag.get("replans") or []) + [
+        {
+            "ref": draft_ref,
+            "at": utc_now(),
+            "kind": "revision",
+            "reason": reason,
+            "added": added,
+            "dropped": dropped,
+            "retouched": retouched,
+            "review_ref": verdict,
+        }
+    ]
+    errors, _ = validate_dag(candidate)
+    if errors:
+        raise DagError("revision would produce invalid DAG: " + "; ".join(errors))
+    dag.clear()
+    dag.update(candidate)
+    lines = [f"revised {dag['dag_id']}: +{len(added)} -{len(dropped)} ~{len(retouched)} node(s)"]
+    if blast:
+        lines.append("Downstream nodes that read the changed nodes as an interface:")
+        lines += [f"  {node_id} -> {', '.join(dependents)}" for node_id, dependents in sorted(blast.items())]
+    return "\n".join(lines)
+
+
 def replan_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
     """Rework an approved plan mid-flight without losing what already ran.
 
@@ -1794,6 +1928,8 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
     parser.add_argument("--replan", metavar="DRAFT", help="rework an approved plan, preserving every execution record")
+    parser.add_argument("--revise", metavar="DRAFT", help="reorganise an approved plan without changing what it delivers")
+    parser.add_argument("--revision-review", metavar="REF", help="scoped review of a revision that drops or re-wires a node")
     parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
@@ -1822,6 +1958,7 @@ def cmd_update(argv: list[str]) -> int:
             args.decomposition_review,
             args.amend,
             args.replan,
+            args.revise,
             args.reseal,
             args.archive,
             args.abandon,
@@ -1831,7 +1968,7 @@ def cmd_update(argv: list[str]) -> int:
     if operations != 1:
         parser.error(
             "choose exactly one node, planning-status, convergence, gap-plan, init, "
-            "decomposition-review, amend, replan, reseal, archive, or abandon operation"
+            "decomposition-review, amend, replan, revise, reseal, archive, or abandon operation"
         )
     if args.reseal and not args.reason:
         parser.error("--reseal requires --reason recording why the control file needed repair")
@@ -1865,6 +2002,8 @@ def cmd_update(argv: list[str]) -> int:
                 message = amend_dag(args.dag, dag, args.amend)
             elif args.replan:
                 message = replan_dag(args.dag, dag, args.replan)
+            elif args.revise:
+                message = revise_dag(args.dag, dag, args.revise, args.reason, args.revision_review)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),

@@ -96,6 +96,21 @@ Every finding names the offending nodes and what would go wrong, not a style pre
 
 The runtime derives the verdict from the findings, so no reviewer passes its own approval flag. `critical` and `important` block approval; `minor` is recorded and does not.
 
+## Scoped review of a revision
+
+When the controller reorganises a live plan, a full decomposition review is the wrong instrument: the plan was already reviewed, and only part of it moved. The scoped review answers one question — does the change break something downstream of it?
+
+It receives the change and its neighbourhood, never the whole DAG and never the repository:
+
+- what moved: the nodes dropped, added, or retouched, with the before and after of each;
+- why: the execution facts that motivated it, such as the failing handoff or the review verdict;
+- the contracts of the unfinished nodes that transitively depend on the changed ones;
+- nothing else. It does not re-judge nodes the change did not touch.
+
+The validator has already re-run everything structural — cycles, unknown edges, conflict symmetry, undeclared scope collisions, acceptance coverage — so this review is only for what those cannot read: whether a downstream node still gets what it was written to consume. `inputs` and `outputs` are prose, so no script can compare them; that judgement is the entire reason this review exists.
+
+Findings use the same shape and severities as a full decomposition review, and may name nodes the revision dropped. `critical` and `important` block the revision.
+
 ## Coverage and convergence preview
 
 Before approval, map each source requirement and each global acceptance criterion to at least one node and verification path. Check cross-node integration explicitly. A populated task list is not evidence of full requirement coverage.

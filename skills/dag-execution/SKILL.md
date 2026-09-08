@@ -132,18 +132,41 @@ For a failed or blocked attempt, record a short reason and durable evidence refe
 
 ## Rework the plan when execution disproves it
 
-A plan is a hypothesis, and execution is what tests it. When the graph no longer matches reality — a node nobody needs, work no node owns, a slice that turned out to be two, an escalation with no owner — change the plan. Do not absorb the mismatch into a node's scope, and do not abandon the effort to rebuild it.
+A plan is a hypothesis and execution is what tests it. When the graph stops matching reality — a node nobody needs, work no node owns, a slice that turned out to be two, a brief a failed node needs corrected, an escalation with no owner — change the plan. Do not absorb the mismatch into a node's scope, do not carry a node you know is wrong, and do not abandon the effort to rebuild it.
+
+You own how the work is organised. You do not own what it delivers. That line, not the size of the change, decides which path to take.
+
+### Reorganising: yours
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --revise ".dag/revision.json" --reason "<one line>"
+```
+
+Re-slice nodes, move responsibility between unstarted ones, add a node, drop one whose work another already covers, fix a stale path, re-brief a failed node before retrying it. The plan stays `approved` and execution never pauses.
+
+Write the draft by copying the control file and editing it. Nodes that ran keep their `status`, `attempts`, and `handoff` verbatim, and the contract of a `done` or `running` node is frozen — one was accepted against exactly that contract and the other is being executed against it right now. A `failed` or `blocked` node's contract is yours to correct.
+
+Dropping a node, or changing what one `outputs` or `depends_on`, moves an interface that downstream nodes were written against. `inputs` and `outputs` are prose, so no validator can tell whether a consumer still gets what it needs. For those changes the runtime names the affected downstream nodes and requires a scoped review of the change, using `${CLAUDE_SKILL_DIR}/references/decomposition.md`:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --revise ".dag/revision.json" --reason "<one line>" \
+  --revision-review ".dag/artifacts/revision-review.json"
+```
+
+Give that reviewer the change, why it happened, and the dependent contracts — not the whole DAG. Blocking findings refuse the revision.
+
+### Changing the deliverable: the user's
+
+Changing `objective`, `global_acceptance`, `assumptions`, or `source_refs` renegotiates what the project promises. `--revise` refuses it. That goes through a full replan, a fresh decomposition review, and the user's approval:
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --planning-status replan_required --reference "<durable path recording why>"
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --replan ".dag/replan.json"
 ```
 
-Write the draft by copying the current control file and editing it. Nodes that have not started are yours to add, drop, re-slice, and re-wire. Nodes that ran are not: their `status`, `attempts`, and `handoff` must survive verbatim, and a `done` node's contract must too, because a reviewer accepted its diff against exactly that contract. The runtime refuses a draft that rewrites either, and refuses to replan at all while a node is running — settle in-flight work first.
+Failed convergence keeps its own path, `--add-gap-nodes`, which forces the additions to address exactly the recorded gaps.
 
-Replanning returns `planning_status` to `awaiting_approval` and clears the decomposition review, so the reworked plan goes back through a fresh review and the user's approval before anything new is dispatched. That is the point: the controller may change the plan, but it does not get to approve its own change.
-
-Failed convergence is different and keeps its own path, `--add-gap-nodes`, which forces the additions to address exactly the recorded gaps.
+Undoing accepted work is a node, not a state change: `done` is terminal, so write a node whose objective is to revert it and let it pass the same gates. Never rewrite a completed node's record to make it look like the work never happened.
 
 ## Integrate accepted nodes
 

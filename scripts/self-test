@@ -587,6 +587,120 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("update-task", "--amend", ref, expect=3)
         self.assertIn("must stay 'fixture'", result.stderr)
 
+    def live_plan(self, nodes):
+        """An approved, mid-flight DAG the controller may reorganise."""
+        self.awaiting(nodes)
+        self.approve_as("session-plan")
+        return json.loads(self.path.read_text())
+
+    def revise(self, proposed, *, name="revision.json", reason="execution disproved the slice",
+               review=None, expect=0):
+        args = ["update-task", "--revise", self.draft(proposed, name=name), "--reason", reason]
+        if review:
+            args += ["--revision-review", review]
+        return self.run_cmd(*args, expect=expect)
+
+    def scoped_review(self, findings=(), name="scoped-review.json"):
+        artifact = self.root / ".dag" / "artifacts" / name
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(
+            {"dag_id": "fixture", "findings": list(findings),
+             "checks_performed": ["blast radius", "interface continuity"]}
+        ), encoding="utf-8")
+        return str(artifact.relative_to(self.root))
+
+    def test_revise_reorganises_a_leaf_without_ceremony(self):
+        current = self.live_plan([node("A"), node("B")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][1]["read_first"] = ["docs/spec.md"]
+        proposed["nodes"][1]["title"] = "Node B, re-scoped"
+        self.revise(proposed)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["planning_status"], "approved")
+        self.assertEqual(saved["nodes"][1]["read_first"], ["docs/spec.md"])
+        self.assertEqual(saved["replans"][-1]["retouched"], ["B"])
+        self.assertEqual(saved["replans"][-1]["reason"], "execution disproved the slice")
+        self.assertEqual(saved["approval_ref"], current["approval_ref"])
+
+    def test_revise_cannot_change_what_the_project_delivers(self):
+        current = self.live_plan([node("A")])
+        proposed = copy.deepcopy(current)
+        proposed["global_acceptance"] = [{"id": "G1", "criterion": "something else entirely"}]
+        result = self.revise(proposed, expect=3)
+        self.assertIn("global_acceptance", result.stderr)
+        self.assertIn("--replan", result.stderr)
+
+    def test_revise_escalates_when_a_node_is_dropped(self):
+        current = self.live_plan([node("A"), node("B", depends=("A",))])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"] = [n for n in proposed["nodes"] if n["id"] != "A"]
+        proposed["nodes"][0]["depends_on"] = []
+        result = self.revise(proposed, expect=3)
+        self.assertIn("--revision-review", result.stderr)
+        self.assertIn("still covered once work leaves the plan", result.stderr)
+        self.revise(proposed, name="r2.json", review=self.scoped_review())
+        saved = json.loads(self.path.read_text())
+        self.assertEqual([n["id"] for n in saved["nodes"]], ["B"])
+        self.assertEqual(saved["replans"][-1]["dropped"], ["A"])
+
+    def test_revise_escalates_when_an_interface_moves(self):
+        current = self.live_plan([node("A"), node("B", depends=("A",))])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["outputs"] = ["a completely different artifact"]
+        result = self.revise(proposed, expect=3)
+        self.assertIn("--revision-review", result.stderr)
+        self.revise(proposed, name="r2.json", review=self.scoped_review())
+        self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"],
+                         ["a completely different artifact"])
+
+    def test_revise_adding_a_node_needs_no_review(self):
+        current = self.live_plan([node("A")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"].append(node("C", depends=("A",)))
+        self.revise(proposed)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["replans"][-1]["added"], ["C"])
+        self.assertEqual(saved["planning_status"], "approved")
+
+    def test_scoped_review_findings_block_the_revision(self):
+        current = self.live_plan([node("A"), node("B", depends=("A",))])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["outputs"] = ["something else"]
+        review = self.scoped_review([
+            {"severity": "important", "kind": "missing_dependency", "nodes": ["B"],
+             "detail": "B consumes A's old output and nothing replaces it"},
+        ])
+        result = self.revise(proposed, review=review, expect=3)
+        self.assertIn("blocking finding", result.stderr)
+        self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"], ["output A"])
+
+    def test_revise_freezes_running_and_done_contracts(self):
+        self.live_plan([node("A"), node("B")])
+        self.start("A")
+        proposed = json.loads(self.path.read_text())
+        proposed["nodes"][0]["objective"] = "something the running worker never received"
+        result = self.revise(proposed, expect=3)
+        self.assertIn("is running and its contract is frozen", result.stderr)
+
+    def test_revise_can_rebrief_a_failed_node(self):
+        self.live_plan([node("A")])
+        self.start("A")
+        self.run_cmd("update-task", "A", "failed", "--reason", "brief was wrong")
+        proposed = json.loads(self.path.read_text())
+        proposed["nodes"][0]["objective"] = "Deliver A with the brief execution proved it needs"
+        self.revise(proposed, reason="retry with a corrected brief")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][0]["objective"], "Deliver A with the brief execution proved it needs")
+        self.assertEqual(len(saved["nodes"][0]["attempts"]), 1)
+
+    def test_revision_drift_from_its_review_is_reported(self):
+        current = self.live_plan([node("A")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["title"] = "Node A, retitled"
+        self.revise(proposed)
+        result = self.run_cmd("validate-dag")
+        self.assertIn("revised 1 time(s) since its decomposition review", result.stdout + result.stderr)
+
     def broken_plan(self, nodes):
         """An approved DAG with A done, declared no longer fit for purpose."""
         self.awaiting(nodes)

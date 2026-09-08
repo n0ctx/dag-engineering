@@ -11,6 +11,7 @@ Compile large engineering work into a persistent DAG, then use that DAG as the c
 
 - Git is the code truth, project documentation is the knowledge truth, `.dag/dag.json` is the execution-state truth, and a session is disposable computation.
 - The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. It is not the default implementation worker.
+- One project has one control plane: `.dag/` at the main worktree root, holding one `.dag/dag.json` at a time. A finished effort is archived before the next one starts.
 - Workers and reviewers never edit `.dag/dag.json`. Only the controller changes it, using this skill's runtime scripts after initial creation.
 - A worker's or reviewer's claim is evidence, not acceptance. The controller runs at least one real check tied directly to each node's acceptance criteria before marking it done.
 - `depends_on` expresses semantic ordering. `conflicts_with` expresses unsafe concurrent use of files or resources. Never substitute one for the other.

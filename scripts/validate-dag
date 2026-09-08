@@ -99,6 +99,7 @@ def load_dag(path: Path) -> dict[str, Any]:
         raise DagError(f"cannot read {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise DagError("DAG root must be a JSON object")
+    check_dag_location(path)
     return value
 
 
@@ -142,6 +143,55 @@ def dag_lock(path: Path):
 def project_root(dag_path: Path) -> Path:
     resolved = dag_path.resolve()
     return resolved.parent.parent if resolved.parent.name == ".dag" else resolved.parent
+
+
+def control_plane_root(start: Path | None = None) -> Path | None:
+    """Locate the main worktree root, which is the only place `.dag/` may live.
+
+    `git worktree list` reports the main worktree first, so this resolves the same
+    root from a subdirectory or from a linked worktree. It returns None when the
+    answer cannot be trusted, including outside Git and under `--separate-git-dir`,
+    where the reported path is the Git directory rather than a worktree.
+    """
+    origin = (start or Path.cwd()).resolve()
+    while not origin.is_dir():
+        origin = origin.parent
+    listing = run_git(origin, "worktree", "list", "--porcelain")
+    if listing.returncode != 0:
+        return None
+    for line in listing.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = Path(line[len("worktree ") :]).resolve()
+        if not candidate.is_dir():
+            return None
+        toplevel = run_git(candidate, "rev-parse", "--show-toplevel")
+        if toplevel.returncode != 0 or Path(toplevel.stdout.strip()).resolve() != candidate:
+            return None
+        return candidate
+    return None
+
+
+def resolve_dag_path(given: Path | None) -> Path:
+    """Default the control file to the main worktree root, not the current directory."""
+    if given is not None:
+        return given
+    root = control_plane_root()
+    return (root / ".dag" / "dag.json") if root else Path(".dag/dag.json")
+
+
+def check_dag_location(dag_path: Path) -> None:
+    """Reject a second control plane created in a subdirectory or a linked worktree."""
+    resolved = dag_path.resolve()
+    if resolved.parent.name != ".dag" or resolved.name != "dag.json":
+        return
+    root = control_plane_root(resolved.parent)
+    if root is None or root == project_root(dag_path):
+        return
+    raise DagError(
+        f"control plane must live at the main worktree root {root}, not {project_root(dag_path)}; "
+        "move or remove this .dag directory"
+    )
 
 
 def artifact_path(dag_path: Path, ref: Any, label: str, *, json_object: bool = False) -> Path:
@@ -892,9 +942,10 @@ def validate_or_exit(path: Path, json_output: bool = False) -> dict[str, Any]:
 
 def cmd_validate(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="validate-dag", description="Validate a dag-engineering JSON control file.")
-    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args(argv)
+    args.dag = resolve_dag_path(args.dag)
     try:
         dag = load_dag(args.dag)
     except DagError as exc:
@@ -919,10 +970,11 @@ def cmd_validate(argv: list[str]) -> int:
 
 def cmd_ready(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ready-tasks", description="List eligible DAG nodes; selection remains a controller decision.")
-    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
     parser.add_argument("--limit", type=int, help="limit returned candidates without implying dispatch")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args(argv)
+    args.dag = resolve_dag_path(args.dag)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     dag = validate_or_exit(args.dag, args.json)
@@ -946,6 +998,7 @@ def cmd_ready(argv: list[str]) -> int:
             }
             for node in candidates
         ],
+        "control_plane_root": str(project_root(args.dag)),
         "note": "eligible candidates are not an instruction to dispatch all of them",
     }
     if args.json:
@@ -1061,6 +1114,11 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
         }
         if worktree in active_worktrees:
             raise DagError("another active node already uses this worktree")
+        if worktree != project_root(args.dag) and (worktree / ".dag" / "dag.json").exists():
+            raise DagError(
+                f"{worktree} holds its own .dag/dag.json; a worktree must not carry a second control "
+                "plane, and artifacts written there would not resolve against the real one"
+            )
         dirty = dirty_paths(worktree)
         if dirty:
             raise DagError("worktree is not clean outside .dag/: " + ", ".join(dirty))
@@ -1236,14 +1294,76 @@ def add_gap_nodes(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
     return f"added {len(additions)} gap node(s); planning_status -> awaiting_approval"
 
 
+def init_dag(dag_path: Path, draft_ref: str) -> str:
+    """Install a validated draft as the control file, refusing to replace one."""
+    if dag_path.exists():
+        raise DagError(
+            f"{dag_path} already exists; archive a completed DAG or abandon an unfinished one "
+            "before creating a new control plane"
+        )
+    draft = Path(draft_ref)
+    if not draft.is_absolute():
+        draft = project_root(dag_path) / draft
+    if not draft.is_file():
+        raise DagError(f"draft not found: {draft_ref}")
+    draft = draft.resolve()
+    if draft == dag_path.resolve():
+        raise DagError("draft must be a separate file from the control file")
+    candidate = load_dag(draft)
+    errors, _ = validate_dag(candidate)
+    if errors:
+        raise DagError("draft is not a valid DAG: " + "; ".join(errors))
+    candidate["updated_at"] = utc_now()
+    atomic_write(dag_path, candidate)
+    draft.unlink()
+    return f"created {candidate['dag_id']} with {len(candidate['nodes'])} nodes from {draft_ref}"
+
+
+def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, reference: str | None) -> str:
+    """Move the control file into .dag/archive/, closing this effort's lifecycle."""
+    running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
+    if running:
+        raise DagError(f"finish or fail the running nodes first: {', '.join(running)}")
+    complete = dag["planning_status"] == "complete"
+    if complete and reason is not None:
+        raise DagError("--reason applies to --abandon, not to archiving a completed DAG")
+    if not complete:
+        if not is_text(reason):
+            raise DagError(
+                f"planning_status is {dag['planning_status']!r}, not 'complete'; "
+                "continue execution, or abandon it explicitly with --abandon --reason \"<why>\""
+            )
+        if not is_text(reference) or not is_source_ref(reference):
+            raise DagError(
+                "abandoning unfinished work is the user's decision: persist their instruction under "
+                ".dag/sources/ and pass it with --reference. Never abandon a plan on your own initiative"
+            )
+        if is_safe_path(reference):
+            artifact_path(dag_path, reference, "abandon reference")
+    dag["archived_at"] = utc_now()
+    if not complete:
+        dag["abandon_reason"] = reason
+        dag["abandon_ref"] = reference
+    destination = project_root(dag_path) / ".dag" / "archive" / f"{dag['dag_id']}-{dag['archived_at'].replace(':', '')}.json"
+    if destination.exists():
+        raise DagError(f"archive entry already exists: {destination}")
+    atomic_write(destination, dag)
+    dag_path.unlink()
+    verb = "archived" if complete else "abandoned"
+    return f"{verb} {dag['dag_id']} to {destination.relative_to(project_root(dag_path))}"
+
+
 def cmd_update(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="update-task", description="Apply guarded controller-owned DAG state transitions.")
-    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
     parser.add_argument("node_id", nargs="?")
     parser.add_argument("status", nargs="?")
     parser.add_argument("--planning-status", choices=sorted(PLANNING_STATUSES))
     parser.add_argument("--convergence", choices=("passed", "failed"))
     parser.add_argument("--add-gap-nodes", metavar="REF", help="import reviewed gap nodes from a project-relative JSON artifact")
+    parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
+    parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
+    parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
     parser.add_argument("--reference", help="durable approval or convergence reference")
     parser.add_argument("--handoff-ref")
     parser.add_argument("--review-ref")
@@ -1257,15 +1377,31 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--gap", action="append", default=[], help="short convergence gap; repeat as needed")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args(argv)
+    args.dag = resolve_dag_path(args.dag)
 
     operations = sum(
         bool(value)
-        for value in (args.planning_status, args.convergence, args.add_gap_nodes, args.node_id or args.status)
+        for value in (
+            args.planning_status,
+            args.convergence,
+            args.add_gap_nodes,
+            args.init,
+            args.archive,
+            args.abandon,
+            args.node_id or args.status,
+        )
     )
     if operations != 1:
-        parser.error("choose exactly one node, planning-status, convergence, or gap-plan operation")
+        parser.error("choose exactly one node, planning-status, convergence, gap-plan, init, archive, or abandon operation")
+    if args.abandon and not (args.reason and args.reference):
+        parser.error("--abandon requires --reason and --reference to the user's persisted instruction")
     try:
         with dag_lock(args.dag):
+            if args.init:
+                message, warnings = init_dag(args.dag, args.init), []
+                payload = {"updated": True, "message": message, "warnings": warnings}
+                print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else f"UPDATED: {message}")
+                return 0
             dag = load_dag(args.dag)
             errors, _ = validate_dag(dag)
             if errors:
@@ -1276,6 +1412,17 @@ def cmd_update(argv: list[str]) -> int:
                 message = transition_convergence(args.dag, dag, args.convergence, args.reference, args.gap)
             elif args.add_gap_nodes:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
+            elif args.archive or args.abandon:
+                message, warnings = (
+                    retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),
+                    [],
+                )
+                print(
+                    json.dumps({"updated": True, "message": message, "warnings": warnings}, ensure_ascii=False, indent=2)
+                    if args.json
+                    else f"UPDATED: {message}"
+                )
+                return 0
             else:
                 message = transition_node(dag, args)
             dag["updated_at"] = utc_now()
@@ -1302,9 +1449,10 @@ def cmd_update(argv: list[str]) -> int:
 
 def cmd_status(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="status", description="Summarize DAG progress and recovery state.")
-    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args(argv)
+    args.dag = resolve_dag_path(args.dag)
     dag = validate_or_exit(args.dag, args.json)
     nodes = node_map(dag)
     counts = {status: 0 for status in ("done", "running", "failed", "blocked", "pending")}
@@ -1372,6 +1520,7 @@ def cmd_status(argv: list[str]) -> int:
     ]
     output = {
         "dag_id": dag["dag_id"],
+        "control_plane_root": str(project_root(args.dag)),
         "objective": dag["objective"],
         "planning_status": dag["planning_status"],
         "convergence": dag["convergence"],
@@ -1388,6 +1537,7 @@ def cmd_status(argv: list[str]) -> int:
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         print(f"DAG {dag['dag_id']}: {counts['done']}/{total} done ({output['progress']['percent']}%)")
+        print(f"Control plane: {output['control_plane_root']}/.dag (artifact paths resolve here)")
         print(f"Planning: {dag['planning_status']} | Convergence: {dag['convergence']['status']}")
         print(
             "States: "

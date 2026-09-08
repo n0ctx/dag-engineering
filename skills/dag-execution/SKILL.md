@@ -22,8 +22,8 @@ Read `${CLAUDE_SKILL_DIR}/references/dag-schema.md` only to diagnose or repair i
 At the start of every session:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/validate-dag" .dag/dag.json
-"${CLAUDE_SKILL_DIR}/scripts/status" .dag/dag.json
+"${CLAUDE_SKILL_DIR}/scripts/validate-dag"
+"${CLAUDE_SKILL_DIR}/scripts/status"
 git status --short --branch
 git log --oneline --decorate -12
 ```
@@ -44,7 +44,7 @@ Do not start nodes while `planning_status` is not `approved`.
 Obtain eligible candidates:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/ready-tasks" .dag/dag.json --json
+"${CLAUDE_SKILL_DIR}/scripts/ready-tasks" --json
 ```
 
 The result means only: pending, all dependencies done, and no active conflict. Choose among it using actual wall-clock benefit, repeated exploration cost, hidden shared state, worktree availability, and integration risk.
@@ -60,7 +60,7 @@ The result means only: pending, all dependencies done, and no active conflict. C
 Mark a node running before dispatch:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json <node-id> running \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> running \
   --worktree "<absolute or project-relative worktree>" \
   --branch "<expected branch>" --base-ref "<expected HEAD>"
 ```
@@ -70,7 +70,7 @@ Use a fresh worker with no inherited chat history. Give it only:
 - the exact node contract;
 - precise upstream handoff references and outputs;
 - necessary project constraints and paths;
-- its worktree/path and report artifact path;
+- its worktree/path, and an absolute report artifact path under the control plane reported by `status`;
 - the worker protocol from `${CLAUDE_SKILL_DIR}/references/node-contract.md`.
 
 Do not send the whole DAG, full PRD, prior worker reasoning, or full session history. The worker implements and reports; it does not define acceptance, approve the node, edit the DAG, integrate itself into the control branch, or dispatch its own reviewer.
@@ -78,6 +78,8 @@ Do not send the whole DAG, full PRD, prior worker reasoning, or full session his
 ## Worktree policy
 
 For one node or strict serial work, use the current clean working tree unless existing project rules require isolation. Do not create a worktree for ceremony.
+
+`.dag/` exists only at the main worktree root. A relative `.dag/artifacts/...` path handed to a worker would resolve inside that worker's own worktree, where the runtime will not find it, so give absolute artifact paths whenever the worker is not in the main worktree.
 
 For concurrent implementation nodes, each node gets an isolated worktree and branch from the correct accepted base. Verify the location is ignored when project-local, reproduce required environment setup, run a clean baseline check, and keep scope explicit. Workers commit only their node. They do not merge themselves into the control branch.
 
@@ -88,7 +90,7 @@ After implementation, create a bounded review package: original node contract, a
 The reviewer checks both acceptance/scope compliance and code quality. It cannot invent acceptance criteria or choose a new architecture. Save its JSON verdict using the schema in `${CLAUDE_SKILL_DIR}/references/node-contract.md`, then record the round:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json <node-id> review \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> review \
   --handoff-ref ".dag/artifacts/<node-id>/handoff.json" \
   --review-ref ".dag/artifacts/<node-id>/review-<round>.json" \
   --head-ref "<reviewed-sha>"
@@ -105,7 +107,7 @@ Apply `${CLAUDE_SKILL_DIR}/references/verification.md`. The controller personall
 Only after all four checks pass may the controller record completion:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json <node-id> done \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> done \
   --handoff-ref ".dag/artifacts/<node-id>/handoff.json" \
   --verification-ref ".dag/artifacts/<node-id>/master-verification.json" \
   --head-ref "<reviewed-sha>" --summary "<short result>"
@@ -126,14 +128,14 @@ All nodes being `done` is necessary but not sufficient. Re-read the original obj
 If a gap exists, record failed convergence and its durable report:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json --convergence failed \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --convergence failed \
   --reference ".dag/artifacts/convergence-review.md" --gap "<short gap>"
 ```
 
 Then write a compact gap-plan JSON artifact as specified in `${CLAUDE_SKILL_DIR}/references/dag-schema.md` and import it through:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" \
   --add-gap-nodes ".dag/artifacts/gap-plan.json"
 ```
 
@@ -142,10 +144,18 @@ This preserves the failed convergence record, adds the artifact as a source, and
 If convergence passes, record it and complete the DAG:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json --convergence passed \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --convergence passed \
   --reference ".dag/artifacts/convergence-review.md"
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json --planning-status complete \
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --planning-status complete \
   --reference ".dag/artifacts/convergence-review.md"
 ```
 
 Announce project completion only when every node is done, convergence passed, and `planning_status` is `complete`.
+
+Then retire the control plane so the next effort starts clean:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --archive
+```
+
+This moves the DAG and its recorded evidence into `.dag/archive/<dag-id>-<timestamp>.json` and removes `.dag/dag.json`. Archiving is refused while any node is running.

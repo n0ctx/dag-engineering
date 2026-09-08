@@ -88,7 +88,7 @@ class RuntimeTests(unittest.TestCase):
 
     def run_cmd(self, command, *args, expect=0):
         result = subprocess.run(
-            [str(SCRIPTS / command), str(self.path), *args],
+            [str(SCRIPTS / command), "--dag", str(self.path), *args],
             text=True,
             capture_output=True,
             env={**os.environ, "CLAUDE_CODE_SESSION_ID": self.session},
@@ -307,7 +307,7 @@ class RuntimeTests(unittest.TestCase):
             ("A", "running", "--worktree", str(self.root)),
         ):
             result = subprocess.run(
-                [str(SCRIPTS / "update-task"), str(self.path), *args],
+                [str(SCRIPTS / "update-task"), "--dag", str(self.path), *args],
                 text=True,
                 capture_output=True,
                 env=environment,
@@ -330,6 +330,142 @@ class RuntimeTests(unittest.TestCase):
         )
         self.approve_as("session-exec")
         self.assertEqual(json.loads(self.path.read_text())["planning_session"], "session-plan")
+
+    def run_in(self, cwd, command, *args, expect=0):
+        result = subprocess.run(
+            [str(SCRIPTS / command), *args],
+            text=True,
+            capture_output=True,
+            cwd=str(cwd),
+            env={**os.environ, "CLAUDE_CODE_SESSION_ID": self.session},
+        )
+        self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
+        return result
+
+    def linked_worktree(self, name):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        worktree = Path(holder.name) / name
+        subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "add", "-q", str(worktree), "-b", name], check=True
+        )
+        return worktree
+
+    def draft(self, value, name="draft.json"):
+        path = self.root / ".dag" / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return f".dag/{name}"
+
+    def test_default_path_resolves_to_the_main_worktree_root(self):
+        self.write(dag([node("A")]))
+        deep = self.root / "src" / "deep"
+        deep.mkdir(parents=True)
+        self.assertIn("fixture", self.run_in(deep, "status").stdout)
+        worktree = self.linked_worktree("linked")
+        status = json.loads(self.run_in(worktree, "status", "--json").stdout)
+        self.assertEqual(Path(status["control_plane_root"]).resolve(), self.root.resolve())
+
+    def test_path_resolution_falls_back_outside_git(self):
+        with tempfile.TemporaryDirectory() as plain:
+            target = Path(plain) / ".dag"
+            target.mkdir()
+            (target / "dag.json").write_text(json.dumps(dag([node("A")])), encoding="utf-8")
+            self.assertIn("fixture", self.run_in(plain, "status").stdout)
+
+    def test_control_plane_outside_the_main_root_is_rejected(self):
+        self.write(dag([node("A")]))
+        worktree = self.linked_worktree("second")
+        stray = worktree / ".dag"
+        stray.mkdir()
+        (stray / "dag.json").write_text(json.dumps(dag([node("A")])), encoding="utf-8")
+        result = self.run_in(worktree, "validate-dag", "--dag", str(stray / "dag.json"), expect=2)
+        self.assertIn("main worktree root", result.stderr)
+
+    def test_running_rejects_a_worktree_with_its_own_control_plane(self):
+        self.write(dag([node("A")]))
+        worktree = self.linked_worktree("own-dag")
+        (worktree / ".dag").mkdir()
+        (worktree / ".dag" / "dag.json").write_text("{}", encoding="utf-8")
+        result = self.run_cmd("update-task", "A", "running", "--worktree", str(worktree), expect=3)
+        self.assertIn("second control plane", result.stderr)
+
+    def test_init_installs_a_draft_and_consumes_it(self):
+        value = dag([node("A")])
+        value["planning_status"] = "awaiting_approval"
+        value["approval_ref"] = None
+        ref = self.draft(value)
+        self.run_cmd("update-task", "--init", ref)
+        self.assertEqual(json.loads(self.path.read_text())["dag_id"], "fixture")
+        self.assertFalse((self.root / ".dag" / "draft.json").exists())
+
+    def test_init_refuses_to_replace_an_existing_control_file(self):
+        self.write(dag([node("A")]))
+        ref = self.draft(dag([node("B")]))
+        result = self.run_cmd("update-task", "--init", ref, expect=3)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual([n["id"] for n in json.loads(self.path.read_text())["nodes"]], ["A"])
+
+    def test_init_rejects_an_invalid_draft(self):
+        broken = dag([node("A", depends=("missing",))])
+        ref = self.draft(broken)
+        result = self.run_cmd("update-task", "--init", ref, expect=3)
+        self.assertIn("not a valid DAG", result.stderr)
+        self.assertFalse(self.path.exists())
+
+    def test_archive_requires_a_complete_dag(self):
+        self.write(dag([node("A")]))
+        result = self.run_cmd("update-task", "--archive", expect=3)
+        self.assertIn("not 'complete'", result.stderr)
+        self.assertTrue(self.path.exists())
+
+    def test_archive_retires_a_complete_dag(self):
+        self.awaiting([node("A")])
+        self.approve_as("session-plan")
+        self.complete("A")
+        report = self.root / ".dag" / "artifacts" / "conv.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("passed\n", encoding="utf-8")
+        self.run_cmd("update-task", "--convergence", "passed", "--reference", ".dag/artifacts/conv.md")
+        self.run_cmd("update-task", "--planning-status", "complete", "--reference", ".dag/artifacts/conv.md")
+        self.run_cmd("update-task", "--archive")
+        self.assertFalse(self.path.exists())
+        archived = list((self.root / ".dag" / "archive").glob("fixture-*.json"))
+        self.assertEqual(len(archived), 1)
+        saved = json.loads(archived[0].read_text())
+        self.assertEqual(saved["planning_status"], "complete")
+        self.assertNotIn("abandon_reason", saved)
+
+    def test_abandon_requires_the_users_persisted_instruction(self):
+        self.write(dag([node("A")]))
+        result = self.run_cmd("update-task", "--abandon", "--reason", "superseded",
+                              "--reference", ".dag/sources/never-written.md", expect=3)
+        self.assertIn("does not exist", result.stderr)
+        self.assertTrue(self.path.exists())
+
+    def test_abandon_records_reason_and_instruction(self):
+        self.write(dag([node("A")]))
+        instruction = self.root / ".dag" / "sources" / "abandon.md"
+        instruction.parent.mkdir(parents=True, exist_ok=True)
+        instruction.write_text("user: drop this plan\n", encoding="utf-8")
+        self.run_cmd("update-task", "--abandon", "--reason", "requirements changed",
+                     "--reference", ".dag/sources/abandon.md")
+        self.assertFalse(self.path.exists())
+        archived = list((self.root / ".dag" / "archive").glob("fixture-*.json"))
+        saved = json.loads(archived[0].read_text())
+        self.assertEqual(saved["abandon_reason"], "requirements changed")
+        self.assertEqual(saved["abandon_ref"], ".dag/sources/abandon.md")
+        self.assertTrue(saved["archived_at"])
+
+    def test_retiring_is_refused_while_a_node_runs(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        instruction = self.root / ".dag" / "sources" / "abandon.md"
+        instruction.parent.mkdir(parents=True, exist_ok=True)
+        instruction.write_text("user: stop\n", encoding="utf-8")
+        for args in (("--archive",), ("--abandon", "--reason", "stop", "--reference", ".dag/sources/abandon.md")):
+            result = self.run_cmd("update-task", *args, expect=3)
+            self.assertIn("running nodes first", result.stderr)
+        self.assertTrue(self.path.exists())
 
     def test_parallel_nodes_cannot_share_worktree(self):
         self.write(dag([node("A"), node("B")]))
@@ -552,7 +688,7 @@ class RuntimeTests(unittest.TestCase):
         def start(item):
             node_id, worktree = item
             return subprocess.run(
-                [str(SCRIPTS / "update-task"), str(self.path), node_id, "running", "--worktree", str(worktree)],
+                [str(SCRIPTS / "update-task"), "--dag", str(self.path), node_id, "running", "--worktree", str(worktree)],
                 text=True, capture_output=True,
             )
         with ThreadPoolExecutor(max_workers=2) as pool:

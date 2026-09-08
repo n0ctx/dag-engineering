@@ -93,6 +93,13 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 
 `status` is `pending`, `running`, `done`, `failed`, or `blocked`. `ready` is never stored.
 
+## Control plane location and lifecycle
+
+- `.dag/` lives at the main worktree root and nowhere else. Commands resolve it from there, so they work from any subdirectory, and reject a `.dag/dag.json` found elsewhere. Outside Git, or under `--separate-git-dir` where Git cannot report a trustworthy worktree root, resolution falls back to the current directory.
+- One `.dag/dag.json` exists at a time. `update-task --init <draft>` is the only sanctioned way to create it and refuses to replace an existing one.
+- `update-task --archive` retires a `complete` DAG; `update-task --abandon --reason "<why>" --reference "<durable path>"` retires an unfinished one, recording both the reason and the user's persisted instruction, because dropping unfinished work is never the controller's own decision. Both write `.dag/archive/<dag-id>-<timestamp>.json`, add `archived_at`, remove `.dag/dag.json`, and refuse while a node is running. Archived files are records only and are never reloaded.
+- Commit `.dag/` — control file, `sources/`, `artifacts/`, and `archive/`. It is the audit trail and what lets a fresh clone resume. Controller commits to the control plane stay separate from node commits, so they never enter a node's base-to-head range.
+
 ## Path and contract rules
 
 - `scope.files`, `scope.forbidden`, and `read_first` contain project-relative paths or glob patterns. Absolute paths and `..` traversal are invalid.

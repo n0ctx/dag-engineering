@@ -44,7 +44,9 @@ Before dispatch into a worktree:
 - prefer an existing project worktree convention; for a project-local directory, verify Git ignores it;
 - reproduce required environment files or links without copying secrets into Git;
 - run a project-appropriate clean baseline check;
-- tell the worker its exact directory and scope.
+- tell the worker its exact directory, scope, and absolute artifact paths.
+
+A linked worktree never contains its own `.dag/`. The control plane stays at the main worktree root, and the runtime refuses to start a node in a worktree that carries a second one.
 
 A worker commits its node but does not merge, rebase the control branch, edit another node's worktree, or update the DAG.
 

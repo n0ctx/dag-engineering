@@ -121,12 +121,22 @@ Acceptance belongs to the plan, not the worker or reviewer. Criteria must descri
 
 ## 6. Validate deterministically
 
-Write the initial DAG to `.dag/dag.json`, then run:
+Write the draft to `.dag/draft.json`, then let the runtime install it:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/validate-dag" .dag/dag.json
-"${CLAUDE_SKILL_DIR}/scripts/status" .dag/dag.json
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --init .dag/draft.json
+"${CLAUDE_SKILL_DIR}/scripts/status"
 ```
+
+`--init` validates the draft, installs it as `.dag/dag.json`, and consumes the draft. Never write `.dag/dag.json` directly: the runtime is what guarantees a new plan cannot overwrite an existing one.
+
+If `--init` reports that a control file already exists, stop. A completed DAG is retired with `update-task --archive`, which you may do yourself. An unfinished one is different: report what it is and what remains, then ask whether to resume it or drop it, and end the turn. Abandoning half-finished work is the user's call, so the runtime also requires their persisted instruction:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --abandon --reason "<why>" --reference "<path under .dag/sources/>"
+```
+
+Deciding for yourself that a new request supersedes an existing plan is never a reason to abandon it.
 
 Fix every validation error before presenting the plan. The model's own review does not replace the validator.
 
@@ -141,7 +151,7 @@ For a newly generated DAG from a short, natural-language, vague, or unapproved s
 Validation success is not product approval. After explicit approval, the controller records it through:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/update-task" .dag/dag.json --planning-status approved --reference "<durable approval reference>"
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --planning-status approved --reference "<durable approval reference>"
 ```
 
 For an approval given in chat, first persist the exact approval and the DAG version it accepts under `.dag/sources/`, then pass that project-relative path. The runtime rejects a missing local approval artifact.

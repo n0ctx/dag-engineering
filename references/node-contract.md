@@ -17,7 +17,7 @@ expected outputs
 acceptance
 verification
 worktree/path
-report artifact path
+report artifact path (absolute; a relative one lands in the worker's own worktree)
 project constraints that bind this node
 ```
 
@@ -62,7 +62,7 @@ For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was trie
 
 ## Worker handoff
 
-Write a compact artifact, preferably `.dag/artifacts/<node-id>/handoff.json`:
+Write a compact artifact at the exact path the controller supplied, normally `<control-plane-root>/.dag/artifacts/<node-id>/handoff.json`:
 
 ```json
 {

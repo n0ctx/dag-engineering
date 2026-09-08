@@ -1,0 +1,57 @@
+# Verification gates
+
+A node reaches `done` only after worker evidence, fresh review, and controller verification all exist. No agent approves its own work.
+
+## 1. Scope gate
+
+Use real Git data against the node's base/head or working-tree boundary:
+
+```bash
+git diff --stat <base>..<head>
+git diff --name-only <base>..<head>
+git status --short
+```
+
+Compare every changed path with `scope.files` and `scope.forbidden`. Generated or untracked files count. A useful out-of-scope edit is still an out-of-scope edit: reject or explicitly re-plan it rather than silently widening the node.
+
+## 2. Evidence gate
+
+Check that each claimed command, lint, typecheck, build, CLI action, or manual observation has a reproducible command and result tied to the reviewed commit/worktree. Missing, truncated, stale, or pre-fix evidence is not a pass.
+
+Worker evidence can satisfy breadth, but it does not replace the independent controller check.
+
+## 3. Review gate
+
+Confirm a fresh reviewer evaluated:
+
+- the original node contract and acceptance, not criteria it invented;
+- the actual diff or immutable review package;
+- scope compliance and test validity;
+- the current fix round rather than an earlier commit.
+
+Critical, Important, spec, or scope findings remain blocking until a scoped re-review marks them addressed or the controller re-plans. Minor findings may be recorded without extending the fix loop when they do not undermine acceptance.
+
+## 4. Independent controller gate
+
+The controller personally runs at least one real criterion directly tied to a node acceptance ID. Reading the worker or reviewer report is not a check. Prefer the smallest command or observable probe that would fail if the claimed behavior were absent.
+
+Record command, immutable Git head, timestamp, covered acceptance IDs, exit status, concise output, and the exact Git diff path list in a JSON artifact matching `${CLAUDE_SKILL_DIR}/references/dag-schema.md`. Pass that artifact to `update-task --verification-ref`.
+
+If the check fails, return the concrete finding to the implementer. The controller does not fix it inline by default, because implementing the fix would compromise its independent acceptance role.
+
+## Integration gate
+
+After landing mutually related nodes, test the integrated interface and any global behavior affected by their combination. Per-node green checks do not prove merge order, schema compatibility, generated outputs, or end-to-end flow.
+
+## Final convergence gate
+
+When every node is done, independently compare the integrated project with:
+
+- the original objective;
+- every `source_ref` and global acceptance criterion;
+- accepted non-goals and compatibility constraints;
+- end-to-end behavior and integration evidence.
+
+Classify each global criterion as verified, missing, or partly verified. Check for requirements that never mapped to a node. A missing or partial requirement creates an explicit gap node or `replan_required`; it never becomes an implicit postscript to a done node.
+
+Only passed convergence plus all nodes done permits the DAG to become `complete`.

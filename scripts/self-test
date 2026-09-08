@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+import copy
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+
+SCRIPTS = Path(__file__).resolve().parent
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def node(node_id, *, depends=(), conflicts=(), files=None):
+    return {
+        "id": node_id,
+        "title": f"Node {node_id}",
+        "objective": f"Deliver {node_id}",
+        "work_type": "implementation",
+        "estimated_cost": "low",
+        "scope": {"files": list(files) if files else [f"src/{node_id}.py"], "forbidden": []},
+        "read_first": [],
+        "depends_on": list(depends),
+        "conflicts_with": list(conflicts),
+        "inputs": [],
+        "outputs": [f"output {node_id}"],
+        "acceptance": [{"id": "AC1", "criterion": f"{node_id} works"}],
+        "verification": [{"id": "V1", "run": "true", "expect": "exit 0", "covers": ["AC1"]}],
+        "status": "pending",
+        "attempts": [],
+        "handoff": {
+            "status": None,
+            "ref": None,
+            "verification_refs": [],
+            "commit": None,
+            "summary": None,
+            "failure_reason": None,
+            "updated_at": None,
+        },
+    }
+
+
+def dag(nodes):
+    timestamp = now()
+    return {
+        "schema_version": 1,
+        "dag_id": "fixture",
+        "objective": "Exercise runtime",
+        "source_refs": [".dag/sources/fixture.md"],
+        "assumptions": [],
+        "global_acceptance": [{"id": "G1", "criterion": "runtime behaves"}],
+        "planning_status": "approved",
+        "approval_ref": "fixture approval",
+        "max_parallel": 3,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "convergence": {"status": "pending", "verification_ref": None, "checked_at": None, "gaps": []},
+        "nodes": nodes,
+    }
+
+
+class RuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Fixture"], check=True)
+        (self.root / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "baseline"], check=True)
+        self.path = self.root / ".dag" / "dag.json"
+        self.path.parent.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write(self, value):
+        self.path.write_text(json.dumps(value), encoding="utf-8")
+
+    def run_cmd(self, command, *args, expect=0):
+        result = subprocess.run(
+            [str(SCRIPTS / command), str(self.path), *args],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
+        return result
+
+    def start(self, node_id):
+        return self.run_cmd("update-task", node_id, "running", "--worktree", str(self.root))
+
+    def commit_node(self, node_id):
+        path = self.root / "src" / f"{node_id}.py"
+        path.parent.mkdir(exist_ok=True)
+        count = subprocess.run(
+            ["git", "-C", str(self.root), "rev-list", "--count", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        path.write_text(f"VALUE = {node_id!r}\nREVISION = {count}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", str(path.relative_to(self.root))], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", f"deliver {node_id}"], check=True)
+        return subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+    def artifacts(self, node_id, head, *, round_number=1, approved=True):
+        folder = self.root / ".dag" / "artifacts" / node_id
+        folder.mkdir(parents=True, exist_ok=True)
+        handoff = folder / f"handoff-{round_number}.json"
+        handoff.write_text(json.dumps({
+            "node": node_id,
+            "status": "DONE",
+            "files_changed": [f"src/{node_id}.py"],
+            "outputs": [f"output {node_id}"],
+            "decisions": [],
+            "verification": [{"command": "fixture check", "result": "exit 0"}],
+            "concerns": [],
+            "unresolved": [],
+            "downstream_notes": [],
+            "commit": head,
+        }), encoding="utf-8")
+        review = folder / f"review-{round_number}.json"
+        review.write_text(json.dumps({
+            "node": node_id,
+            "head_ref": head,
+            "round": round_number,
+            "spec": "APPROVED" if approved else "NEEDS_FIXES",
+            "quality": "APPROVED" if approved else "NEEDS_FIXES",
+            "blocking_findings": [] if approved else ["F1"],
+        }), encoding="utf-8")
+        master = folder / "master.json"
+        master.write_text(json.dumps({
+            "node": node_id,
+            "head_ref": head,
+            "checked_at": now(),
+            "acceptance_ids": ["AC1"],
+            "checks": [{"command": "fixture check", "exit_code": 0, "result": "passed"}],
+            "scope_files": [f"src/{node_id}.py"],
+        }), encoding="utf-8")
+        return tuple(str(path.relative_to(self.root)) for path in (handoff, review, master))
+
+    def complete(self, node_id):
+        self.start(node_id)
+        head = self.commit_node(node_id)
+        handoff, review, master = self.artifacts(node_id, head)
+        self.run_cmd(
+            "update-task", node_id, "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head,
+        )
+        self.run_cmd(
+            "update-task", node_id, "done", "--handoff-ref", handoff,
+            "--verification-ref", master, "--head-ref", head, "--summary", f"{node_id} delivered",
+        )
+        return head
+
+    def test_happy_path_and_ready_dependency(self):
+        self.write(dag([node("A"), node("B"), node("C", depends=("A", "B")), node("D")]))
+        self.run_cmd("validate-dag")
+        ready = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
+        self.assertEqual([item["id"] for item in ready["candidates"]], ["A", "B", "D"])
+
+    def test_cycle_and_missing_dependency_fail(self):
+        cycle = dag([node("A", depends=("B",)), node("B", depends=("A",))])
+        self.write(cycle)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("cycle", result.stderr)
+        missing = dag([node("A", depends=("missing",))])
+        self.write(missing)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("unknown node", result.stderr)
+
+    def test_self_dependency_and_invalid_status_fail(self):
+        self_ref = dag([node("A", depends=("A",))])
+        self.write(self_ref)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("self-reference", result.stderr)
+        invalid = dag([node("A")])
+        invalid["nodes"][0]["status"] = "ready"
+        self.write(invalid)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("invalid value 'ready'", result.stderr)
+
+    def test_ephemeral_source_label_fails(self):
+        value = dag([node("A")])
+        value["source_refs"] = ["user-request: 2026-09-08"]
+        self.write(value)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("durable project path", result.stderr)
+
+    def test_conflict_excludes_only_active_peer(self):
+        self.write(dag([node("A", conflicts=("B",)), node("B", conflicts=("A",))]))
+        initial = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
+        self.assertEqual([item["id"] for item in initial["candidates"]], ["A", "B"])
+        self.start("A")
+        active = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
+        self.assertEqual(active["candidates"], [])
+
+    def test_overlapping_scope_without_conflict_edge_fails(self):
+        self.write(dag([node("A", files=["src/**"]), node("B", files=["src/auth/*.py"])]))
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("scopes overlap", result.stderr)
+
+    def test_overlapping_scope_is_allowed_when_ordered_or_declared(self):
+        self.write(
+            dag([
+                node("A", files=["src/**"], conflicts=("B",)),
+                node("B", files=["src/auth/*.py"], conflicts=("A",)),
+            ])
+        )
+        self.run_cmd("validate-dag")
+        self.write(dag([node("A", files=["src/**"]), node("B", files=["src/auth/*.py"], depends=("A",))]))
+        self.run_cmd("validate-dag")
+
+    def test_disjoint_patterns_are_not_reported_as_conflicts(self):
+        self.write(dag([node("A", files=["src/**/*.py"]), node("B", files=["src/**/*.md"])]))
+        self.run_cmd("validate-dag")
+        self.write(dag([node("A", files=["src/auth/**"]), node("B", files=["src/billing/**"])]))
+        self.run_cmd("validate-dag")
+
+    def test_done_node_cannot_collide_with_a_pending_peer(self):
+        self.write(
+            dag([
+                node("A", files=["src/**"], conflicts=("B",)),
+                node("B", files=["src/auth/*.py"], conflicts=("A",)),
+            ])
+        )
+        self.complete("A")
+        value = json.loads(self.path.read_text())
+        for entry in value["nodes"]:
+            entry["conflicts_with"] = []
+        self.write(value)
+        self.run_cmd("validate-dag")
+
+    def test_status_roadmap_layers_follow_dependencies(self):
+        self.write(
+            dag([
+                node("A"),
+                node("B", conflicts=("A",), files=["lib/b.py"]),
+                node("C", depends=("A", "B")),
+                node("D", depends=("C",)),
+            ])
+        )
+        value = json.loads(self.path.read_text())
+        value["nodes"][1]["conflicts_with"] = ["A"]
+        value["nodes"][0]["conflicts_with"] = ["B"]
+        self.write(value)
+        status = json.loads(self.run_cmd("status", "--json").stdout)
+        self.assertEqual(
+            [[entry["id"] for entry in layer["nodes"]] for layer in status["roadmap"]],
+            [["A", "B"], ["C"], ["D"]],
+        )
+        first = status["roadmap"][0]["nodes"]
+        self.assertEqual([entry["unlocks"] for entry in first], [["C"], ["C"]])
+        self.assertTrue(all(entry["ready"] for entry in first))
+        self.assertFalse(status["roadmap"][1]["nodes"][0]["ready"])
+        text = self.run_cmd("status").stdout
+        self.assertIn("Layer 0:", text)
+        self.assertIn("A: Node A (ready) -> C", text)
+
+    def test_parallel_nodes_cannot_share_worktree(self):
+        self.write(dag([node("A"), node("B")]))
+        self.start("A")
+        result = self.run_cmd(
+            "update-task", "B", "running", "--worktree", str(self.root), expect=3,
+        )
+        self.assertIn("already uses this worktree", result.stderr)
+
+    def test_blocked_upstream_and_resume(self):
+        self.write(dag([node("A"), node("C", depends=("A",))]))
+        self.start("A")
+        self.run_cmd("update-task", "A", "blocked", "--reason", "missing contract")
+        ready = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
+        self.assertEqual(ready["candidates"], [])
+        status = json.loads(self.run_cmd("status", "--json").stdout)
+        self.assertEqual(status["counts"]["blocked"], 1)
+        self.assertTrue(any(item["node"] == "C" for item in status["critical_blockers"]))
+        self.start("A")
+        resumed = json.loads(self.path.read_text())
+        self.assertEqual(resumed["nodes"][0]["status"], "running")
+        self.assertEqual(len(resumed["nodes"][0]["attempts"]), 2)
+
+    def test_legal_done_and_illegal_pending_done(self):
+        self.write(dag([node("A"), node("B")]))
+        before = self.path.read_text()
+        self.run_cmd(
+            "update-task",
+            "B",
+            "done",
+            "--handoff-ref",
+            ".dag/artifacts/B/handoff.json",
+            "--verification-ref",
+            ".dag/artifacts/B/master.txt",
+            "--summary",
+            "done",
+            expect=3,
+        )
+        self.assertEqual(self.path.read_text(), before)
+        self.start("A")
+        head = self.commit_node("A")
+        handoff, review, master = self.artifacts("A", head)
+        self.run_cmd("update-task", "A", "review", "--handoff-ref", handoff, "--review-ref", review, "--head-ref", head)
+        self.run_cmd("update-task", "A", "done", "--handoff-ref", handoff, "--verification-ref", master, "--head-ref", head, "--summary", "A delivered")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][0]["status"], "done")
+        self.assertEqual(saved["nodes"][0]["attempts"][0]["outcome"], "done")
+
+    def test_approval_and_convergence_gates(self):
+        value = dag([node("A")])
+        value["planning_status"] = "awaiting_approval"
+        value["approval_ref"] = None
+        self.write(value)
+        self.run_cmd("update-task", "A", "running", expect=3)
+        self.run_cmd(
+            "update-task", "--planning-status", "approved",
+            "--reference", ".dag/sources/missing-approval.md", expect=3,
+        )
+        approval = self.root / ".dag" / "sources" / "approval.md"
+        approval.parent.mkdir(parents=True, exist_ok=True)
+        approval.write_text("approved\n", encoding="utf-8")
+        self.run_cmd("update-task", "--planning-status", "approved", "--reference", ".dag/sources/approval.md")
+        self.complete("A")
+        self.run_cmd("update-task", "--planning-status", "complete", "--reference", "review", expect=3)
+        convergence = self.root / ".dag" / "artifacts" / "convergence.md"
+        convergence.parent.mkdir(parents=True, exist_ok=True)
+        convergence.write_text("passed\n", encoding="utf-8")
+        self.run_cmd("update-task", "--convergence", "passed", "--reference", ".dag/artifacts/convergence.md")
+        self.run_cmd("update-task", "--planning-status", "complete", "--reference", ".dag/artifacts/convergence.md")
+        self.run_cmd("validate-dag")
+
+    def test_failed_convergence_survives_gap_node_replan(self):
+        self.write(dag([node("A")]))
+        self.complete("A")
+        convergence = self.root / ".dag" / "artifacts" / "convergence.md"
+        convergence.parent.mkdir(parents=True, exist_ok=True)
+        convergence.write_text("missing original requirement\n", encoding="utf-8")
+        self.run_cmd(
+            "update-task",
+            "--convergence",
+            "failed",
+            "--reference",
+            ".dag/artifacts/convergence.md",
+            "--gap",
+            "missing original requirement",
+        )
+        gap_plan = self.root / ".dag" / "artifacts" / "gap-plan.json"
+        gap_plan.write_text(json.dumps({
+            "dag_id": "fixture",
+            "addresses_gaps": ["missing original requirement"],
+            "nodes": [node("GAP", depends=("A",))],
+        }), encoding="utf-8")
+        self.run_cmd("update-task", "--add-gap-nodes", ".dag/artifacts/gap-plan.json")
+        self.run_cmd("validate-dag")
+        status = json.loads(self.run_cmd("status", "--json").stdout)
+        self.assertTrue(any(item["node"] == "<convergence>" for item in status["critical_blockers"]))
+
+    def test_done_rejects_missing_or_unapproved_evidence(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        handoff, review, master = self.artifacts("A", head, approved=False)
+        result = self.run_cmd(
+            "update-task", "A", "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head,
+        )
+        self.assertIn("needs_fixes", result.stdout)
+        self.run_cmd(
+            "update-task", "A", "done", "--handoff-ref", handoff,
+            "--verification-ref", master, "--head-ref", head, "--summary", "not done", expect=3,
+        )
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][0]["status"], "running")
+
+        missing = ".dag/artifacts/A/missing.json"
+        self.run_cmd(
+            "update-task", "A", "review", "--handoff-ref", missing,
+            "--review-ref", missing, "--head-ref", head, expect=3,
+        )
+
+    def test_done_rejects_missing_master_artifact_after_approval(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        handoff, review, _ = self.artifacts("A", head)
+        self.run_cmd(
+            "update-task", "A", "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head,
+        )
+        result = self.run_cmd(
+            "update-task", "A", "done", "--handoff-ref", handoff,
+            "--verification-ref", ".dag/artifacts/A/not-there.json",
+            "--head-ref", head, "--summary", "not done", expect=3,
+        )
+        self.assertIn("does not exist", result.stderr)
+
+    def test_scope_violation_is_rejected_by_review_gate(self):
+        value = dag([node("A")])
+        self.write(value)
+        self.start("A")
+        path = self.root / "outside.py"
+        path.write_text("BAD = True\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "outside.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "outside scope"], check=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        folder = self.root / ".dag" / "artifacts" / "A"
+        folder.mkdir(parents=True)
+        handoff = folder / "handoff.json"
+        handoff.write_text("{}", encoding="utf-8")
+        review = folder / "review.json"
+        review.write_text("{}", encoding="utf-8")
+        result = self.run_cmd(
+            "update-task", "A", "review",
+            "--handoff-ref", str(handoff.relative_to(self.root)),
+            "--review-ref", str(review.relative_to(self.root)), "--head-ref", head, expect=3,
+        )
+        self.assertIn("scope violation", result.stderr)
+
+    def test_review_circuit_breaker_is_stateful(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        for round_number in range(1, 4):
+            head = self.commit_node("A")
+            handoff, review, _ = self.artifacts("A", head, round_number=round_number, approved=False)
+            self.run_cmd(
+                "update-task", "A", "review", "--handoff-ref", handoff,
+                "--review-ref", review, "--head-ref", head,
+            )
+        head = self.commit_node("A")
+        handoff, review, _ = self.artifacts("A", head, round_number=4, approved=True)
+        result = self.run_cmd(
+            "update-task", "A", "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head, expect=3,
+        )
+        self.assertIn("at most three rounds", result.stderr)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(len(saved["nodes"][0]["attempts"][0]["reviews"]), 3)
+
+    def test_running_attempt_persists_git_recovery_state(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        attempt = json.loads(self.path.read_text())["nodes"][0]["attempts"][0]
+        self.assertEqual(attempt["worktree"], str(self.root.resolve()))
+        self.assertTrue(attempt["branch"])
+        self.assertEqual(len(attempt["base_ref"]), 40)
+        self.assertIsNone(attempt["head_ref"])
+        self.assertEqual(attempt["reviews"], [])
+        status = json.loads(self.run_cmd("status", "--json").stdout)
+        self.assertEqual(status["active_attempts"][0]["worktree"], str(self.root.resolve()))
+        self.assertEqual(status["active_attempts"][0]["attempt"], 1)
+
+    def test_gap_import_rejects_unmatched_gap(self):
+        self.write(dag([node("A")]))
+        self.complete("A")
+        report = self.root / ".dag" / "artifacts" / "convergence.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("gap one\n", encoding="utf-8")
+        self.run_cmd(
+            "update-task", "--convergence", "failed", "--reference", ".dag/artifacts/convergence.md",
+            "--gap", "gap one",
+        )
+        gap_plan = self.root / ".dag" / "artifacts" / "bad-gap-plan.json"
+        gap_plan.write_text(json.dumps({
+            "dag_id": "fixture", "addresses_gaps": ["different gap"], "nodes": [node("GAP")]
+        }), encoding="utf-8")
+        self.run_cmd("update-task", "--add-gap-nodes", ".dag/artifacts/bad-gap-plan.json", expect=3)
+
+    def test_concurrent_updates_use_lock_without_lost_state(self):
+        self.write(dag([node("A"), node("B")]))
+        second = self.root / ".dag" / "worktrees" / "B"
+        second.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "worktree", "add", "-qb", "fixture-b", str(second), "HEAD"],
+            check=True,
+        )
+        def start(item):
+            node_id, worktree = item
+            return subprocess.run(
+                [str(SCRIPTS / "update-task"), str(self.path), node_id, "running", "--worktree", str(worktree)],
+                text=True, capture_output=True,
+            )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(start, (("A", self.root), ("B", second))))
+        self.assertTrue(all(result.returncode == 0 for result in results), [result.stderr for result in results])
+        saved = json.loads(self.path.read_text())
+        self.assertEqual({item["status"] for item in saved["nodes"]}, {"running"})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

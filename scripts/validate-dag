@@ -1,0 +1,1427 @@
+#!/usr/bin/env python3
+"""Validate and update dag-engineering state with no external dependencies."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import fnmatch
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sys
+import tempfile
+import subprocess
+from datetime import datetime, timezone
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+HARD_MAX_PARALLEL = 3
+PLANNING_STATUSES = {
+    "draft",
+    "awaiting_approval",
+    "approved",
+    "replan_required",
+    "complete",
+}
+NODE_STATUSES = {"pending", "running", "done", "failed", "blocked"}
+WORK_TYPES = {"implementation", "investigation", "integration", "documentation"}
+COSTS = {"low", "medium", "high"}
+CONVERGENCE_STATUSES = {"pending", "failed", "passed"}
+REVIEW_OUTCOMES = {"approved", "needs_fixes", "cannot_verify"}
+WORKER_DONE_STATUSES = {"DONE", "DONE_WITH_CONCERNS"}
+NODE_TRANSITIONS = {
+    "pending": {"running"},
+    "running": {"done", "failed", "blocked"},
+    "failed": {"running"},
+    "blocked": {"pending", "running"},
+    "done": set(),
+}
+PLANNING_TRANSITIONS = {
+    "draft": {"awaiting_approval"},
+    "awaiting_approval": {"approved"},
+    "approved": {"replan_required", "complete"},
+    "replan_required": {"awaiting_approval", "approved"},
+    "complete": set(),
+}
+TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+EXIT_INVALID = 1
+EXIT_USAGE = 2
+EXIT_TRANSITION = 3
+
+
+class DagError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def is_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_timestamp(value: Any) -> bool:
+    return is_text(value) and bool(TIMESTAMP_RE.match(value))
+
+
+def is_safe_path(value: Any) -> bool:
+    if not is_text(value) or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    return not path.is_absolute() and value != "." and ".." not in path.parts
+
+
+def is_source_ref(value: Any) -> bool:
+    if not is_text(value):
+        return False
+    if value.startswith(("https://", "http://", "issue:", "commit:")):
+        return not any(char.isspace() for char in value)
+    if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", value):
+        return True
+    return is_safe_path(value) and ":" not in value
+
+
+def load_dag(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except FileNotFoundError as exc:
+        raise DagError(f"DAG file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DagError(f"invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
+    except OSError as exc:
+        raise DagError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise DagError("DAG root must be a JSON object")
+    return value
+
+
+def atomic_write(path: Path, dag: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temp_name = handle.name
+            json.dump(dag, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except OSError as exc:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        raise DagError(f"cannot write {path}: {exc}") from exc
+
+
+@contextmanager
+def dag_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    try:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise DagError(f"cannot lock {path}: {exc}") from exc
+
+
+def project_root(dag_path: Path) -> Path:
+    resolved = dag_path.resolve()
+    return resolved.parent.parent if resolved.parent.name == ".dag" else resolved.parent
+
+
+def artifact_path(dag_path: Path, ref: Any, label: str, *, json_object: bool = False) -> Path:
+    if not is_safe_path(ref):
+        raise DagError(f"{label} must be a safe project-relative path")
+    root = project_root(dag_path)
+    target = (root / ref).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise DagError(f"{label} resolves outside the project: {ref}") from exc
+    if not target.is_file():
+        raise DagError(f"{label} does not exist or is not a file: {ref}")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise DagError(f"{label} is not readable UTF-8: {ref}: {exc}") from exc
+    if not content.strip():
+        raise DagError(f"{label} is empty: {ref}")
+    if json_object:
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise DagError(f"{label} is invalid JSON: {ref}: {exc.msg}") from exc
+        if not isinstance(value, dict):
+            raise DagError(f"{label} must contain a JSON object: {ref}")
+    return target
+
+
+def run_git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise DagError(f"cannot run git in {worktree}: {exc}") from exc
+
+
+def resolve_worktree(dag_path: Path, raw_worktree: str) -> Path:
+    worktree = Path(raw_worktree)
+    if not worktree.is_absolute():
+        worktree = project_root(dag_path) / worktree
+    worktree = worktree.resolve()
+    if not worktree.is_dir():
+        raise DagError(f"worktree does not exist: {raw_worktree}")
+    result = run_git(worktree, "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        raise DagError(f"worktree is not inside a Git repository: {raw_worktree}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def resolve_commit(worktree: Path, ref: str, label: str) -> str:
+    if not is_text(ref):
+        raise DagError(f"{label} must be a non-empty Git ref")
+    result = run_git(worktree, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if result.returncode != 0:
+        raise DagError(f"{label} is not a commit in {worktree}: {ref}")
+    return result.stdout.strip()
+
+
+def current_branch(worktree: Path) -> str:
+    result = run_git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return result.stdout.strip() if result.returncode == 0 else "(detached)"
+
+
+def dirty_paths(worktree: Path) -> list[str]:
+    result = run_git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if result.returncode != 0:
+        raise DagError(f"cannot inspect worktree status: {result.stderr.strip()}")
+    paths: list[str] = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        raw = record[3:] if len(record) >= 4 and record[2] == " " else record
+        if raw == ".dag" or raw.startswith(".dag/"):
+            continue
+        paths.append(raw)
+    return paths
+
+
+def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
+    raw_worktree = attempt["worktree"]
+    worktree = resolve_worktree(dag_path, raw_worktree)
+    base_ref = attempt["base_ref"]
+    base_ref = resolve_commit(worktree, base_ref, "base_ref")
+    head_ref = resolve_commit(worktree, head_ref, "head_ref")
+    ancestor = run_git(worktree, "merge-base", "--is-ancestor", base_ref, head_ref)
+    if ancestor.returncode != 0:
+        raise DagError(f"head_ref {head_ref!r} is not a descendant of base_ref {base_ref!r}")
+    diff = run_git(worktree, "diff", "--name-only", f"{base_ref}..{head_ref}")
+    if diff.returncode != 0:
+        raise DagError(f"cannot compute node diff: {diff.stderr.strip()}")
+    dirty = dirty_paths(worktree)
+    if dirty:
+        raise DagError("worktree has uncommitted changes outside .dag/: " + ", ".join(dirty))
+    changed = [line for line in diff.stdout.splitlines() if line]
+    allowed = node["scope"]["files"]
+    forbidden = node["scope"]["forbidden"]
+    for changed_path in changed:
+        if any(fnmatch.fnmatchcase(changed_path, pattern) for pattern in forbidden):
+            raise DagError(f"scope violation: {changed_path!r} matches forbidden scope")
+        if not any(fnmatch.fnmatchcase(changed_path, pattern) for pattern in allowed):
+            raise DagError(f"scope violation: {changed_path!r} is outside scope.files")
+    return changed
+
+
+def load_json_artifact(dag_path: Path, ref: Any, label: str) -> dict[str, Any]:
+    path = artifact_path(dag_path, ref, label, json_object=True)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_handoff_artifact(
+    dag_path: Path, ref: str, node_id: str, head_ref: str, changed: list[str]
+) -> dict[str, Any]:
+    value = load_json_artifact(dag_path, ref, "handoff artifact")
+    if value.get("node") != node_id:
+        raise DagError(f"handoff artifact node must be {node_id!r}")
+    if value.get("status") not in WORKER_DONE_STATUSES:
+        raise DagError("handoff artifact status must be DONE or DONE_WITH_CONCERNS")
+    commit = value.get("commit")
+    if commit != head_ref:
+        raise DagError("handoff artifact commit must equal the reviewed head commit")
+    if not isinstance(value.get("files_changed"), list):
+        raise DagError("handoff artifact files_changed must be an array")
+    if value["files_changed"] != changed:
+        raise DagError("handoff artifact files_changed must equal the Git diff path list")
+    if not isinstance(value.get("verification"), list) or not value["verification"]:
+        raise DagError("handoff artifact verification must be a non-empty array")
+    return value
+
+
+def validate_review_artifact(
+    dag_path: Path, ref: str, node_id: str, head_ref: str, expected_round: int
+) -> dict[str, Any]:
+    value = load_json_artifact(dag_path, ref, "review artifact")
+    if value.get("node") != node_id:
+        raise DagError(f"review artifact node must be {node_id!r}")
+    if value.get("head_ref") != head_ref:
+        raise DagError("review artifact head_ref must equal the reviewed head commit")
+    if value.get("round") != expected_round:
+        raise DagError(f"review artifact round must be {expected_round}")
+    if value.get("spec") not in {"APPROVED", "NEEDS_FIXES", "CANNOT_VERIFY"}:
+        raise DagError("review artifact has invalid spec verdict")
+    if value.get("quality") not in {"APPROVED", "NEEDS_FIXES"}:
+        raise DagError("review artifact has invalid quality verdict")
+    findings = value.get("blocking_findings")
+    if not isinstance(findings, list):
+        raise DagError("review artifact blocking_findings must be an array")
+    return value
+
+
+def validate_master_artifact(
+    dag_path: Path,
+    ref: str,
+    node: dict[str, Any],
+    head_ref: str,
+    changed: list[str],
+) -> None:
+    value = load_json_artifact(dag_path, ref, "master verification artifact")
+    if value.get("node") != node["id"]:
+        raise DagError(f"master verification artifact node must be {node['id']!r}")
+    if value.get("head_ref") != head_ref:
+        raise DagError("master verification artifact head_ref must equal the completed head commit")
+    if not is_timestamp(value.get("checked_at")):
+        raise DagError("master verification artifact checked_at must be a UTC timestamp")
+    acceptance_ids = {entry["id"] for entry in node["acceptance"]}
+    covered = value.get("acceptance_ids")
+    if not isinstance(covered, list) or not covered or any(item not in acceptance_ids for item in covered):
+        raise DagError("master verification artifact must cover at least one declared acceptance ID")
+    checks = value.get("checks")
+    if not isinstance(checks, list) or not checks:
+        raise DagError("master verification artifact checks must be a non-empty array")
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict) or not is_text(check.get("command")):
+            raise DagError(f"master verification artifact checks[{index}] needs a command")
+        if check.get("exit_code") != 0 or not is_text(check.get("result")):
+            raise DagError(f"master verification artifact checks[{index}] is not a passing check")
+    if value.get("scope_files") != changed:
+        raise DagError("master verification artifact scope_files must equal the Git diff path list")
+
+
+def expect_text(errors: list[str], value: Any, label: str) -> None:
+    if not is_text(value):
+        errors.append(f"{label}: must be a non-empty string")
+
+
+def expect_string_list(
+    errors: list[str], value: Any, label: str, *, nonempty: bool = False, paths: bool = False
+) -> None:
+    if not isinstance(value, list):
+        errors.append(f"{label}: must be an array")
+        return
+    if nonempty and not value:
+        errors.append(f"{label}: must not be empty")
+    for index, item in enumerate(value):
+        if paths:
+            if not is_safe_path(item):
+                errors.append(f"{label}[{index}]: must be a safe project-relative path or glob")
+        elif not is_text(item):
+            errors.append(f"{label}[{index}]: must be a non-empty string")
+
+
+def validate_criteria(
+    errors: list[str], value: Any, label: str, *, criterion_key: str = "criterion"
+) -> set[str]:
+    ids: set[str] = set()
+    if not isinstance(value, list) or not value:
+        errors.append(f"{label}: must be a non-empty array")
+        return ids
+    for index, item in enumerate(value):
+        prefix = f"{label}[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        entry_id = item.get("id")
+        expect_text(errors, entry_id, f"{prefix}.id")
+        expect_text(errors, item.get(criterion_key), f"{prefix}.{criterion_key}")
+        if is_text(entry_id):
+            if entry_id in ids:
+                errors.append(f"{prefix}.id: duplicate ID {entry_id!r}")
+            ids.add(entry_id)
+    return ids
+
+
+def find_cycle(nodes: dict[str, dict[str, Any]]) -> list[str] | None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node_id: str) -> list[str] | None:
+        if node_id in visiting:
+            start = stack.index(node_id)
+            return stack[start:] + [node_id]
+        if node_id in visited:
+            return None
+        visiting.add(node_id)
+        stack.append(node_id)
+        for dependency in nodes[node_id].get("depends_on", []):
+            if dependency in nodes:
+                cycle = visit(dependency)
+                if cycle:
+                    return cycle
+        stack.pop()
+        visiting.remove(node_id)
+        visited.add(node_id)
+        return None
+
+    for node_id in nodes:
+        cycle = visit(node_id)
+        if cycle:
+            return cycle
+    return None
+
+
+WILDCARDS = "*?["
+
+
+def literal_bounds(pattern: str) -> tuple[str, str | None]:
+    """Return the literal head of a pattern and, when knowable, its literal tail.
+
+    A character class makes the tail unreliable without a full fnmatch parse, so it
+    is reported as unknown rather than guessed.
+    """
+    first = min((pattern.find(char) for char in WILDCARDS if char in pattern), default=-1)
+    if first < 0:
+        return pattern, pattern
+    if "[" in pattern:
+        return pattern[:first], None
+    last = max(pattern.rfind(char) for char in "*?" if char in pattern)
+    return pattern[:first], pattern[last + 1 :]
+
+
+def patterns_may_overlap(left: str, right: str) -> bool:
+    """Over-approximate whether two fnmatch patterns can match one path.
+
+    Never reports False for a genuine overlap, so a missing conflict edge cannot
+    slip through. A false positive only costs one parallelism opportunity.
+    """
+    if not any(char in left + right for char in WILDCARDS):
+        return left == right
+    left_prefix, left_suffix = literal_bounds(left)
+    right_prefix, right_suffix = literal_bounds(right)
+    if not (left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)):
+        return False
+    if left_suffix is None or right_suffix is None:
+        return True
+    return left_suffix.endswith(right_suffix) or right_suffix.endswith(left_suffix)
+
+
+def dependency_closure(nodes: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    """Map each node to every node it transitively depends on."""
+    closure: dict[str, set[str]] = {}
+
+    def resolve(node_id: str, seen: frozenset[str]) -> set[str]:
+        if node_id in closure:
+            return closure[node_id]
+        if node_id in seen:
+            return set()
+        reached: set[str] = set()
+        for dependency in nodes[node_id].get("depends_on", []):
+            if dependency in nodes:
+                reached.add(dependency)
+                reached |= resolve(dependency, seen | {node_id})
+        closure[node_id] = reached
+        return reached
+
+    for node_id in nodes:
+        resolve(node_id, frozenset())
+    return closure
+
+
+def dependency_layers(nodes: dict[str, dict[str, Any]]) -> list[list[str]]:
+    """Group nodes by longest depends_on distance from a root.
+
+    Ordering comes from depends_on alone; conflicts_with is resource exclusion and
+    never implies a layer.
+    """
+    depth: dict[str, int] = {}
+
+    def resolve(node_id: str, seen: frozenset[str]) -> int:
+        if node_id in depth:
+            return depth[node_id]
+        if node_id in seen:
+            return 0
+        upstream = [
+            resolve(dependency, seen | {node_id})
+            for dependency in nodes[node_id].get("depends_on", [])
+            if dependency in nodes
+        ]
+        depth[node_id] = max(upstream, default=-1) + 1
+        return depth[node_id]
+
+    for node_id in nodes:
+        resolve(node_id, frozenset())
+    layers: list[list[str]] = [[] for _ in range(max(depth.values(), default=-1) + 1)]
+    for node_id in sorted(nodes):
+        layers[depth[node_id]].append(node_id)
+    return layers
+
+
+def undeclared_conflicts(nodes: dict[str, dict[str, Any]]) -> list[str]:
+    """Report concurrently schedulable node pairs whose file scopes can collide."""
+    closure = dependency_closure(nodes)
+    ordered = sorted(nodes)
+    findings = []
+    for index, left_id in enumerate(ordered):
+        left = nodes[left_id]
+        if left.get("status") == "done":
+            continue
+        for right_id in ordered[index + 1 :]:
+            right = nodes[right_id]
+            if right.get("status") == "done":
+                continue
+            if right_id in closure.get(left_id, ()) or left_id in closure.get(right_id, ()):
+                continue
+            if right_id in left.get("conflicts_with", []) or left_id in right.get("conflicts_with", []):
+                continue
+            left_files = left.get("scope", {}).get("files") or []
+            right_files = right.get("scope", {}).get("files") or []
+            overlap = next(
+                (
+                    (left_pattern, right_pattern)
+                    for left_pattern in left_files
+                    if is_text(left_pattern)
+                    for right_pattern in right_files
+                    if is_text(right_pattern) and patterns_may_overlap(left_pattern, right_pattern)
+                ),
+                None,
+            )
+            if overlap:
+                findings.append(
+                    f"nodes {left_id!r} and {right_id!r} can run concurrently but their scopes overlap "
+                    f"({overlap[0]!r} vs {overlap[1]!r}); add a symmetric conflicts_with edge, "
+                    f"a dependency, or narrower scope.files"
+                )
+    return findings
+
+
+def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    required_top = {
+        "schema_version",
+        "dag_id",
+        "objective",
+        "source_refs",
+        "assumptions",
+        "global_acceptance",
+        "planning_status",
+        "approval_ref",
+        "max_parallel",
+        "created_at",
+        "updated_at",
+        "convergence",
+        "nodes",
+    }
+    for key in sorted(required_top - dag.keys()):
+        errors.append(f"root: missing required field {key!r}")
+
+    if dag.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"schema_version: expected {SCHEMA_VERSION}")
+    expect_text(errors, dag.get("dag_id"), "dag_id")
+    expect_text(errors, dag.get("objective"), "objective")
+    expect_string_list(errors, dag.get("source_refs"), "source_refs", nonempty=True)
+    if isinstance(dag.get("source_refs"), list):
+        for index, source_ref in enumerate(dag["source_refs"]):
+            if is_text(source_ref) and not is_source_ref(source_ref):
+                errors.append(
+                    f"source_refs[{index}]: must be a durable project path, URL, issue ID, or commit reference"
+                )
+    expect_string_list(errors, dag.get("assumptions"), "assumptions")
+    validate_criteria(errors, dag.get("global_acceptance"), "global_acceptance")
+
+    planning_status = dag.get("planning_status")
+    if planning_status not in PLANNING_STATUSES:
+        errors.append(f"planning_status: invalid value {planning_status!r}")
+    approval_ref = dag.get("approval_ref")
+    if approval_ref is not None and not is_text(approval_ref):
+        errors.append("approval_ref: must be null or a non-empty string")
+    if planning_status in {"approved", "complete"} and not is_text(approval_ref):
+        errors.append(f"approval_ref: required when planning_status is {planning_status!r}")
+    if approval_ref is not None and is_text(approval_ref) and not is_source_ref(approval_ref):
+        errors.append("approval_ref: must be a durable project path, URL, issue ID, or commit reference")
+
+    max_parallel = dag.get("max_parallel")
+    if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or not 1 <= max_parallel <= HARD_MAX_PARALLEL:
+        errors.append(f"max_parallel: must be an integer from 1 to {HARD_MAX_PARALLEL}")
+    for field in ("created_at", "updated_at"):
+        if not is_timestamp(dag.get(field)):
+            errors.append(f"{field}: must be a UTC RFC 3339 timestamp ending in Z")
+
+    convergence = dag.get("convergence")
+    if not isinstance(convergence, dict):
+        errors.append("convergence: must be an object")
+        convergence = {}
+    else:
+        for field in ("status", "verification_ref", "checked_at", "gaps"):
+            if field not in convergence:
+                errors.append(f"convergence: missing required field {field!r}")
+    convergence_status = convergence.get("status")
+    if convergence_status not in CONVERGENCE_STATUSES:
+        errors.append(f"convergence.status: invalid value {convergence_status!r}")
+    for field in ("verification_ref", "checked_at"):
+        value = convergence.get(field)
+        if value is not None and (not is_timestamp(value) if field == "checked_at" else not is_text(value)):
+            expected = "a UTC RFC 3339 timestamp ending in Z" if field == "checked_at" else "a non-empty string"
+            errors.append(f"convergence.{field}: must be null or {expected}")
+    expect_string_list(errors, convergence.get("gaps"), "convergence.gaps")
+    if convergence_status == "failed":
+        if not is_text(convergence.get("verification_ref")):
+            errors.append("convergence.verification_ref: required when convergence failed")
+        if not convergence.get("gaps"):
+            errors.append("convergence.gaps: at least one gap is required when convergence failed")
+    if convergence_status == "passed" and not is_text(convergence.get("verification_ref")):
+        errors.append("convergence.verification_ref: required when convergence passed")
+
+    raw_nodes = dag.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        errors.append("nodes: must be a non-empty array")
+        raw_nodes = []
+
+    nodes: dict[str, dict[str, Any]] = {}
+    required_node = {
+        "id",
+        "title",
+        "objective",
+        "work_type",
+        "estimated_cost",
+        "scope",
+        "read_first",
+        "depends_on",
+        "conflicts_with",
+        "inputs",
+        "outputs",
+        "acceptance",
+        "verification",
+        "status",
+        "attempts",
+        "handoff",
+    }
+
+    for index, node in enumerate(raw_nodes):
+        label = f"nodes[{index}]"
+        if not isinstance(node, dict):
+            errors.append(f"{label}: must be an object")
+            continue
+        for key in sorted(required_node - node.keys()):
+            errors.append(f"{label}: missing required field {key!r}")
+        node_id = node.get("id")
+        expect_text(errors, node_id, f"{label}.id")
+        if is_text(node_id):
+            if node_id in nodes:
+                errors.append(f"{label}.id: duplicate node ID {node_id!r}")
+            else:
+                nodes[node_id] = node
+            label = f"node {node_id!r}"
+        expect_text(errors, node.get("title"), f"{label}.title")
+        expect_text(errors, node.get("objective"), f"{label}.objective")
+        if node.get("work_type") not in WORK_TYPES:
+            errors.append(f"{label}.work_type: invalid value {node.get('work_type')!r}")
+        if node.get("estimated_cost") not in COSTS:
+            errors.append(f"{label}.estimated_cost: invalid value {node.get('estimated_cost')!r}")
+
+        scope = node.get("scope")
+        if not isinstance(scope, dict):
+            errors.append(f"{label}.scope: must be an object")
+        else:
+            for field in ("files", "forbidden"):
+                if field not in scope:
+                    errors.append(f"{label}.scope: missing required field {field!r}")
+            expect_string_list(errors, scope.get("files"), f"{label}.scope.files", nonempty=True, paths=True)
+            expect_string_list(errors, scope.get("forbidden"), f"{label}.scope.forbidden", paths=True)
+
+        expect_string_list(errors, node.get("read_first"), f"{label}.read_first", paths=True)
+        expect_string_list(errors, node.get("depends_on"), f"{label}.depends_on")
+        expect_string_list(errors, node.get("conflicts_with"), f"{label}.conflicts_with")
+        expect_string_list(errors, node.get("inputs"), f"{label}.inputs")
+        expect_string_list(errors, node.get("outputs"), f"{label}.outputs", nonempty=True)
+        acceptance_ids = validate_criteria(errors, node.get("acceptance"), f"{label}.acceptance")
+
+        verification = node.get("verification")
+        verification_ids: set[str] = set()
+        covered: set[str] = set()
+        if not isinstance(verification, list) or not verification:
+            errors.append(f"{label}.verification: must be a non-empty array")
+        else:
+            for v_index, entry in enumerate(verification):
+                v_label = f"{label}.verification[{v_index}]"
+                if not isinstance(entry, dict):
+                    errors.append(f"{v_label}: must be an object")
+                    continue
+                entry_id = entry.get("id")
+                expect_text(errors, entry_id, f"{v_label}.id")
+                expect_text(errors, entry.get("run"), f"{v_label}.run")
+                expect_text(errors, entry.get("expect"), f"{v_label}.expect")
+                covers = entry.get("covers")
+                expect_string_list(errors, covers, f"{v_label}.covers", nonempty=True)
+                if is_text(entry_id):
+                    if entry_id in verification_ids:
+                        errors.append(f"{v_label}.id: duplicate ID {entry_id!r}")
+                    verification_ids.add(entry_id)
+                if isinstance(covers, list):
+                    for acceptance_id in covers:
+                        if is_text(acceptance_id):
+                            if acceptance_id not in acceptance_ids:
+                                errors.append(f"{v_label}.covers: unknown acceptance ID {acceptance_id!r}")
+                            covered.add(acceptance_id)
+        for acceptance_id in sorted(acceptance_ids - covered):
+            errors.append(f"{label}.acceptance: {acceptance_id!r} has no verification coverage")
+
+        status = node.get("status")
+        if status not in NODE_STATUSES:
+            errors.append(f"{label}.status: invalid value {status!r}")
+        attempts = node.get("attempts")
+        if not isinstance(attempts, list):
+            errors.append(f"{label}.attempts: must be an array")
+            attempts = []
+        for a_index, attempt in enumerate(attempts):
+            a_label = f"{label}.attempts[{a_index}]"
+            if not isinstance(attempt, dict):
+                errors.append(f"{a_label}: must be an object")
+                continue
+            if attempt.get("number") != a_index + 1:
+                errors.append(f"{a_label}.number: expected {a_index + 1}")
+            if not is_timestamp(attempt.get("started_at")):
+                errors.append(f"{a_label}.started_at: invalid timestamp")
+            for field in (
+                "finished_at",
+                "outcome",
+                "worktree",
+                "branch",
+                "base_ref",
+                "head_ref",
+                "reviews",
+                "handoff_ref",
+                "verification_ref",
+                "failure_reason",
+            ):
+                if field not in attempt:
+                    errors.append(f"{a_label}: missing required field {field!r}")
+            for field in ("worktree", "branch", "base_ref"):
+                if field in attempt and not is_text(attempt.get(field)):
+                    errors.append(f"{a_label}.{field}: must be a non-empty string")
+            if attempt.get("head_ref") is not None and not is_text(attempt.get("head_ref")):
+                errors.append(f"{a_label}.head_ref: must be null or a non-empty string")
+            if attempt.get("finished_at") is not None and not is_timestamp(attempt.get("finished_at")):
+                errors.append(f"{a_label}.finished_at: invalid timestamp")
+            outcome = attempt.get("outcome")
+            if outcome is not None and outcome not in {"done", "failed", "blocked"}:
+                errors.append(f"{a_label}.outcome: invalid value {outcome!r}")
+            reviews = attempt.get("reviews")
+            if not isinstance(reviews, list):
+                errors.append(f"{a_label}.reviews: must be an array")
+                reviews = []
+            if len(reviews) > 3:
+                errors.append(f"{a_label}.reviews: at most three review/fix rounds are allowed")
+            for r_index, review in enumerate(reviews):
+                r_label = f"{a_label}.reviews[{r_index}]"
+                if not isinstance(review, dict):
+                    errors.append(f"{r_label}: must be an object")
+                    continue
+                if review.get("round") != r_index + 1:
+                    errors.append(f"{r_label}.round: expected {r_index + 1}")
+                if review.get("outcome") not in REVIEW_OUTCOMES:
+                    errors.append(f"{r_label}.outcome: invalid value {review.get('outcome')!r}")
+                if not is_text(review.get("ref")):
+                    errors.append(f"{r_label}.ref: must be a non-empty string")
+                if not is_text(review.get("handoff_ref")):
+                    errors.append(f"{r_label}.handoff_ref: must be a non-empty string")
+                if not is_text(review.get("head_ref")):
+                    errors.append(f"{r_label}.head_ref: must be a non-empty string")
+                if not is_timestamp(review.get("reviewed_at")):
+                    errors.append(f"{r_label}.reviewed_at: invalid timestamp")
+        if attempts:
+            last = attempts[-1]
+            if status == "running" and (last.get("finished_at") is not None or last.get("outcome") is not None):
+                errors.append(f"{label}.attempts: running node must have an open final attempt")
+            if status in {"done", "failed", "blocked"} and last.get("outcome") != status:
+                errors.append(f"{label}.attempts: final outcome must match status {status!r}")
+            if status == "done":
+                reviews = last.get("reviews", [])
+                if not reviews or reviews[-1].get("outcome") != "approved":
+                    errors.append(f"{label}.attempts: done node requires a final approved review")
+                if not is_text(last.get("head_ref")):
+                    errors.append(f"{label}.attempts: done node requires head_ref")
+        elif status != "pending":
+            errors.append(f"{label}.attempts: non-pending node must have at least one attempt")
+
+        handoff = node.get("handoff")
+        if not isinstance(handoff, dict):
+            errors.append(f"{label}.handoff: must be an object")
+            handoff = {}
+        else:
+            for field in ("status", "ref", "verification_refs", "commit", "summary", "failure_reason", "updated_at"):
+                if field not in handoff:
+                    errors.append(f"{label}.handoff: missing required field {field!r}")
+        expect_string_list(errors, handoff.get("verification_refs"), f"{label}.handoff.verification_refs")
+        if status == "done":
+            if not is_text(handoff.get("ref")):
+                errors.append(f"{label}.handoff.ref: required for a done node")
+            if not handoff.get("verification_refs"):
+                errors.append(f"{label}.handoff.verification_refs: required for a done node")
+            if not is_text(handoff.get("summary")):
+                errors.append(f"{label}.handoff.summary: required for a done node")
+        if status in {"failed", "blocked"} and not is_text(handoff.get("failure_reason")):
+            errors.append(f"{label}.handoff.failure_reason: required for {status!r}")
+
+    for node_id, node in nodes.items():
+        for field in ("depends_on", "conflicts_with"):
+            refs = node.get(field, [])
+            if not isinstance(refs, list):
+                continue
+            if len(refs) != len(set(item for item in refs if isinstance(item, str))):
+                errors.append(f"node {node_id!r}.{field}: duplicate references")
+            for ref in refs:
+                if not is_text(ref):
+                    continue
+                if ref == node_id:
+                    errors.append(f"node {node_id!r}.{field}: self-reference is not allowed")
+                elif ref not in nodes:
+                    errors.append(f"node {node_id!r}.{field}: unknown node {ref!r}")
+        for conflict in node.get("conflicts_with", []):
+            if conflict in nodes and node_id not in nodes[conflict].get("conflicts_with", []):
+                errors.append(f"node {node_id!r}.conflicts_with: {conflict!r} is not symmetric")
+
+        status = node.get("status")
+        for dependency in node.get("depends_on", []):
+            if dependency in nodes and status in {"running", "done"} and nodes[dependency].get("status") != "done":
+                errors.append(
+                    f"node {node_id!r}: status {status!r} requires dependency {dependency!r} to be done"
+                )
+        if status == "running":
+            for conflict in node.get("conflicts_with", []):
+                if conflict in nodes and nodes[conflict].get("status") == "running" and node_id < conflict:
+                    errors.append(f"running nodes {node_id!r} and {conflict!r} conflict")
+
+    cycle = find_cycle(nodes)
+    if cycle:
+        errors.append("depends_on cycle: " + " -> ".join(cycle))
+    else:
+        errors.extend(undeclared_conflicts(nodes))
+
+    all_done = bool(nodes) and all(node.get("status") == "done" for node in nodes.values())
+    if convergence_status == "passed" and not all_done:
+        errors.append("convergence.status 'passed' requires all nodes to be done")
+    if planning_status == "complete":
+        if not all_done:
+            errors.append("planning_status 'complete' requires all nodes to be done")
+        if convergence_status != "passed":
+            errors.append("planning_status 'complete' requires passed convergence")
+    if all_done and convergence_status == "pending":
+        warnings.append("all nodes are done but final convergence is still pending")
+
+    return errors, warnings
+
+
+def node_map(dag: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {node["id"]: node for node in dag["nodes"]}
+
+
+def ready_nodes(dag: dict[str, Any]) -> list[dict[str, Any]]:
+    if dag.get("planning_status") != "approved":
+        return []
+    nodes = node_map(dag)
+    active = {node_id for node_id, node in nodes.items() if node.get("status") == "running"}
+    result = []
+    for node in dag["nodes"]:
+        if node.get("status") != "pending":
+            continue
+        if any(nodes[dependency].get("status") != "done" for dependency in node.get("depends_on", [])):
+            continue
+        if any(conflict in active for conflict in node.get("conflicts_with", [])):
+            continue
+        result.append(node)
+    return result
+
+
+def validate_or_exit(path: Path, json_output: bool = False) -> dict[str, Any]:
+    try:
+        dag = load_dag(path)
+    except DagError as exc:
+        payload = {"valid": False, "errors": [str(exc)], "warnings": []}
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+    errors, warnings = validate_dag(dag)
+    if errors:
+        payload = {"valid": False, "errors": errors, "warnings": warnings}
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for error in errors:
+                print(f"ERROR: {error}", file=sys.stderr)
+            for warning in warnings:
+                print(f"WARNING: {warning}", file=sys.stderr)
+        raise SystemExit(EXIT_INVALID)
+    return dag
+
+
+def cmd_validate(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="validate-dag", description="Validate a dag-engineering JSON control file.")
+    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+    try:
+        dag = load_dag(args.dag)
+    except DagError as exc:
+        payload = {"valid": False, "errors": [str(exc)], "warnings": []}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    errors, warnings = validate_dag(dag)
+    if args.json:
+        print(json.dumps({"valid": not errors, "errors": errors, "warnings": warnings}, ensure_ascii=False, indent=2))
+    else:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+        if not errors:
+            print(f"VALID: {args.dag} ({len(dag['nodes'])} nodes)")
+    return EXIT_INVALID if errors else 0
+
+
+def cmd_ready(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ready-tasks", description="List eligible DAG nodes; selection remains a controller decision.")
+    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--limit", type=int, help="limit returned candidates without implying dispatch")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
+    dag = validate_or_exit(args.dag, args.json)
+    all_candidates = ready_nodes(dag)
+    candidates = all_candidates
+    if args.limit is not None:
+        candidates = candidates[: args.limit]
+    output = {
+        "dag_id": dag["dag_id"],
+        "planning_status": dag["planning_status"],
+        "eligible_count": len(all_candidates),
+        "returned_count": len(candidates),
+        "candidates": [
+            {
+                "id": node["id"],
+                "title": node["title"],
+                "work_type": node["work_type"],
+                "estimated_cost": node["estimated_cost"],
+                "depends_on": node["depends_on"],
+                "conflicts_with": node["conflicts_with"],
+            }
+            for node in candidates
+        ],
+        "note": "eligible candidates are not an instruction to dispatch all of them",
+    }
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        if dag["planning_status"] != "approved":
+            print(f"No ready nodes: planning_status is {dag['planning_status']!r}, not 'approved'.")
+        elif not candidates:
+            print("No eligible candidates.")
+        else:
+            print(f"Eligible candidates ({len(candidates)}; controller still selects):")
+            for node in candidates:
+                print(f"- {node['id']}: {node['title']} [{node['work_type']}, cost={node['estimated_cost']}]")
+    return 0
+
+
+def clear_handoff(node: dict[str, Any]) -> None:
+    node["handoff"] = {
+        "status": None,
+        "ref": None,
+        "verification_refs": [],
+        "commit": None,
+        "summary": None,
+        "failure_reason": None,
+        "updated_at": None,
+    }
+
+
+def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.Namespace) -> str:
+    if node["status"] != "running":
+        raise DagError(f"cannot review {node['id']!r} while status is {node['status']!r}")
+    if not is_text(args.handoff_ref) or not is_text(args.review_ref) or not is_text(args.head_ref):
+        raise DagError("review requires --handoff-ref, --review-ref, and --head-ref")
+    attempt = node["attempts"][-1]
+    reviews = attempt["reviews"]
+    if len(reviews) >= 3:
+        raise DagError("review/fix circuit breaker reached: at most three rounds are allowed")
+    if reviews and reviews[-1]["outcome"] == "approved":
+        raise DagError("the current head already has an approved final review")
+
+    worktree = resolve_worktree(args.dag, attempt["worktree"])
+    head_ref = resolve_commit(worktree, args.head_ref, "head_ref")
+    changed = checked_changes(args.dag, node, attempt, head_ref)
+    validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], head_ref, changed)
+    review = validate_review_artifact(args.dag, args.review_ref, node["id"], head_ref, len(reviews) + 1)
+    if review["spec"] == "APPROVED" and review["quality"] == "APPROVED" and not review["blocking_findings"]:
+        outcome = "approved"
+    elif review["spec"] == "CANNOT_VERIFY":
+        outcome = "cannot_verify"
+    else:
+        outcome = "needs_fixes"
+    if reviews and reviews[-1]["outcome"] == "needs_fixes" and reviews[-1]["head_ref"] == head_ref:
+        raise DagError("a needs_fixes re-review requires a new head commit")
+    now = utc_now()
+    reviews.append(
+        {
+            "round": len(reviews) + 1,
+            "outcome": outcome,
+            "ref": args.review_ref,
+            "handoff_ref": args.handoff_ref,
+            "head_ref": head_ref,
+            "reviewed_at": now,
+        }
+    )
+    attempt["handoff_ref"] = args.handoff_ref
+    attempt["head_ref"] = head_ref
+    return f"{node['id']}: review round {len(reviews)} -> {outcome}"
+
+
+def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
+    if not args.node_id or not args.status:
+        raise DagError("node ID and action are required for a node transition")
+    nodes = node_map(dag)
+    if args.node_id not in nodes:
+        raise DagError(f"unknown node {args.node_id!r}")
+    node = nodes[args.node_id]
+    current = node["status"]
+    target = args.status
+    if target == "review":
+        return transition_review(dag, node, args)
+    if target not in NODE_STATUSES:
+        raise DagError(f"invalid target status {target!r}")
+    if target not in NODE_TRANSITIONS[current]:
+        raise DagError(f"illegal transition for {args.node_id!r}: {current} -> {target}")
+
+    now = utc_now()
+    if target == "running":
+        if dag["planning_status"] != "approved":
+            raise DagError("cannot start a node before planning_status is 'approved'")
+        incomplete = [dependency for dependency in node["depends_on"] if nodes[dependency]["status"] != "done"]
+        if incomplete:
+            raise DagError(f"cannot start {args.node_id!r}; incomplete dependencies: {', '.join(incomplete)}")
+        active_conflicts = [conflict for conflict in node["conflicts_with"] if nodes[conflict]["status"] == "running"]
+        if active_conflicts:
+            raise DagError(f"cannot start {args.node_id!r}; active conflicts: {', '.join(active_conflicts)}")
+        active_count = sum(candidate["status"] == "running" for candidate in nodes.values())
+        limit = min(dag["max_parallel"], HARD_MAX_PARALLEL)
+        if active_count >= limit:
+            raise DagError(f"cannot start {args.node_id!r}; active-node limit {limit} reached")
+        if not is_text(args.worktree):
+            raise DagError("--worktree is required when starting a node")
+        worktree = resolve_worktree(args.dag, args.worktree)
+        active_worktrees = {
+            resolve_worktree(args.dag, candidate["attempts"][-1]["worktree"])
+            for candidate in nodes.values()
+            if candidate["status"] == "running"
+        }
+        if worktree in active_worktrees:
+            raise DagError("another active node already uses this worktree")
+        dirty = dirty_paths(worktree)
+        if dirty:
+            raise DagError("worktree is not clean outside .dag/: " + ", ".join(dirty))
+        actual_branch = current_branch(worktree)
+        if args.branch is not None and args.branch != actual_branch:
+            raise DagError(f"--branch {args.branch!r} does not match current branch {actual_branch!r}")
+        current_head = resolve_commit(worktree, "HEAD", "HEAD")
+        base_ref = resolve_commit(worktree, args.base_ref or "HEAD", "base_ref")
+        if base_ref != current_head:
+            raise DagError("base_ref must equal the worktree HEAD when the attempt starts")
+        clear_handoff(node)
+        node["attempts"].append(
+            {
+                "number": len(node["attempts"]) + 1,
+                "started_at": now,
+                "finished_at": None,
+                "outcome": None,
+                "worktree": str(worktree),
+                "branch": actual_branch,
+                "base_ref": base_ref,
+                "head_ref": None,
+                "reviews": [],
+                "handoff_ref": None,
+                "verification_ref": None,
+                "failure_reason": None,
+            }
+        )
+    elif target in {"done", "failed", "blocked"}:
+        attempt = node["attempts"][-1]
+        attempt["finished_at"] = now
+        attempt["outcome"] = target
+        if target == "done":
+            if not is_text(args.handoff_ref):
+                raise DagError("--handoff-ref is required when marking a node done")
+            if not is_text(args.verification_ref):
+                raise DagError("--verification-ref is required when marking a node done")
+            if not is_text(args.summary):
+                raise DagError("--summary is required when marking a node done")
+            if not is_text(args.head_ref):
+                raise DagError("--head-ref is required when marking a node done")
+            reviews = attempt["reviews"]
+            if not reviews or reviews[-1]["outcome"] != "approved":
+                raise DagError("cannot mark done without a final approved review")
+            worktree = resolve_worktree(args.dag, attempt["worktree"])
+            head_ref = resolve_commit(worktree, args.head_ref, "head_ref")
+            if reviews[-1]["head_ref"] != head_ref:
+                raise DagError("done head_ref must equal the final approved review head_ref")
+            if reviews[-1]["handoff_ref"] != args.handoff_ref:
+                raise DagError("done handoff_ref must equal the final reviewed handoff_ref")
+            changed = checked_changes(args.dag, node, attempt, head_ref)
+            validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], head_ref, changed)
+            validate_master_artifact(args.dag, args.verification_ref, node, head_ref, changed)
+            node["handoff"] = {
+                "status": "DONE",
+                "ref": args.handoff_ref,
+                "verification_refs": [args.verification_ref],
+                "commit": head_ref,
+                "summary": args.summary,
+                "failure_reason": None,
+                "updated_at": now,
+            }
+            attempt["handoff_ref"] = args.handoff_ref
+            attempt["verification_ref"] = args.verification_ref
+            attempt["head_ref"] = head_ref
+        else:
+            if not is_text(args.reason):
+                raise DagError(f"--reason is required when marking a node {target}")
+            if args.handoff_ref:
+                artifact_path(args.dag, args.handoff_ref, "handoff artifact")
+            if args.verification_ref:
+                artifact_path(args.dag, args.verification_ref, "verification artifact")
+            if args.head_ref:
+                worktree = resolve_worktree(args.dag, attempt["worktree"])
+                attempt["head_ref"] = resolve_commit(worktree, args.head_ref, "head_ref")
+            node["handoff"] = {
+                "status": target.upper(),
+                "ref": args.handoff_ref,
+                "verification_refs": [args.verification_ref] if args.verification_ref else [],
+                "commit": attempt.get("head_ref"),
+                "summary": args.summary,
+                "failure_reason": args.reason,
+                "updated_at": now,
+            }
+            attempt["handoff_ref"] = args.handoff_ref
+            attempt["verification_ref"] = args.verification_ref
+            attempt["failure_reason"] = args.reason
+    elif current == "blocked" and target == "pending":
+        clear_handoff(node)
+
+    node["status"] = target
+    return f"{args.node_id}: {current} -> {target}"
+
+
+def transition_planning(dag_path: Path, dag: dict[str, Any], target: str, reference: str | None) -> str:
+    if target not in PLANNING_STATUSES:
+        raise DagError(f"invalid planning status {target!r}")
+    current = dag["planning_status"]
+    if target not in PLANNING_TRANSITIONS[current]:
+        raise DagError(f"illegal planning transition: {current} -> {target}")
+    if target == "approved" and (not is_text(reference) or not is_source_ref(reference)):
+        raise DagError("--reference must be a durable project path, URL, issue ID, or commit reference")
+    if target == "approved" and is_safe_path(reference):
+        artifact_path(dag_path, reference, "approval reference")
+    if target == "complete":
+        if any(node["status"] != "done" for node in dag["nodes"]):
+            raise DagError("cannot complete DAG while any node is not done")
+        if dag["convergence"]["status"] != "passed":
+            raise DagError("cannot complete DAG before convergence passes")
+    dag["planning_status"] = target
+    if target == "approved":
+        dag["approval_ref"] = reference
+    return f"planning_status: {current} -> {target}"
+
+
+def transition_convergence(
+    dag_path: Path, dag: dict[str, Any], target: str, reference: str | None, gaps: list[str]
+) -> str:
+    if target not in {"passed", "failed"}:
+        raise DagError("--convergence must be 'passed' or 'failed'")
+    if any(node["status"] != "done" for node in dag["nodes"]):
+        raise DagError("cannot record convergence before all nodes are done")
+    if not is_text(reference):
+        raise DagError("--reference is required when recording convergence")
+    artifact_path(dag_path, reference, "convergence verification artifact")
+    if target == "failed" and not gaps:
+        raise DagError("at least one --gap is required when convergence failed")
+    now = utc_now()
+    dag["convergence"] = {
+        "status": target,
+        "verification_ref": reference,
+        "checked_at": now,
+        "gaps": gaps if target == "failed" else [],
+    }
+    if target == "failed":
+        dag["planning_status"] = "replan_required"
+    return f"convergence: {target}"
+
+
+def add_gap_nodes(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
+    if dag["planning_status"] != "replan_required" or dag["convergence"]["status"] != "failed":
+        raise DagError("gap nodes can be added only after failed convergence requires replanning")
+    value = load_json_artifact(dag_path, ref, "gap plan artifact")
+    if value.get("dag_id") != dag["dag_id"]:
+        raise DagError("gap plan artifact dag_id does not match the DAG")
+    addresses = value.get("addresses_gaps")
+    if not isinstance(addresses, list) or sorted(addresses) != sorted(dag["convergence"]["gaps"]):
+        raise DagError("gap plan artifact must address exactly the recorded convergence gaps")
+    additions = value.get("nodes")
+    if not isinstance(additions, list) or not additions:
+        raise DagError("gap plan artifact nodes must be a non-empty array")
+    existing_ids = set(node_map(dag))
+    for index, node in enumerate(additions):
+        if not isinstance(node, dict):
+            raise DagError(f"gap plan artifact nodes[{index}] must be an object")
+        if node.get("id") in existing_ids:
+            raise DagError(f"gap node ID already exists: {node.get('id')!r}")
+        if node.get("status") != "pending" or node.get("attempts") != []:
+            raise DagError(f"gap node {node.get('id')!r} must start pending with no attempts")
+        handoff = node.get("handoff")
+        if not isinstance(handoff, dict) or any(value is not None and value != [] for value in handoff.values()):
+            raise DagError(f"gap node {node.get('id')!r} must have an empty handoff")
+        existing_ids.add(node.get("id"))
+    dag["nodes"].extend(additions)
+    if ref not in dag["source_refs"]:
+        dag["source_refs"].append(ref)
+    dag["planning_status"] = "awaiting_approval"
+    dag["approval_ref"] = None
+    errors, _ = validate_dag(dag)
+    if errors:
+        raise DagError("gap plan would produce invalid DAG: " + "; ".join(errors))
+    return f"added {len(additions)} gap node(s); planning_status -> awaiting_approval"
+
+
+def cmd_update(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="update-task", description="Apply guarded controller-owned DAG state transitions.")
+    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("node_id", nargs="?")
+    parser.add_argument("status", nargs="?")
+    parser.add_argument("--planning-status", choices=sorted(PLANNING_STATUSES))
+    parser.add_argument("--convergence", choices=("passed", "failed"))
+    parser.add_argument("--add-gap-nodes", metavar="REF", help="import reviewed gap nodes from a project-relative JSON artifact")
+    parser.add_argument("--reference", help="durable approval or convergence reference")
+    parser.add_argument("--handoff-ref")
+    parser.add_argument("--review-ref")
+    parser.add_argument("--verification-ref")
+    parser.add_argument("--worktree", help="Git worktree path; required when entering running")
+    parser.add_argument("--branch", help="expected current branch when entering running")
+    parser.add_argument("--base-ref", help="expected start commit; defaults to worktree HEAD")
+    parser.add_argument("--head-ref", help="reviewed or completed Git commit")
+    parser.add_argument("--summary")
+    parser.add_argument("--reason")
+    parser.add_argument("--gap", action="append", default=[], help="short convergence gap; repeat as needed")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    operations = sum(
+        bool(value)
+        for value in (args.planning_status, args.convergence, args.add_gap_nodes, args.node_id or args.status)
+    )
+    if operations != 1:
+        parser.error("choose exactly one node, planning-status, convergence, or gap-plan operation")
+    try:
+        with dag_lock(args.dag):
+            dag = load_dag(args.dag)
+            errors, _ = validate_dag(dag)
+            if errors:
+                raise DagError("DAG is invalid before transition: " + "; ".join(errors))
+            if args.planning_status:
+                message = transition_planning(args.dag, dag, args.planning_status, args.reference)
+            elif args.convergence:
+                message = transition_convergence(args.dag, dag, args.convergence, args.reference, args.gap)
+            elif args.add_gap_nodes:
+                message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
+            else:
+                message = transition_node(dag, args)
+            dag["updated_at"] = utc_now()
+            errors, warnings = validate_dag(dag)
+            if errors:
+                raise DagError("transition would produce invalid DAG: " + "; ".join(errors))
+            atomic_write(args.dag, dag)
+    except DagError as exc:
+        payload = {"updated": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_TRANSITION
+    payload = {"updated": True, "message": message, "warnings": warnings}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"UPDATED: {message}")
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+    return 0
+
+
+def cmd_status(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="status", description="Summarize DAG progress and recovery state.")
+    parser.add_argument("dag", nargs="?", default=".dag/dag.json", type=Path)
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+    dag = validate_or_exit(args.dag, args.json)
+    nodes = node_map(dag)
+    counts = {status: 0 for status in ("done", "running", "failed", "blocked", "pending")}
+    for node in nodes.values():
+        counts[node["status"]] += 1
+    candidates = ready_nodes(dag)
+    blockers = []
+    if dag["convergence"]["status"] == "failed":
+        blockers.append(
+            {
+                "node": "<convergence>",
+                "status": "failed",
+                "reason": "; ".join(dag["convergence"]["gaps"]),
+            }
+        )
+    for node_id, node in nodes.items():
+        if node["status"] in {"failed", "blocked"}:
+            blockers.append({"node": node_id, "status": node["status"], "reason": node["handoff"]["failure_reason"]})
+        elif node["status"] == "pending":
+            bad_upstream = [
+                dependency
+                for dependency in node["depends_on"]
+                if nodes[dependency]["status"] in {"failed", "blocked"}
+            ]
+            if bad_upstream:
+                blockers.append({"node": node_id, "status": "upstream_blocked", "by": bad_upstream})
+    total = len(nodes)
+    active_attempts = []
+    for node_id, node in nodes.items():
+        if node["status"] != "running":
+            continue
+        attempt = node["attempts"][-1]
+        active_attempts.append(
+            {
+                "node": node_id,
+                "attempt": attempt["number"],
+                "worktree": attempt["worktree"],
+                "branch": attempt["branch"],
+                "base_ref": attempt["base_ref"],
+                "head_ref": attempt["head_ref"],
+                "review_rounds": len(attempt["reviews"]),
+                "last_review": attempt["reviews"][-1]["outcome"] if attempt["reviews"] else None,
+            }
+        )
+    unlocks: dict[str, list[str]] = {node_id: [] for node_id in nodes}
+    for node_id, node in nodes.items():
+        for dependency in node["depends_on"]:
+            unlocks[dependency].append(node_id)
+    ready_ids = {node["id"] for node in candidates}
+    roadmap = [
+        {
+            "layer": index,
+            "nodes": [
+                {
+                    "id": node_id,
+                    "title": nodes[node_id]["title"],
+                    "status": nodes[node_id]["status"],
+                    "ready": node_id in ready_ids,
+                    "unlocks": sorted(unlocks[node_id]),
+                }
+                for node_id in layer
+            ],
+        }
+        for index, layer in enumerate(dependency_layers(nodes))
+    ]
+    output = {
+        "dag_id": dag["dag_id"],
+        "objective": dag["objective"],
+        "planning_status": dag["planning_status"],
+        "convergence": dag["convergence"],
+        "progress": {"done": counts["done"], "total": total, "percent": round(counts["done"] * 100 / total, 1)},
+        "counts": counts,
+        "running": [node_id for node_id, node in nodes.items() if node["status"] == "running"],
+        "active_attempts": active_attempts,
+        "ready_candidates": [node["id"] for node in candidates],
+        "roadmap": roadmap,
+        "critical_blockers": blockers,
+        "updated_at": dag["updated_at"],
+    }
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        print(f"DAG {dag['dag_id']}: {counts['done']}/{total} done ({output['progress']['percent']}%)")
+        print(f"Planning: {dag['planning_status']} | Convergence: {dag['convergence']['status']}")
+        print(
+            "States: "
+            + ", ".join(f"{name}={counts[name]}" for name in ("done", "running", "failed", "blocked", "pending"))
+        )
+        print("Running: " + (", ".join(output["running"]) or "none"))
+        for attempt in active_attempts:
+            print(
+                f"  - {attempt['node']} attempt {attempt['attempt']}: "
+                f"{attempt['worktree']} [{attempt['branch']}] base={attempt['base_ref'][:12]} "
+                f"reviews={attempt['review_rounds']} last={attempt['last_review'] or 'none'}"
+            )
+        print("Roadmap (layers follow depends_on only):")
+        markers = {"done": "x", "running": ">", "failed": "!", "blocked": "!", "pending": " "}
+        for layer in roadmap:
+            print(f"  Layer {layer['layer']}:")
+            for entry in layer["nodes"]:
+                unlocked = " -> " + ", ".join(entry["unlocks"]) if entry["unlocks"] else ""
+                ready = " (ready)" if entry["ready"] else ""
+                print(f"    [{markers[entry['status']]}] {entry['id']}: {entry['title']}{ready}{unlocked}")
+        print("Ready candidates: " + (", ".join(output["ready_candidates"]) or "none"))
+        if blockers:
+            print("Critical blockers:")
+            for blocker in blockers:
+                if blocker["status"] == "upstream_blocked":
+                    print(f"- {blocker['node']}: blocked by {', '.join(blocker['by'])}")
+                else:
+                    print(f"- {blocker['node']}: {blocker['status']} — {blocker['reason']}")
+        else:
+            print("Critical blockers: none")
+    return 0
+
+
+def main() -> int:
+    command = os.environ.get("DAG_ENGINEERING_COMMAND") or Path(sys.argv[0]).name
+    commands = {
+        "validate-dag": cmd_validate,
+        "ready-tasks": cmd_ready,
+        "update-task": cmd_update,
+        "status": cmd_status,
+    }
+    if command not in commands:
+        print(f"ERROR: unknown command entrypoint {command!r}", file=sys.stderr)
+        return EXIT_USAGE
+    return commands[command](sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

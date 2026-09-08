@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import runpy
+
+os.environ["DAG_ENGINEERING_COMMAND"] = "ready-tasks"
+runpy.run_path(str(Path(__file__).with_name("validate-dag")), run_name="__main__")

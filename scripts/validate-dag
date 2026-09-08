@@ -309,6 +309,16 @@ def current_branch(worktree: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "(detached)"
 
 
+def is_control_plane_path(path: str) -> bool:
+    """Whether a project-relative path belongs to the control plane rather than the project.
+
+    Node scope describes project work, so control-plane paths are excluded from it entirely.
+    The control file defends itself with its seal; a worker that edits it fails on the next
+    read whether or not the edit ever reached a commit.
+    """
+    return path == ".dag" or path.startswith(".dag/")
+
+
 def dirty_paths(worktree: Path) -> list[str]:
     result = run_git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if result.returncode != 0:
@@ -318,7 +328,7 @@ def dirty_paths(worktree: Path) -> list[str]:
         if not record:
             continue
         raw = record[3:] if len(record) >= 4 and record[2] == " " else record
-        if raw == ".dag" or raw.startswith(".dag/"):
+        if is_control_plane_path(raw):
             continue
         paths.append(raw)
     return paths
@@ -345,7 +355,7 @@ def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], hea
     dirty = dirty_paths(worktree)
     if dirty:
         raise DagError("worktree has uncommitted changes outside .dag/: " + ", ".join(dirty))
-    return [line for line in diff.stdout.splitlines() if line]
+    return [line for line in diff.stdout.splitlines() if line and not is_control_plane_path(line)]
 
 
 def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:

@@ -988,6 +988,21 @@ class RuntimeTests(unittest.TestCase):
         result = self.review("A", head, approved=False, blocking=[], expect=3)
         self.assertIn("without naming a finding", result.stderr)
 
+    def test_control_plane_commits_do_not_count_as_node_scope(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        path = self.root / "src" / "A.py"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("VALUE = 'A'\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "node work plus control plane"], check=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        report = json.loads(self.run_cmd("check-scope", "A", "--head-ref", head, "--json").stdout)
+        self.assertTrue(report["in_scope"])
+        self.assertEqual(report["changed"], ["src/A.py"])
+
     def test_check_scope_reports_a_clean_diff(self):
         self.write(dag([node("A")]))
         self.start("A")

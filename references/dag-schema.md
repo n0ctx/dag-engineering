@@ -101,7 +101,6 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 - An approved plan is reworked with `update-task --planning-status replan_required --reference "<why>"` followed by `update-task --replan <draft>`. Unstarted nodes may be added, dropped, and re-sliced; a node that has attempts keeps its `status`, `attempts`, and `handoff`, and a `done` node keeps its contract too, because its diff was accepted against that contract. Replanning is refused while a node is running, clears `decomposition_review`, returns `planning_status` to `awaiting_approval`, and appends to `replans`. Abandoning is for dropping an effort, not for editing one.
 - One `.dag/dag.json` exists at a time. `update-task --init <draft>` is the only sanctioned way to create it and refuses to replace an existing one.
 - `update-task --archive` retires a `complete` DAG; `update-task --abandon --reason "<why>" --reference "<durable path>"` retires an unfinished one, recording both the reason and the user's persisted instruction, because dropping unfinished work is never the controller's own decision. Both write `.dag/archive/<dag-id>-<timestamp>.json`, add `archived_at`, remove `.dag/dag.json`, and refuse while a node is running. Archived files are records only and are never reloaded.
-- If `.dag/` is tracked, controller commits to it stay separate from node commits and outside any node's base-to-head range; a control-plane commit inside that range is an out-of-scope change to the node.
 
 ## Path and contract rules
 

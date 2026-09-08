@@ -37,7 +37,7 @@ If a node is still `running`, reconcile it before new dispatch:
 - if the attempt cannot be proven complete, mark it `failed` with a stale-attempt reason, then decide whether to add context, change model, re-slice, or retry;
 - never replay work merely because the old session disappeared.
 
-Do not start nodes while `planning_status` is not `approved`.
+Do not start nodes while `planning_status` is not `approved`. If any command reports that the control file was modified outside the runtime, stop and tell the user: something wrote state that no gate approved, and the correct response is to inspect it, not to re-seal past it.
 
 ## Select; do not mechanically drain
 

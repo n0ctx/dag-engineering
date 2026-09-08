@@ -88,7 +88,51 @@ def is_source_ref(value: Any) -> bool:
     return is_safe_path(value) and ":" not in value
 
 
-def load_dag(path: Path) -> dict[str, Any]:
+def is_control_file(path: Path) -> bool:
+    resolved = path.resolve()
+    return resolved.parent.name == ".dag" and resolved.name == "dag.json"
+
+
+def seal_path(path: Path) -> Path:
+    return path.parent / f".{path.name}.seal"
+
+
+def compute_seal(dag: dict[str, Any]) -> str:
+    payload = json.dumps(dag, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_seal(path: Path, dag: dict[str, Any]) -> None:
+    seal = seal_path(path)
+    temp = seal.with_name(f"{seal.name}.tmp")
+    temp.write_text(compute_seal(dag) + "\n", encoding="utf-8")
+    os.replace(temp, seal)
+
+
+def verify_seal(path: Path, dag: dict[str, Any]) -> None:
+    """Reject a control file that was written by anything but this runtime.
+
+    Every gate in this skill lives in the transition commands, so a control file
+    edited with a file tool would carry state no gate ever approved.
+    """
+    seal = seal_path(path)
+    try:
+        recorded = seal.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        recorded = ""
+    except OSError as exc:
+        raise DagError(f"cannot read {seal}: {exc}") from exc
+    if recorded == compute_seal(dag):
+        return
+    detail = "has no integrity seal" if not recorded else "was modified outside this runtime"
+    raise DagError(
+        f"{path} {detail}. Every state change must go through this skill's update-task command, which is "
+        "where the approval, review, scope, and session gates live. If this is a legitimate repair, such as a "
+        "merge resolution, re-seal it deliberately with --reseal --reason \"<why>\""
+    )
+
+
+def load_dag(path: Path, *, sealed: bool = True) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
@@ -101,10 +145,12 @@ def load_dag(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise DagError("DAG root must be a JSON object")
     check_dag_location(path)
+    if sealed and is_control_file(path):
+        verify_seal(path, value)
     return value
 
 
-def atomic_write(path: Path, dag: dict[str, Any]) -> None:
+def atomic_write(path: Path, dag: dict[str, Any], *, seal: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_name = ""
     try:
@@ -117,6 +163,8 @@ def atomic_write(path: Path, dag: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        if seal and is_control_file(path):
+            write_seal(path, dag)
     except OSError as exc:
         if temp_name:
             try:
@@ -675,6 +723,9 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
     planning_session = dag.get("planning_session")
     if planning_session is not None and not is_text(planning_session):
         errors.append("planning_session: must be null or a non-empty string")
+    reseal = dag.get("reseal")
+    if reseal is not None and not (isinstance(reseal, dict) and is_text(reseal.get("reason"))):
+        errors.append("reseal: must be null or an object carrying a reason")
     review = dag.get("decomposition_review")
     if review is not None:
         if not isinstance(review, dict):
@@ -1275,6 +1326,14 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
     return f"{args.node_id}: {current} -> {target}"
 
 
+def reseal_dag(dag_path: Path, reason: str) -> str:
+    """Re-seal a control file after a deliberate human repair."""
+    dag = load_dag(dag_path, sealed=False)
+    dag["reseal"] = {"reason": reason, "at": utc_now()}
+    atomic_write(dag_path, dag)
+    return f"resealed {dag_path}: {reason}"
+
+
 def record_design_review(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
     """Bind a fresh reviewer's decomposition verdict to the current plan."""
     artifact = validate_design_review_artifact(dag_path, ref, dag)
@@ -1400,7 +1459,7 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     draft = draft.resolve()
     if draft == dag_path.resolve():
         raise DagError("draft must be a separate file from the control file")
-    candidate = load_dag(draft)
+    candidate = load_dag(draft, sealed=False)
     errors, _ = validate_dag(candidate)
     if errors:
         raise DagError("draft is not a valid DAG: " + "; ".join(errors))
@@ -1414,6 +1473,37 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     atomic_write(dag_path, candidate)
     draft.unlink()
     return f"created {candidate['dag_id']} with {len(candidate['nodes'])} nodes from {draft_ref}"
+
+
+def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
+    """Replace an unapproved plan from a draft, which is how review findings get fixed."""
+    if dag["planning_status"] not in {"draft", "awaiting_approval"}:
+        raise DagError(
+            f"planning_status is {dag['planning_status']!r}; an approved plan changes through "
+            "--planning-status replan_required or a gap-plan import, not --amend"
+        )
+    started = [node["id"] for node in dag["nodes"] if node["attempts"]]
+    if started:
+        raise DagError(f"nodes already have attempts and cannot be replanned this way: {', '.join(started)}")
+    draft = Path(draft_ref)
+    if not draft.is_absolute():
+        draft = project_root(dag_path) / draft
+    if not draft.is_file():
+        raise DagError(f"draft not found: {draft_ref}")
+    candidate = load_dag(draft.resolve(), sealed=False)
+    errors, _ = validate_dag(candidate)
+    if errors:
+        raise DagError("draft is not a valid DAG: " + "; ".join(errors))
+    if candidate["dag_id"] != dag["dag_id"]:
+        raise DagError(f"draft dag_id must stay {dag['dag_id']!r}; a different effort is a new control plane")
+    if candidate["planning_status"] not in {"draft", "awaiting_approval"}:
+        raise DagError("an amended plan is still unapproved; approval runs through --planning-status")
+    candidate["decomposition_review"] = None
+    candidate["planning_session"] = dag.get("planning_session")
+    dag.clear()
+    dag.update(candidate)
+    draft.resolve().unlink()
+    return f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes; decomposition review cleared"
 
 
 def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, reference: str | None) -> str:
@@ -1444,8 +1534,9 @@ def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, referenc
     destination = project_root(dag_path) / ".dag" / "archive" / f"{dag['dag_id']}-{dag['archived_at'].replace(':', '')}.json"
     if destination.exists():
         raise DagError(f"archive entry already exists: {destination}")
-    atomic_write(destination, dag)
+    atomic_write(destination, dag, seal=False)
     dag_path.unlink()
+    seal_path(dag_path).unlink(missing_ok=True)
     verb = "archived" if complete else "abandoned"
     return f"{verb} {dag['dag_id']} to {destination.relative_to(project_root(dag_path))}"
 
@@ -1460,6 +1551,8 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--add-gap-nodes", metavar="REF", help="import reviewed gap nodes from a project-relative JSON artifact")
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
+    parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
+    parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
     parser.add_argument("--reference", help="durable approval or convergence reference")
@@ -1485,6 +1578,8 @@ def cmd_update(argv: list[str]) -> int:
             args.add_gap_nodes,
             args.init,
             args.decomposition_review,
+            args.amend,
+            args.reseal,
             args.archive,
             args.abandon,
             args.node_id or args.status,
@@ -1493,12 +1588,19 @@ def cmd_update(argv: list[str]) -> int:
     if operations != 1:
         parser.error(
             "choose exactly one node, planning-status, convergence, gap-plan, init, "
-            "decomposition-review, archive, or abandon operation"
+            "decomposition-review, amend, reseal, archive, or abandon operation"
         )
+    if args.reseal and not args.reason:
+        parser.error("--reseal requires --reason recording why the control file needed repair")
     if args.abandon and not (args.reason and args.reference):
         parser.error("--abandon requires --reason and --reference to the user's persisted instruction")
     try:
         with dag_lock(args.dag):
+            if args.reseal:
+                message = reseal_dag(args.dag, args.reason)
+                print(json.dumps({"updated": True, "message": message, "warnings": []}, ensure_ascii=False, indent=2)
+                      if args.json else f"UPDATED: {message}")
+                return 0
             if args.init:
                 message, warnings = init_dag(args.dag, args.init), []
                 payload = {"updated": True, "message": message, "warnings": warnings}
@@ -1516,6 +1618,8 @@ def cmd_update(argv: list[str]) -> int:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
             elif args.decomposition_review:
                 message = record_design_review(args.dag, dag, args.decomposition_review)
+            elif args.amend:
+                message = amend_dag(args.dag, dag, args.amend)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),

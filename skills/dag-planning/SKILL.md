@@ -152,7 +152,13 @@ A plan that validates can still be a bad plan. Before showing it to the user, di
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review.json"
 ```
 
-The runtime derives the verdict from the findings and binds it to this exact plan. Resolve every `critical` and `important` finding, then re-review, because editing the DAG invalidates the previous verdict. Do not argue a blocking finding away in chat: either change the plan or record why the reviewer was wrong and get a fresh verdict.
+The runtime derives the verdict from the findings and binds it to this exact plan. Resolve every `critical` and `important` finding by writing a corrected draft and amending the plan in place:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --amend ".dag/draft.json"
+```
+
+Amending clears the previous verdict, so dispatch a fresh review afterwards. Fixing findings is an amendment, never an abandon-and-recreate: abandoning is for dropping an effort the user no longer wants, and using it to edit a plan destroys the record of what was reviewed. Do not argue a blocking finding away in chat: either change the plan or record why the reviewer was wrong and get a fresh verdict.
 
 ## 8. Approval gate
 

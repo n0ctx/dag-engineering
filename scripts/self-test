@@ -86,6 +86,7 @@ class RuntimeTests(unittest.TestCase):
 
     def write(self, value):
         self.path.write_text(json.dumps(value), encoding="utf-8")
+        self.run_cmd("update-task", "--reseal", "--reason", "fixture")
 
     def run_cmd(self, command, *args, expect=0):
         result = subprocess.run(
@@ -384,6 +385,7 @@ class RuntimeTests(unittest.TestCase):
             target = Path(plain) / ".dag"
             target.mkdir()
             (target / "dag.json").write_text(json.dumps(dag([node("A")])), encoding="utf-8")
+            self.run_in(plain, "update-task", "--reseal", "--reason", "fixture")
             self.assertIn("fixture", self.run_in(plain, "status").stdout)
 
     def test_control_plane_outside_the_main_root_is_rejected(self):
@@ -425,6 +427,53 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("update-task", "--init", ref, expect=3)
         self.assertIn("not a valid DAG", result.stderr)
         self.assertFalse(self.path.exists())
+
+    def test_hand_edited_control_file_is_rejected(self):
+        self.awaiting([node("A")])
+        tampered = json.loads(self.path.read_text())
+        tampered["planning_status"] = "approved"
+        tampered["approval_ref"] = "someone@example.com"
+        self.path.write_text(json.dumps(tampered), encoding="utf-8")
+        for command in ("validate-dag", "status", "ready-tasks"):
+            result = self.run_cmd(command, expect=2)
+            self.assertIn("modified outside this runtime", result.stderr)
+        result = self.run_cmd("update-task", "A", "running", "--worktree", str(self.root), expect=3)
+        self.assertIn("modified outside this runtime", result.stderr)
+
+    def test_missing_seal_is_rejected(self):
+        self.awaiting([node("A")])
+        (self.root / ".dag" / ".dag.json.seal").unlink()
+        result = self.run_cmd("validate-dag", expect=2)
+        self.assertIn("no integrity seal", result.stderr)
+
+    def test_reseal_is_a_recorded_repair(self):
+        self.awaiting([node("A")])
+        tampered = json.loads(self.path.read_text())
+        tampered["objective"] = "repaired after a merge"
+        self.path.write_text(json.dumps(tampered), encoding="utf-8")
+        self.run_cmd("update-task", "--reseal", "--reason", "resolved a merge conflict")
+        self.run_cmd("validate-dag")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["reseal"]["reason"], "resolved a merge conflict")
+        self.assertTrue(saved["reseal"]["at"])
+
+    def test_runtime_transitions_keep_the_seal_valid(self):
+        self.awaiting([node("A"), node("B")])
+        self.approve_as("session-plan")
+        self.start("A")
+        self.run_cmd("update-task", "A", "failed", "--reason", "stuck")
+        self.run_cmd("validate-dag")
+
+    def test_archived_copies_carry_no_seal(self):
+        self.write(dag([node("A")]))
+        instruction = self.root / ".dag" / "sources" / "abandon.md"
+        instruction.parent.mkdir(parents=True, exist_ok=True)
+        instruction.write_text("user: drop it\n", encoding="utf-8")
+        self.run_cmd("update-task", "--abandon", "--reason", "changed", "--reference", ".dag/sources/abandon.md")
+        self.assertFalse((self.root / ".dag" / ".dag.json.seal").exists())
+        archived = list((self.root / ".dag" / "archive").glob("fixture-*.json"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(list((self.root / ".dag" / "archive").glob("*.seal")), [])
 
     def test_approval_requires_a_decomposition_review(self):
         self.awaiting([node("A")])
@@ -496,6 +545,41 @@ class RuntimeTests(unittest.TestCase):
         ref = self.draft(value)
         result = self.run_cmd("update-task", "--init", ref, expect=3)
         self.assertIn("starts as 'draft' or 'awaiting_approval'", result.stderr)
+
+    def test_amend_replaces_the_plan_and_clears_its_review(self):
+        self.awaiting([node("A"), node("B")])
+        self.design_review([
+            {"severity": "important", "kind": "missing_dependency", "nodes": ["B"], "detail": "B needs A"},
+        ])
+        fixed = dag([node("A"), node("B", depends=("A",))])
+        fixed["planning_status"] = "awaiting_approval"
+        fixed["approval_ref"] = None
+        ref = self.draft(fixed, name="amended.json")
+        self.run_cmd("update-task", "--amend", ref)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][1]["depends_on"], ["A"])
+        self.assertIsNone(saved["decomposition_review"])
+        self.assertFalse((self.root / ".dag" / "amended.json").exists())
+        self.design_review()
+        self.approve_as("session-plan")
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
+
+    def test_amend_refuses_an_approved_or_started_plan(self):
+        self.awaiting([node("A")])
+        self.approve_as("session-plan")
+        ref = self.draft(dag([node("A")]), name="amended.json")
+        result = self.run_cmd("update-task", "--amend", ref, expect=3)
+        self.assertIn("replan_required", result.stderr)
+
+    def test_amend_keeps_the_same_effort(self):
+        self.awaiting([node("A")])
+        other = dag([node("A")])
+        other["dag_id"] = "different"
+        other["planning_status"] = "awaiting_approval"
+        other["approval_ref"] = None
+        ref = self.draft(other, name="amended.json")
+        result = self.run_cmd("update-task", "--amend", ref, expect=3)
+        self.assertIn("must stay 'fixture'", result.stderr)
 
     def test_archive_requires_a_complete_dag(self):
         self.write(dag([node("A")]))

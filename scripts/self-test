@@ -58,6 +58,7 @@ def dag(nodes):
         "planning_status": "approved",
         "approval_ref": "fixture approval",
         "planning_session": None,
+        "decomposition_review": None,
         "max_parallel": 3,
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -267,11 +268,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("Layer 0:", text)
         self.assertIn("A: Node A (ready) -> C", text)
 
+    def design_review(self, findings=(), dag_id="fixture"):
+        artifact = self.root / ".dag" / "artifacts" / "design-review.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(
+            json.dumps({"dag_id": dag_id, "findings": list(findings), "checks_performed": ["dependency pass"]}),
+            encoding="utf-8",
+        )
+        ref = ".dag/artifacts/design-review.json"
+        self.run_cmd("update-task", "--decomposition-review", ref)
+        return ref
+
     def approve_as(self, session):
         approval = self.root / ".dag" / "sources" / "approval.md"
         approval.parent.mkdir(parents=True, exist_ok=True)
         approval.write_text("approved\n", encoding="utf-8")
         previous, self.session = self.session, session
+        self.design_review()
         self.run_cmd("update-task", "--planning-status", "approved", "--reference", ".dag/sources/approval.md")
         self.session = previous
 
@@ -301,6 +314,7 @@ class RuntimeTests(unittest.TestCase):
         approval = self.root / ".dag" / "sources" / "approval.md"
         approval.parent.mkdir(parents=True, exist_ok=True)
         approval.write_text("approved\n", encoding="utf-8")
+        self.design_review()
         environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
         for args in (
             ("--planning-status", "approved", "--reference", ".dag/sources/approval.md"),
@@ -411,6 +425,77 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("update-task", "--init", ref, expect=3)
         self.assertIn("not a valid DAG", result.stderr)
         self.assertFalse(self.path.exists())
+
+    def test_approval_requires_a_decomposition_review(self):
+        self.awaiting([node("A")])
+        approval = self.root / ".dag" / "sources" / "approval.md"
+        approval.parent.mkdir(parents=True, exist_ok=True)
+        approval.write_text("approved\n", encoding="utf-8")
+        result = self.run_cmd("update-task", "--planning-status", "approved",
+                              "--reference", ".dag/sources/approval.md", expect=3)
+        self.assertIn("no decomposition review", result.stderr)
+
+    def test_blocking_design_findings_prevent_approval(self):
+        self.awaiting([node("A"), node("B")])
+        self.design_review([
+            {"severity": "important", "kind": "missing_dependency", "nodes": ["B"],
+             "detail": "B consumes A's interface but declares no dependency"},
+        ])
+        saved = json.loads(self.path.read_text())["decomposition_review"]
+        self.assertEqual(saved["verdict"], "needs_changes")
+        approval = self.root / ".dag" / "sources" / "approval.md"
+        approval.parent.mkdir(parents=True, exist_ok=True)
+        approval.write_text("approved\n", encoding="utf-8")
+        result = self.run_cmd("update-task", "--planning-status", "approved",
+                              "--reference", ".dag/sources/approval.md", expect=3)
+        self.assertIn("blocking findings", result.stderr)
+
+    def test_minor_findings_do_not_block_approval(self):
+        self.awaiting([node("A")])
+        self.design_review([{"severity": "minor", "kind": "granularity", "nodes": ["A"], "detail": "title is vague"}])
+        self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["verdict"], "approved")
+        self.approve_as("session-plan")
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
+
+    def test_editing_the_plan_invalidates_its_review(self):
+        self.awaiting([node("A")])
+        self.design_review()
+        value = json.loads(self.path.read_text())
+        value["nodes"].append(node("B"))
+        self.write(value)
+        approval = self.root / ".dag" / "sources" / "approval.md"
+        approval.parent.mkdir(parents=True, exist_ok=True)
+        approval.write_text("approved\n", encoding="utf-8")
+        result = self.run_cmd("update-task", "--planning-status", "approved",
+                              "--reference", ".dag/sources/approval.md", expect=3)
+        self.assertIn("changed after its decomposition review", result.stderr)
+
+    def test_execution_state_does_not_invalidate_a_review(self):
+        self.awaiting([node("A"), node("B")])
+        self.approve_as("session-plan")
+        before = json.loads(self.path.read_text())["decomposition_review"]["fingerprint"]
+        self.start("A")
+        self.run_cmd("update-task", "A", "failed", "--reason", "stuck")
+        self.run_cmd("validate-dag")
+        self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["fingerprint"], before)
+
+    def test_design_review_artifact_must_reference_real_nodes(self):
+        self.awaiting([node("A")])
+        artifact = self.root / ".dag" / "artifacts" / "bad-review.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(
+            {"dag_id": "fixture", "checks_performed": ["x"],
+             "findings": [{"severity": "critical", "nodes": ["ghost"], "detail": "invented node"}]}
+        ), encoding="utf-8")
+        result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/bad-review.json", expect=3)
+        self.assertIn("existing node IDs", result.stderr)
+
+    def test_init_refuses_a_pre_approved_draft(self):
+        value = dag([node("A")])
+        value["planning_status"] = "approved"
+        ref = self.draft(value)
+        result = self.run_cmd("update-task", "--init", ref, expect=3)
+        self.assertIn("starts as 'draft' or 'awaiting_approval'", result.stderr)
 
     def test_archive_requires_a_complete_dag(self):
         self.write(dag([node("A")]))
@@ -528,6 +613,7 @@ class RuntimeTests(unittest.TestCase):
         approval.parent.mkdir(parents=True, exist_ok=True)
         approval.write_text("approved\n", encoding="utf-8")
         self.session = "session-plan"
+        self.design_review()
         self.run_cmd("update-task", "--planning-status", "approved", "--reference", ".dag/sources/approval.md")
         self.session = "session-exec"
         self.complete("A")

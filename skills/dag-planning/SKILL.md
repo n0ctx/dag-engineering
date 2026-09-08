@@ -52,7 +52,7 @@ Extract:
 
 Every record written under `.dag/sources/` is a faithful account, not a design document. Apply the evidence rule and keep stated facts visibly separate from open choices. Copy a non-goal only where the source states the exclusion: listing the channels, platforms, or cases in scope leaves the unnamed ones open, not excluded.
 
-If the source is a natural-language request or an unapproved/mutually ambiguous document, set `planning_status` to `awaiting_approval`. A clearly approved written plan that predates this turn plus an explicit request to execute may start as `approved`; record its durable approval reference. An approval created or inferred during the current planning turn does not qualify.
+If the source is a natural-language request or an unapproved/mutually ambiguous document, set `planning_status` to `awaiting_approval`. A DAG is always created as `draft` or `awaiting_approval`; the runtime rejects any other starting state. When a clearly approved written plan predates this turn, it still becomes a reviewed DAG first, and its durable approval reference is then recorded through the approval transition. An approval created or inferred during the current planning turn does not qualify.
 
 ## 1. Directed reconnaissance
 
@@ -144,7 +144,17 @@ Check convergence before approval: map every original requirement and global acc
 
 Audit the DAG against the evidence rule before presenting it. Walk every technology name and concrete interface, payload, status code, storage, or security choice in `.dag/sources/`, the objective, node outputs, and acceptance, and resolve each one to its evidence, an `assumptions` entry, or an investigation output.
 
-## 7. Approval gate
+## 7. Review the decomposition
+
+A plan that validates can still be a bad plan. Before showing it to the user, dispatch one fresh reviewer against the DAG using the protocol in `${CLAUDE_SKILL_DIR}/references/decomposition.md`. Give it the DAG, its source references, and the repository; never your own reasoning about why you split it this way. Save its JSON verdict under `.dag/artifacts/`, then record it:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review.json"
+```
+
+The runtime derives the verdict from the findings and binds it to this exact plan. Resolve every `critical` and `important` finding, then re-review, because editing the DAG invalidates the previous verdict. Do not argue a blocking finding away in chat: either change the plan or record why the reviewer was wrong and get a fresh verdict.
+
+## 8. Approval gate
 
 For a newly generated DAG from a short, natural-language, vague, or unapproved source, show a compact summary containing objective, nodes, dependency edges, conflicts, expected parallel frontier, global acceptance, and every entry in `assumptions`. Then stop and wait for explicit approval. Default `max_parallel` to 1 unless reconnaissance establishes safe isolation and meaningful wall-clock benefit; never set it to 3 merely because three is allowed.
 

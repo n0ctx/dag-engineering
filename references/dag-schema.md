@@ -17,6 +17,7 @@
   "planning_status": "awaiting_approval",
   "approval_ref": null,
   "planning_session": null,
+  "decomposition_review": null,
   "max_parallel": 2,
   "created_at": "2026-09-08T12:00:00Z",
   "updated_at": "2026-09-08T12:00:00Z",
@@ -108,6 +109,7 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 - Every verification entry covers at least one acceptance ID, and every acceptance ID has coverage.
 - `depends_on` and `conflicts_with` reference existing nodes and cannot reference self.
 - `conflicts_with` is symmetric. The validator rejects one-sided conflicts.
+- `decomposition_review` records a fresh reviewer's verdict on the plan, fingerprinted over the decomposition itself: objective, global acceptance, assumptions, source refs, and each node's contract. Execution state is excluded, so running a node never invalidates a review, while editing the plan does. `planning_status` cannot become `approved` without a matching `approved` verdict.
 - `planning_session` is stamped by the runtime at the first approval and is never rewritten, including after a replan. Node execution is refused from that same session, so planning context cannot leak into execution. It stays null when no session identity is available, and the check then passes.
 - Two nodes that can run concurrently, meaning neither depends on the other, cannot have overlapping `scope.files` without a `conflicts_with` edge. The validator rejects the undeclared collision.
 - A done or running node cannot depend on a non-done node.

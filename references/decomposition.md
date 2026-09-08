@@ -61,6 +61,40 @@ Use exact project-relative paths, interface names, durable upstream handoff refe
 
 When uncertainty is itself the work, create a bounded `investigation` node with a decision artifact, explicit questions, a read budget or stop condition, and downstream nodes that depend on its accepted output.
 
+## Decomposition review
+
+A fresh reviewer that took no part in drafting judges the plan before it reaches the user. It receives the DAG, its `source_refs`, the objective and global acceptance, and the repository — never the planner's reasoning.
+
+The validator already proves the graph is well formed: no cycles, symmetric conflicts, no undeclared same-file collision between concurrent nodes, every acceptance criterion covered by a verification entry. This review covers what no script can decide:
+
+- **missing dependency**: a node cannot correctly start without another node's output, interface, decision, or verified behavior, yet no edge says so;
+- **fabricated dependency**: an edge encoding a scheduling preference rather than real consumption;
+- **granularity**: a node whose first act must be broad architecture discovery, or one so small it carries no independent review value;
+- **acceptance**: criteria restating implementation activity, or behavioral criteria whose only verification is structural;
+- **coverage**: a source requirement, global acceptance criterion, or integration step that no node delivers;
+- **scope realism**: `scope.files` that do not match where the behavior actually lives;
+- **assumption laundering**: a decision parked in `assumptions` that should have been asked during clarification.
+
+Every finding names the offending nodes and what would go wrong, not a style preference:
+
+```json
+{
+  "dag_id": "auth-migration",
+  "findings": [
+    {
+      "severity": "important",
+      "kind": "missing_dependency",
+      "nodes": ["auth-client"],
+      "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency, so a fresh worker would have to invent it",
+      "suggestion": "add auth-client.depends_on = [define-auth-contract]"
+    }
+  ],
+  "checks_performed": ["dependency pass", "coverage against global acceptance", "node sizing"]
+}
+```
+
+The runtime derives the verdict from the findings, so no reviewer passes its own approval flag. `critical` and `important` block approval; `minor` is recorded and does not.
+
 ## Coverage and convergence preview
 
 Before approval, map each source requirement and each global acceptance criterion to at least one node and verification path. Check cross-node integration explicitly. A populated task list is not evidence of full requirement coverage.

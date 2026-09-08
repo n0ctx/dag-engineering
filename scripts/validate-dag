@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import fnmatch
 import json
 import os
@@ -346,6 +347,57 @@ def validate_review_artifact(
     return value
 
 
+PLAN_NODE_FIELDS = (
+    "id", "title", "objective", "work_type", "estimated_cost", "scope", "read_first",
+    "depends_on", "conflicts_with", "inputs", "outputs", "acceptance", "verification",
+)
+DESIGN_SEVERITIES = {"critical", "important", "minor"}
+
+
+def plan_fingerprint(dag: dict[str, Any]) -> str:
+    """Hash the decomposition itself, ignoring execution state.
+
+    A review binds to this fingerprint the way a code review binds to a commit, so
+    editing the plan after review invalidates it.
+    """
+    shape = {
+        "objective": dag.get("objective"),
+        "global_acceptance": dag.get("global_acceptance"),
+        "assumptions": dag.get("assumptions"),
+        "source_refs": dag.get("source_refs"),
+        "nodes": [
+            {field: node.get(field) for field in PLAN_NODE_FIELDS}
+            for node in sorted(dag.get("nodes", []), key=lambda item: item.get("id") or "")
+        ],
+    }
+    payload = json.dumps(shape, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_design_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any]) -> dict[str, Any]:
+    value = load_json_artifact(dag_path, ref, "decomposition review artifact")
+    if value.get("dag_id") != dag["dag_id"]:
+        raise DagError(f"decomposition review artifact dag_id must be {dag['dag_id']!r}")
+    known = {node["id"] for node in dag["nodes"]}
+    findings = value.get("findings")
+    if not isinstance(findings, list):
+        raise DagError("decomposition review artifact findings must be an array")
+    for index, finding in enumerate(findings):
+        label = f"decomposition review findings[{index}]"
+        if not isinstance(finding, dict):
+            raise DagError(f"{label}: must be an object")
+        if finding.get("severity") not in DESIGN_SEVERITIES:
+            raise DagError(f"{label}.severity: must be one of {', '.join(sorted(DESIGN_SEVERITIES))}")
+        if not is_text(finding.get("detail")):
+            raise DagError(f"{label}.detail: must be a non-empty string")
+        nodes = finding.get("nodes", [])
+        if not isinstance(nodes, list) or any(item not in known for item in nodes):
+            raise DagError(f"{label}.nodes: must reference existing node IDs")
+    if not value.get("checks_performed"):
+        raise DagError("decomposition review artifact must record the checks it performed")
+    return value
+
+
 def validate_master_artifact(
     dag_path: Path,
     ref: str,
@@ -586,6 +638,7 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         "planning_status",
         "approval_ref",
         "planning_session",
+        "decomposition_review",
         "max_parallel",
         "created_at",
         "updated_at",
@@ -622,6 +675,16 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
     planning_session = dag.get("planning_session")
     if planning_session is not None and not is_text(planning_session):
         errors.append("planning_session: must be null or a non-empty string")
+    review = dag.get("decomposition_review")
+    if review is not None:
+        if not isinstance(review, dict):
+            errors.append("decomposition_review: must be null or an object")
+        else:
+            for field in ("ref", "fingerprint", "verdict", "recorded_at"):
+                if field not in review:
+                    errors.append(f"decomposition_review: missing required field {field!r}")
+            if review.get("verdict") not in {None, "approved", "needs_changes"}:
+                errors.append("decomposition_review.verdict: must be 'approved' or 'needs_changes'")
 
     max_parallel = dag.get("max_parallel")
     if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or not 1 <= max_parallel <= HARD_MAX_PARALLEL:
@@ -1212,14 +1275,42 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
     return f"{args.node_id}: {current} -> {target}"
 
 
+def record_design_review(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
+    """Bind a fresh reviewer's decomposition verdict to the current plan."""
+    artifact = validate_design_review_artifact(dag_path, ref, dag)
+    blocking = [
+        finding for finding in artifact["findings"] if finding["severity"] in {"critical", "important"}
+    ]
+    verdict = "needs_changes" if blocking else "approved"
+    dag["decomposition_review"] = {
+        "ref": ref,
+        "fingerprint": plan_fingerprint(dag),
+        "verdict": verdict,
+        "recorded_at": utc_now(),
+    }
+    detail = f"{len(blocking)} blocking of {len(artifact['findings'])} findings"
+    return f"decomposition review: {verdict} ({detail})"
+
+
 def transition_planning(dag_path: Path, dag: dict[str, Any], target: str, reference: str | None) -> str:
     if target not in PLANNING_STATUSES:
         raise DagError(f"invalid planning status {target!r}")
     current = dag["planning_status"]
     if target not in PLANNING_TRANSITIONS[current]:
         raise DagError(f"illegal planning transition: {current} -> {target}")
-    if target == "approved" and (not is_text(reference) or not is_source_ref(reference)):
-        raise DagError("--reference must be a durable project path, URL, issue ID, or commit reference")
+    if target == "approved":
+        if not is_text(reference) or not is_source_ref(reference):
+            raise DagError("--reference must be a durable project path, URL, issue ID, or commit reference")
+        review = dag.get("decomposition_review")
+        if not review:
+            raise DagError(
+                "no decomposition review recorded; dispatch a fresh reviewer against this DAG and record "
+                "its verdict with --decomposition-review before approval"
+            )
+        if review["fingerprint"] != plan_fingerprint(dag):
+            raise DagError("the plan changed after its decomposition review; re-review the current DAG")
+        if review["verdict"] != "approved":
+            raise DagError("the decomposition review reported blocking findings; resolve them and re-review")
     if target == "approved" and is_safe_path(reference):
         artifact_path(dag_path, reference, "approval reference")
     if target == "complete":
@@ -1313,6 +1404,12 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     errors, _ = validate_dag(candidate)
     if errors:
         raise DagError("draft is not a valid DAG: " + "; ".join(errors))
+    if candidate["planning_status"] not in {"draft", "awaiting_approval"}:
+        raise DagError(
+            f"a new control file starts as 'draft' or 'awaiting_approval', not "
+            f"{candidate['planning_status']!r}; approval runs through --planning-status so the "
+            "decomposition review and the user's approval reference are both recorded"
+        )
     candidate["updated_at"] = utc_now()
     atomic_write(dag_path, candidate)
     draft.unlink()
@@ -1362,6 +1459,7 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--convergence", choices=("passed", "failed"))
     parser.add_argument("--add-gap-nodes", metavar="REF", help="import reviewed gap nodes from a project-relative JSON artifact")
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
+    parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
     parser.add_argument("--reference", help="durable approval or convergence reference")
@@ -1386,13 +1484,17 @@ def cmd_update(argv: list[str]) -> int:
             args.convergence,
             args.add_gap_nodes,
             args.init,
+            args.decomposition_review,
             args.archive,
             args.abandon,
             args.node_id or args.status,
         )
     )
     if operations != 1:
-        parser.error("choose exactly one node, planning-status, convergence, gap-plan, init, archive, or abandon operation")
+        parser.error(
+            "choose exactly one node, planning-status, convergence, gap-plan, init, "
+            "decomposition-review, archive, or abandon operation"
+        )
     if args.abandon and not (args.reason and args.reference):
         parser.error("--abandon requires --reason and --reference to the user's persisted instruction")
     try:
@@ -1412,6 +1514,8 @@ def cmd_update(argv: list[str]) -> int:
                 message = transition_convergence(args.dag, dag, args.convergence, args.reference, args.gap)
             elif args.add_gap_nodes:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
+            elif args.decomposition_review:
+                message = record_design_review(args.dag, dag, args.decomposition_review)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),

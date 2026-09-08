@@ -1,6 +1,8 @@
-# Node contract and agent protocols
+# Node contract and worker protocol
 
 The controller packages one node for a fresh worker. The node contract is binding; worker and reviewer reports cannot amend it.
+
+The reviewer half of the protocol lives in `references/review-protocol.md`, which the controller loads when it reviews rather than when it dispatches.
 
 ## Worker package
 
@@ -90,69 +92,4 @@ Write a compact artifact at the exact path the controller supplied, normally `<c
 
 Keep implementation chronology, searches, failed commands, and reasoning out of the handoff. Link durable reports instead.
 
-## Fresh reviewer package
-
-Provide only the original node contract, actual diff or immutable diff artifact, base/head refs, structured handoff, relevant test evidence, and any paths `check-scope` reported as also claimed by an unfinished node. The reviewer is read-only and does not receive the implementer's reasoning transcript.
-
-Bound the reviewer's reading too: judge the diff against the contract, and open a file outside the diff and `read_first` only to settle a specific claim the diff makes. Reviewing is not a repository survey.
-
-The next block is copied exactly from Superpowers' current task reviewer prompt because its anti-anchoring rule is identical here:
-
-## Do Not Trust the Report
-
-Treat the implementer's report as unverified claims about the code. It
-may be incomplete, inaccurate, or optimistic. Verify the claims against
-the diff. Design rationales in the report are claims too: "left it per
-YAGNI," "kept it simple deliberately," or any other justification is the
-implementer grading their own work. Judge the code on its merits — a
-stated rationale never downgrades a finding's severity.
-
-The reviewer checks:
-
-- each original acceptance criterion: verified, missing, or not verifiable from the package;
-- missing, extra, or misunderstood behavior;
-- edits outside `scope.files` or inside `scope.forbidden`;
-- behavior regressions and missing caller/integration changes;
-- test validity, including assertions that do not prove the criterion;
-- code quality, security, error handling, and unnecessary abstraction.
-
-A design choice or defect in the node contract goes to the controller as `spec: CANNOT_VERIFY`; the reviewer does not silently choose or edit the contract.
-
-Output:
-
-```json
-{
-  "node": "node-id",
-  "head_ref": "full Git commit SHA",
-  "round": 1,
-  "spec": "APPROVED | NEEDS_FIXES | CANNOT_VERIFY",
-  "quality": "APPROVED | NEEDS_FIXES",
-  "blocking_findings": [
-    {"severity": "critical", "path": "src/auth/client.py", "detail": "acceptance/scope impact and file:line evidence"}
-  ],
-  "controller_decisions": [],
-  "minor_findings": [],
-  "out_of_scope_observations": [],
-  "checks_performed": []
-}
-```
-
-Save it as a project-relative JSON artifact. The runtime derives the review outcome from these verdicts and findings; neither implementer nor controller passes an unverified `approved` flag.
-
-### Where a blocking problem goes
-
-Every blocking finding carries the project-relative `path` it is about, and that path decides its bucket. The runtime enforces the split both ways and rejects a misfiled finding.
-
-- **`blocking_findings`** — the path is inside `scope.files`. The worker can fix it, so it drives the fix loop.
-- **`controller_decisions`** — the path is outside `scope.files` or inside `scope.forbidden`, and this diff made it a problem: a changed signature breaks a caller the worker may not touch, a migration needs a companion change elsewhere. The worker fixing it would trip the scope gate, so it is the controller's call.
-- **`out_of_scope_observations`** — noticed outside the scope but not caused by this diff and not blocking. Reported, never actioned here.
-
-Do not move a fixable defect into `controller_decisions` to skip a fix round, and do not put an out-of-scope breakage into `blocking_findings`: the worker would have to leave its scope to satisfy it, and the scope gate will refuse the result.
-
-A review with escalations and no blocking findings comes back as `escalated`, which does not complete the node. The controller gives those paths an owner — a gap node or a replan — and then re-reviews the same head, where the escalation no longer stands because someone now owns it.
-
-## Scoped re-review
-
-Re-review receives the original contract, prior blocking finding IDs, the fix-only diff, and appended verification evidence. It verdicts every prior finding `ADDRESSED` or `NOT_ADDRESSED`, then identifies only new breakage introduced by the fix. It does not restart broad review or change acceptance.
-
-After three unsuccessful fix/re-review rounds, return the unresolved finding IDs to the controller. The controller chooses more context, a stronger model, re-slicing, replanning, or `blocked`.
+Once the worker reports, the controller checks scope, then reviews the diff using `${CLAUDE_SKILL_DIR}/references/review-protocol.md`.

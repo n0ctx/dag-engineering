@@ -15,7 +15,7 @@ Always read:
 - `${CLAUDE_SKILL_DIR}/references/node-contract.md`
 - `${CLAUDE_SKILL_DIR}/references/verification.md`
 
-Read `${CLAUDE_SKILL_DIR}/references/dag-schema.md` only to diagnose or repair invalid state. Read `${CLAUDE_SKILL_DIR}/references/decomposition.md` only when re-slicing or replanning is required.
+Read `${CLAUDE_SKILL_DIR}/references/review-protocol.md` when a node comes back for review, not at session start. Read `${CLAUDE_SKILL_DIR}/references/dag-schema.md` only to diagnose or repair invalid state. Read `${CLAUDE_SKILL_DIR}/references/decomposition.md` only when re-slicing or replanning is required.
 
 ## Cold start and recovery
 
@@ -96,9 +96,9 @@ Check scope first, before spending a reviewer on the diff:
 
 If it reports a violation, do not dispatch a reviewer. Return the paths to the worker or fail the attempt. The review gate would reject the same diff later anyway, after a full reviewer run has already been paid for.
 
-Then create a bounded review package: original node contract, actual diff or immutable diff path, commit range, structured handoff, relevant evidence, and any paths `check-scope` reported as also claimed by an unfinished node. Dispatch a fresh read-only reviewer using the reviewer protocol. Do not include the implementer's reasoning transcript.
+Now read `${CLAUDE_SKILL_DIR}/references/review-protocol.md` and create a bounded review package: original node contract, actual diff or immutable diff path, commit range, structured handoff, relevant evidence, and any paths `check-scope` reported as also claimed by an unfinished node. Dispatch a fresh read-only reviewer using that protocol. Do not include the implementer's reasoning transcript.
 
-The reviewer checks both acceptance/scope compliance and code quality. It cannot invent acceptance criteria or choose a new architecture. Every finding it raises carries the path it is about, and that path decides whether it is a `blocking_finding` the worker can fix or a `controller_decision` outside the node's scope. Save its JSON verdict using the schema in `${CLAUDE_SKILL_DIR}/references/node-contract.md`, then record the round:
+The reviewer checks both acceptance/scope compliance and code quality. It cannot invent acceptance criteria or choose a new architecture. Every finding it raises carries the path it is about, and that path decides whether it is a `blocking_finding` the worker can fix or a `controller_decision` outside the node's scope. Save its JSON verdict using the schema in `${CLAUDE_SKILL_DIR}/references/review-protocol.md`, then record the round:
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> review \

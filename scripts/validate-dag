@@ -437,6 +437,12 @@ def validate_review_artifact(
     if value.get("quality") not in {"APPROVED", "NEEDS_FIXES"}:
         raise DagError("review artifact has invalid quality verdict")
     validate_findings(value, node)
+    refusing = value["spec"] == "NEEDS_FIXES" or value["quality"] == "NEEDS_FIXES"
+    if refusing and not (value["blocking_findings"] or value["controller_decisions"]):
+        raise DagError(
+            "review artifact refuses the node without naming a finding; a NEEDS_FIXES verdict "
+            "must record what is wrong and where"
+        )
     return value
 
 
@@ -1290,12 +1296,16 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], head_ref, changed)
     review = validate_review_artifact(args.dag, args.review_ref, node, head_ref, len(reviews) + 1)
     escalations = review["controller_decisions"]
-    if review["spec"] == "APPROVED" and review["quality"] == "APPROVED" and not review["blocking_findings"]:
-        outcome = "escalated" if escalations else "approved"
+    # A fix round is only meaningful when something inside scope is named, so the buckets
+    # decide the outcome before the verdict fields do.
+    if review["blocking_findings"]:
+        outcome = "needs_fixes"
     elif review["spec"] == "CANNOT_VERIFY":
         outcome = "cannot_verify"
+    elif escalations:
+        outcome = "escalated"
     else:
-        outcome = "needs_fixes"
+        outcome = "approved"
     if reviews and reviews[-1]["outcome"] == "needs_fixes" and reviews[-1]["head_ref"] == head_ref:
         raise DagError("a needs_fixes re-review requires a new head commit")
     now = utc_now()

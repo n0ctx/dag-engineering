@@ -883,6 +883,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(review["outcome"], "needs_fixes")
         self.assertEqual(review["escalated_paths"], ["src/caller.py"])
 
+    def test_refusal_verdict_with_only_escalations_does_not_start_a_fix_round(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, approved=False, blocking=[], escalations=[
+            {"severity": "important", "path": "src/caller.py", "detail": "A's signature broke this caller"},
+        ])
+        self.assertEqual(self.last_review("A")["outcome"], "escalated")
+
+    def test_refusal_verdict_must_name_a_finding(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.review("A", head, approved=False, blocking=[], expect=3)
+        self.assertIn("without naming a finding", result.stderr)
+
     def test_check_scope_reports_a_clean_diff(self):
         self.write(dag([node("A")]))
         self.start("A")

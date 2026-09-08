@@ -160,7 +160,7 @@ The runtime derives the verdict from the findings and binds it to this exact pla
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --amend ".dag/draft.json"
 ```
 
-Amending clears the previous verdict, so dispatch a fresh review afterwards. Fixing findings is an amendment, never an abandon-and-recreate: abandoning is for dropping an effort the user no longer wants, and using it to edit a plan destroys the record of what was reviewed. Do not argue a blocking finding away in chat: either change the plan or record why the reviewer was wrong and get a fresh verdict.
+Amending clears the previous verdict, so dispatch a fresh review afterwards. Give each amendment its own draft path; the file is kept as the record of what that round proposed. Fixing findings is an amendment, never an abandon-and-recreate: abandoning is for dropping an effort the user no longer wants, and using it to edit a plan destroys the record of what was reviewed. Do not argue a blocking finding away in chat: either change the plan or record why the reviewer was wrong and get a fresh verdict.
 
 ## 8. Approval gate
 

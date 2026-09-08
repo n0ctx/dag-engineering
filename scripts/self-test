@@ -565,7 +565,8 @@ class RuntimeTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["nodes"][1]["depends_on"], ["A"])
         self.assertIsNone(saved["decomposition_review"])
-        self.assertFalse((self.root / ".dag" / "amended.json").exists())
+        self.assertTrue((self.root / ".dag" / "amended.json").exists())
+        self.assertEqual(saved["replans"][-1]["ref"], ".dag/amended.json")
         self.design_review()
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
@@ -789,6 +790,18 @@ class RuntimeTests(unittest.TestCase):
         self.design_review()
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
+
+    def test_every_amendment_is_recorded_and_its_draft_survives(self):
+        """`replans` points at the proposed plan, so the file it names must still be there."""
+        self.awaiting([node("A")])
+        proposed = json.loads(self.path.read_text())
+        proposed["nodes"][0]["title"] = "Node A, retitled"
+        ref = self.draft(proposed, name="first.json")
+        self.run_cmd("update-task", "--amend", ref)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["replans"][-1]["ref"], ref)
+        self.assertEqual(saved["replans"][-1]["kind"], "amendment")
+        self.assertTrue((self.root / ref).exists())
 
     def test_amend_requires_a_declared_break_and_a_settled_graph(self):
         self.awaiting([node("A"), node("B")])

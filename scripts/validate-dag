@@ -1814,7 +1814,7 @@ def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
     if running:
         raise DagError(f"settle running nodes before amending the plan: {', '.join(running)}")
 
-    candidate, draft = load_draft(dag_path, dag, draft_ref)
+    candidate, _ = load_draft(dag_path, dag, draft_ref)
     if candidate["planning_status"] in {"approved", "complete"}:
         raise DagError(
             f"the draft declares itself {candidate['planning_status']!r}; an amended plan is still "
@@ -1849,19 +1849,17 @@ def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
     candidate["planning_session"] = dag.get("planning_session")
     candidate["approval_ref"] = None
     candidate["planning_status"] = "draft" if dag["planning_status"] == "draft" else "awaiting_approval"
-    if kept or dropped or added:
-        candidate["replans"] = list(dag.get("replans") or []) + [
-            {"ref": draft_ref, "at": utc_now(), "kind": "amendment",
-             "added": added, "dropped": dropped, "kept": kept}
-        ]
-    else:
-        candidate["replans"] = list(dag.get("replans") or []) or None
+    candidate["replans"] = list(dag.get("replans") or []) + [
+        {"ref": draft_ref, "at": utc_now(), "kind": "amendment",
+         "added": added, "dropped": dropped, "kept": kept}
+    ]
     errors, _ = validate_dag(candidate)
     if errors:
         raise DagError("amendment would produce invalid DAG: " + "; ".join(errors))
     dag.clear()
     dag.update(candidate)
-    draft.unlink()
+    # The draft stays on disk: `replans` points at it as the record of what was proposed,
+    # and deleting the file the record names would leave the audit trail pointing at nothing.
     detail = f", {len(kept)} with an execution record preserved" if kept else ""
     return (
         f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes{detail}; decomposition review cleared"

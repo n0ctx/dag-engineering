@@ -10,7 +10,7 @@ Provide:
 node id and title
 objective
 scope.files and scope.forbidden
-read_first
+read_first (the complete declared context, not a starting point)
 inputs
 precise upstream outputs and handoff refs
 expected outputs
@@ -23,12 +23,16 @@ project constraints that bind this node
 
 Do not provide full chat history, the whole DAG, every upstream report, or the implementer's future reviewer prompt.
 
+State the search boundary in the same package, because `scope.files` bounds what the worker may write and nothing bounds what it may read:
+
+> Read every file in `read_first` first; it is the whole context this node was planned with. Beyond it, search only inside `scope.files` and the paths those files name directly, such as an import or a caller you must change. Do not survey the repository, read unrelated modules, read Git history, or read documentation the contract does not name. If you cannot proceed on this context, report `NEEDS_CONTEXT` naming the file you need — do not go find it yourself.
+
 ## Worker protocol
 
 The worker:
 
-1. Reads the contract and listed context before editing.
-2. Raises a scope or contract problem before guessing.
+1. Reads all of `read_first` before searching or editing, and treats it as complete rather than as a starting point.
+2. Raises a scope or contract problem before guessing, and returns `NEEDS_CONTEXT` naming the missing file rather than exploring outside the boundary to compensate for a thin contract.
 3. Implements only the declared objective and scope.
 4. Runs focused verification and records reproducible evidence.
 5. Self-reviews the actual diff, but does not approve the node.
@@ -58,7 +62,7 @@ Use exactly one status:
 - `NEEDS_CONTEXT`: a specific missing fact, artifact, or decision is required;
 - `BLOCKED`: the worker cannot complete the node with the current contract or capability.
 
-For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was tried, and the decision/context needed. Do not keep exploring without a bounded hypothesis.
+For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was tried, and the decision/context needed. Do not keep exploring without a bounded hypothesis. Stopping is still a report: write the handoff artifact at the supplied path with that status, `commit` and `files_changed` empty, and the blocker in `unresolved`. A stop returned only as chat prose leaves the controller nothing durable to act on, and the node cannot be resolved from it.
 
 ## Worker handoff
 
@@ -74,6 +78,7 @@ Write a compact artifact at the exact path the controller supplied, normally `<c
   "verification": [
     {"command": "focused command", "result": "exit code and concise result", "artifact_ref": "path"}
   ],
+  "context_used": ["every path read that read_first did not name"],
   "concerns": [],
   "unresolved": [],
   "downstream_notes": [],
@@ -81,11 +86,15 @@ Write a compact artifact at the exact path the controller supplied, normally `<c
 }
 ```
 
+`context_used` is required and may be empty. It is a self-report, so it gates nothing; it exists so that a node which had to read forty files to start is visible as a defective contract rather than as an invisible cost.
+
 Keep implementation chronology, searches, failed commands, and reasoning out of the handoff. Link durable reports instead.
 
 ## Fresh reviewer package
 
-Provide only the original node contract, actual diff or immutable diff artifact, base/head refs, structured handoff, and relevant test evidence. The reviewer is read-only and does not receive the implementer's reasoning transcript.
+Provide only the original node contract, actual diff or immutable diff artifact, base/head refs, structured handoff, relevant test evidence, and any paths `check-scope` reported as also claimed by an unfinished node. The reviewer is read-only and does not receive the implementer's reasoning transcript.
+
+Bound the reviewer's reading too: judge the diff against the contract, and open a file outside the diff and `read_first` only to settle a specific claim the diff makes. Reviewing is not a repository survey.
 
 The next block is copied exactly from Superpowers' current task reviewer prompt because its anti-anchoring rule is identical here:
 
@@ -107,7 +116,7 @@ The reviewer checks:
 - test validity, including assertions that do not prove the criterion;
 - code quality, security, error handling, and unnecessary abstraction.
 
-Every blocking finding names severity, acceptance/scope impact, and file:line evidence. A design choice or defect in the node contract goes to the controller; the reviewer does not silently choose or edit the contract. Out-of-scope observations are reported but not fixed.
+A design choice or defect in the node contract goes to the controller as `spec: CANNOT_VERIFY`; the reviewer does not silently choose or edit the contract.
 
 Output:
 
@@ -118,7 +127,10 @@ Output:
   "round": 1,
   "spec": "APPROVED | NEEDS_FIXES | CANNOT_VERIFY",
   "quality": "APPROVED | NEEDS_FIXES",
-  "blocking_findings": [],
+  "blocking_findings": [
+    {"severity": "critical", "path": "src/auth/client.py", "detail": "acceptance/scope impact and file:line evidence"}
+  ],
+  "controller_decisions": [],
   "minor_findings": [],
   "out_of_scope_observations": [],
   "checks_performed": []
@@ -126,6 +138,18 @@ Output:
 ```
 
 Save it as a project-relative JSON artifact. The runtime derives the review outcome from these verdicts and findings; neither implementer nor controller passes an unverified `approved` flag.
+
+### Where a blocking problem goes
+
+Every blocking finding carries the project-relative `path` it is about, and that path decides its bucket. The runtime enforces the split both ways and rejects a misfiled finding.
+
+- **`blocking_findings`** — the path is inside `scope.files`. The worker can fix it, so it drives the fix loop.
+- **`controller_decisions`** — the path is outside `scope.files` or inside `scope.forbidden`, and this diff made it a problem: a changed signature breaks a caller the worker may not touch, a migration needs a companion change elsewhere. The worker fixing it would trip the scope gate, so it is the controller's call.
+- **`out_of_scope_observations`** — noticed outside the scope but not caused by this diff and not blocking. Reported, never actioned here.
+
+Do not move a fixable defect into `controller_decisions` to skip a fix round, and do not put an out-of-scope breakage into `blocking_findings`: the worker would have to leave its scope to satisfy it, and the scope gate will refuse the result.
+
+A review with escalations and no blocking findings comes back as `escalated`, which does not complete the node. The controller gives those paths an owner — a gap node or a replan — and then re-reviews the same head, where the escalation no longer stands because someone now owns it.
 
 ## Scoped re-review
 

@@ -23,7 +23,6 @@ def node(node_id, *, depends=(), conflicts=(), files=None):
         "title": f"Node {node_id}",
         "objective": f"Deliver {node_id}",
         "work_type": "implementation",
-        "estimated_cost": "low",
         "scope": {"files": list(files) if files else [f"src/{node_id}.py"], "forbidden": []},
         "read_first": [],
         "depends_on": list(depends),
@@ -115,7 +114,8 @@ class RuntimeTests(unittest.TestCase):
             ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
         ).stdout.strip()
 
-    def artifacts(self, node_id, head, *, round_number=1, approved=True):
+    def artifacts(self, node_id, head, *, round_number=1, approved=True,
+                  blocking=None, escalations=None, context_used=()):
         folder = self.root / ".dag" / "artifacts" / node_id
         folder.mkdir(parents=True, exist_ok=True)
         handoff = folder / f"handoff-{round_number}.json"
@@ -126,11 +126,16 @@ class RuntimeTests(unittest.TestCase):
             "outputs": [f"output {node_id}"],
             "decisions": [],
             "verification": [{"command": "fixture check", "result": "exit 0"}],
+            "context_used": list(context_used),
             "concerns": [],
             "unresolved": [],
             "downstream_notes": [],
             "commit": head,
         }), encoding="utf-8")
+        if blocking is None:
+            blocking = [] if approved else [
+                {"severity": "critical", "path": f"src/{node_id}.py", "detail": "fixture defect"}
+            ]
         review = folder / f"review-{round_number}.json"
         review.write_text(json.dumps({
             "node": node_id,
@@ -138,7 +143,8 @@ class RuntimeTests(unittest.TestCase):
             "round": round_number,
             "spec": "APPROVED" if approved else "NEEDS_FIXES",
             "quality": "APPROVED" if approved else "NEEDS_FIXES",
-            "blocking_findings": [] if approved else ["F1"],
+            "blocking_findings": blocking,
+            "controller_decisions": list(escalations or []),
         }), encoding="utf-8")
         master = folder / "master.json"
         master.write_text(json.dumps({
@@ -797,6 +803,158 @@ class RuntimeTests(unittest.TestCase):
             "--review-ref", str(review.relative_to(self.root)), "--head-ref", head, expect=3,
         )
         self.assertIn("scope violation", result.stderr)
+
+    def review(self, node_id, head, *, round_number=1, expect=0, **kwargs):
+        handoff, review, _ = self.artifacts(node_id, head, round_number=round_number, **kwargs)
+        return self.run_cmd(
+            "update-task", node_id, "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head, expect=expect,
+        )
+
+    def last_review(self, node_id):
+        node_state = next(n for n in json.loads(self.path.read_text())["nodes"] if n["id"] == node_id)
+        return node_state["attempts"][-1]["reviews"][-1]
+
+    def test_blocking_finding_must_be_inside_node_scope(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.review("A", head, approved=False, expect=3, blocking=[
+            {"severity": "critical", "path": "src/other.py", "detail": "caller breaks"},
+        ])
+        self.assertIn("record it under controller_decisions", result.stderr)
+
+    def test_blocking_finding_requires_a_path(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.review("A", head, approved=False, expect=3, blocking=[
+            {"severity": "critical", "detail": "something is wrong"},
+        ])
+        self.assertIn("path: must be the project-relative file", result.stderr)
+
+    def test_escalation_must_be_outside_node_scope(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.review("A", head, expect=3, escalations=[
+            {"severity": "important", "path": "src/A.py", "detail": "fixable here"},
+        ])
+        self.assertIn("record it under blocking_findings", result.stderr)
+
+    def test_escalation_blocks_completion_and_names_its_paths(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.review("A", head, escalations=[
+            {"severity": "important", "path": "src/caller.py", "detail": "A's new signature breaks this caller"},
+        ])
+        self.assertIn("escalated", result.stdout)
+        self.assertEqual(self.last_review("A")["outcome"], "escalated")
+        self.assertEqual(self.last_review("A")["escalated_paths"], ["src/caller.py"])
+        _, _, master = self.artifacts("A", head)
+        result = self.run_cmd(
+            "update-task", "A", "done", "--handoff-ref", ".dag/artifacts/A/handoff-1.json",
+            "--verification-ref", master, "--head-ref", head, "--summary", "x", expect=3,
+        )
+        self.assertIn("without a final approved review", result.stderr)
+        status = json.loads(self.run_cmd("status", "--json").stdout)
+        self.assertEqual(status["active_attempts"][0]["escalated_paths"], ["src/caller.py"])
+
+    def test_escalation_resolves_by_rereviewing_the_same_head(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, escalations=[
+            {"severity": "important", "path": "src/caller.py", "detail": "no node owns this caller"},
+        ])
+        self.review("A", head, round_number=2)
+        self.assertEqual(self.last_review("A")["outcome"], "approved")
+        self.assertEqual(self.last_review("A")["escalated_paths"], [])
+
+    def test_both_finding_buckets_yield_needs_fixes(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, approved=False, escalations=[
+            {"severity": "important", "path": "src/caller.py", "detail": "caller breaks"},
+        ])
+        review = self.last_review("A")
+        self.assertEqual(review["outcome"], "needs_fixes")
+        self.assertEqual(review["escalated_paths"], ["src/caller.py"])
+
+    def test_check_scope_reports_a_clean_diff(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        result = self.run_cmd("check-scope", "A", "--head-ref", head, "--json")
+        report = json.loads(result.stdout)
+        self.assertTrue(report["in_scope"])
+        self.assertEqual(report["changed"], ["src/A.py"])
+        self.assertEqual(report["violations"], [])
+
+    def test_check_scope_rejects_an_out_of_scope_change_without_writing(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        before = self.path.read_bytes()
+        seal_before = (self.path.parent / ".dag.json.seal").read_bytes()
+        path = self.root / "outside.py"
+        path.write_text("BAD = True\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "outside.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "outside scope"], check=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        result = self.run_cmd("check-scope", "A", "--head-ref", head, expect=1)
+        self.assertIn("outside.py", result.stdout)
+        self.assertIn("Do not dispatch a reviewer", result.stdout)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((self.path.parent / ".dag.json.seal").read_bytes(), seal_before)
+
+    def test_check_scope_names_nodes_that_also_claim_a_path(self):
+        shared = ["src/A.py", "src/shared.py"]
+        self.write(dag([
+            node("A", files=shared),
+            node("B", depends=("A",), files=["src/shared.py"]),
+        ]))
+        self.start("A")
+        head = self.commit_node("A")
+        report = json.loads(self.run_cmd("check-scope", "A", "--head-ref", head, "--json").stdout)
+        self.assertTrue(report["in_scope"])
+        self.assertEqual(report["also_claimed_by"], {})
+        path = self.root / "src" / "shared.py"
+        path.write_text("SHARED = True\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "src/shared.py"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "also do B's work"], check=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        report = json.loads(self.run_cmd("check-scope", "A", "--head-ref", head, "--json").stdout)
+        self.assertTrue(report["in_scope"])
+        self.assertEqual(report["also_claimed_by"], {"src/shared.py": ["B"]})
+
+    def test_check_scope_reports_context_read_beyond_the_contract(self):
+        value = dag([node("A")])
+        value["nodes"][0]["read_first"] = ["docs/contract.md"]
+        self.write(value)
+        self.start("A")
+        head = self.commit_node("A")
+        handoff, _, _ = self.artifacts(
+            "A", head, context_used=["docs/contract.md", "src/A.py", "src/unrelated.py"]
+        )
+        report = json.loads(self.run_cmd(
+            "check-scope", "A", "--head-ref", head, "--handoff-ref", handoff, "--json"
+        ).stdout)
+        self.assertEqual(report["context_beyond_contract"], ["src/unrelated.py"])
+
+    def test_estimated_cost_is_gone_and_a_stale_one_is_tolerated(self):
+        self.write(dag([node("A")]))
+        self.run_cmd("validate-dag")
+        value = json.loads(self.path.read_text())
+        value["nodes"][0]["estimated_cost"] = "high"
+        self.write(value)
+        self.run_cmd("validate-dag")
+        self.assertNotIn("estimated_cost", self.run_cmd("ready-tasks", "--json").stdout)
 
     def test_review_circuit_breaker_is_stateful(self):
         self.write(dag([node("A")]))

@@ -30,9 +30,9 @@ PLANNING_STATUSES = {
 }
 NODE_STATUSES = {"pending", "running", "done", "failed", "blocked"}
 WORK_TYPES = {"implementation", "investigation", "integration", "documentation"}
-COSTS = {"low", "medium", "high"}
 CONVERGENCE_STATUSES = {"pending", "failed", "passed"}
-REVIEW_OUTCOMES = {"approved", "needs_fixes", "cannot_verify"}
+REVIEW_OUTCOMES = {"approved", "needs_fixes", "cannot_verify", "escalated"}
+FINDING_SEVERITIES = {"critical", "important", "minor"}
 WORKER_DONE_STATUSES = {"DONE", "DONE_WITH_CONCERNS"}
 NODE_TRANSITIONS = {
     "pending": {"running"},
@@ -324,11 +324,17 @@ def dirty_paths(worktree: Path) -> list[str]:
     return paths
 
 
-def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
-    raw_worktree = attempt["worktree"]
-    worktree = resolve_worktree(dag_path, raw_worktree)
-    base_ref = attempt["base_ref"]
-    base_ref = resolve_commit(worktree, base_ref, "base_ref")
+def in_scope(path: str, scope: dict[str, Any]) -> bool:
+    """Whether a node may write a project-relative path."""
+    if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope["forbidden"]):
+        return False
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in scope["files"])
+
+
+def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
+    """Return the attempt's changed paths, refusing an unclean or non-linear worktree."""
+    worktree = resolve_worktree(dag_path, attempt["worktree"])
+    base_ref = resolve_commit(worktree, attempt["base_ref"], "base_ref")
     head_ref = resolve_commit(worktree, head_ref, "head_ref")
     ancestor = run_git(worktree, "merge-base", "--is-ancestor", base_ref, head_ref)
     if ancestor.returncode != 0:
@@ -339,7 +345,11 @@ def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any
     dirty = dirty_paths(worktree)
     if dirty:
         raise DagError("worktree has uncommitted changes outside .dag/: " + ", ".join(dirty))
-    changed = [line for line in diff.stdout.splitlines() if line]
+    return [line for line in diff.stdout.splitlines() if line]
+
+
+def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
+    changed = node_diff(dag_path, node, attempt, head_ref)
     allowed = node["scope"]["files"]
     forbidden = node["scope"]["forbidden"]
     for changed_path in changed:
@@ -372,15 +382,52 @@ def validate_handoff_artifact(
         raise DagError("handoff artifact files_changed must equal the Git diff path list")
     if not isinstance(value.get("verification"), list) or not value["verification"]:
         raise DagError("handoff artifact verification must be a non-empty array")
+    context_used = value.get("context_used")
+    if not isinstance(context_used, list) or any(not is_safe_path(item) for item in context_used):
+        raise DagError("handoff artifact context_used must be an array of project-relative paths")
     return value
 
 
+def validate_findings(value: dict[str, Any], node: dict[str, Any]) -> None:
+    """Partition a review's findings on the boundary the worker can actually act within.
+
+    A finding inside `scope.files` drives the fix loop. A finding outside it cannot be
+    fixed without tripping the scope gate, so it belongs to the controller. Enforcing the
+    partition in both directions is what stops a reviewer from deadlocking the fix loop
+    against the scope gate, or from routing a fixable defect around the loop.
+    """
+    for name, want_in_scope in (("blocking_findings", True), ("controller_decisions", False)):
+        findings = value.get(name)
+        if not isinstance(findings, list):
+            raise DagError(f"review artifact {name} must be an array")
+        for index, finding in enumerate(findings):
+            label = f"review artifact {name}[{index}]"
+            if not isinstance(finding, dict):
+                raise DagError(f"{label}: must be an object")
+            if finding.get("severity") not in FINDING_SEVERITIES:
+                raise DagError(
+                    f"{label}.severity: must be one of {', '.join(sorted(FINDING_SEVERITIES))}"
+                )
+            if not is_text(finding.get("detail")):
+                raise DagError(f"{label}.detail: must be a non-empty string")
+            path = finding.get("path")
+            if not is_safe_path(path):
+                raise DagError(f"{label}.path: must be the project-relative file the finding is about")
+            if in_scope(path, node["scope"]) is not want_in_scope:
+                side = "outside" if want_in_scope else "inside"
+                other = "controller_decisions" if want_in_scope else "blocking_findings"
+                raise DagError(
+                    f"{label}.path {path!r} is {side} {node['id']!r} scope.files; "
+                    f"record it under {other} instead"
+                )
+
+
 def validate_review_artifact(
-    dag_path: Path, ref: str, node_id: str, head_ref: str, expected_round: int
+    dag_path: Path, ref: str, node: dict[str, Any], head_ref: str, expected_round: int
 ) -> dict[str, Any]:
     value = load_json_artifact(dag_path, ref, "review artifact")
-    if value.get("node") != node_id:
-        raise DagError(f"review artifact node must be {node_id!r}")
+    if value.get("node") != node["id"]:
+        raise DagError(f"review artifact node must be {node['id']!r}")
     if value.get("head_ref") != head_ref:
         raise DagError("review artifact head_ref must equal the reviewed head commit")
     if value.get("round") != expected_round:
@@ -389,14 +436,12 @@ def validate_review_artifact(
         raise DagError("review artifact has invalid spec verdict")
     if value.get("quality") not in {"APPROVED", "NEEDS_FIXES"}:
         raise DagError("review artifact has invalid quality verdict")
-    findings = value.get("blocking_findings")
-    if not isinstance(findings, list):
-        raise DagError("review artifact blocking_findings must be an array")
+    validate_findings(value, node)
     return value
 
 
 PLAN_NODE_FIELDS = (
-    "id", "title", "objective", "work_type", "estimated_cost", "scope", "read_first",
+    "id", "title", "objective", "work_type", "scope", "read_first",
     "depends_on", "conflicts_with", "inputs", "outputs", "acceptance", "verification",
 )
 DESIGN_SEVERITIES = {"critical", "important", "minor"}
@@ -780,7 +825,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         "title",
         "objective",
         "work_type",
-        "estimated_cost",
         "scope",
         "read_first",
         "depends_on",
@@ -813,8 +857,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         expect_text(errors, node.get("objective"), f"{label}.objective")
         if node.get("work_type") not in WORK_TYPES:
             errors.append(f"{label}.work_type: invalid value {node.get('work_type')!r}")
-        if node.get("estimated_cost") not in COSTS:
-            errors.append(f"{label}.estimated_cost: invalid value {node.get('estimated_cost')!r}")
 
         scope = node.get("scope")
         if not isinstance(scope, dict):
@@ -926,6 +968,11 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                     errors.append(f"{r_label}.head_ref: must be a non-empty string")
                 if not is_timestamp(review.get("reviewed_at")):
                     errors.append(f"{r_label}.reviewed_at: invalid timestamp")
+                expect_string_list(
+                    errors, review.get("escalated_paths"), f"{r_label}.escalated_paths", paths=True
+                )
+                if review.get("outcome") == "escalated" and not review.get("escalated_paths"):
+                    errors.append(f"{r_label}.escalated_paths: an escalated review must name the paths")
         if attempts:
             last = attempts[-1]
             if status == "running" and (last.get("finished_at") is not None or last.get("outcome") is not None):
@@ -1106,7 +1153,6 @@ def cmd_ready(argv: list[str]) -> int:
                 "id": node["id"],
                 "title": node["title"],
                 "work_type": node["work_type"],
-                "estimated_cost": node["estimated_cost"],
                 "depends_on": node["depends_on"],
                 "conflicts_with": node["conflicts_with"],
             }
@@ -1125,8 +1171,93 @@ def cmd_ready(argv: list[str]) -> int:
         else:
             print(f"Eligible candidates ({len(candidates)}; controller still selects):")
             for node in candidates:
-                print(f"- {node['id']}: {node['title']} [{node['work_type']}, cost={node['estimated_cost']}]")
+                print(f"- {node['id']}: {node['title']} [{node['work_type']}]")
     return 0
+
+
+def claimed_by_others(dag: dict[str, Any], node_id: str, changed: list[str]) -> dict[str, list[str]]:
+    """Map changed paths to the unfinished nodes whose scope also claims them.
+
+    Overlap is legal, which is what `conflicts_with` exists for, so this is a fact for the
+    controller rather than a gate: it is the cheapest available signal that a worker did a
+    neighbouring node's work instead of only its own.
+    """
+    claims: dict[str, list[str]] = {}
+    for other in dag["nodes"]:
+        if other["id"] == node_id or other["status"] not in {"pending", "running"}:
+            continue
+        for path in changed:
+            if in_scope(path, other["scope"]):
+                claims.setdefault(path, []).append(other["id"])
+    return claims
+
+
+def cmd_check_scope(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="check-scope",
+        description="Check an attempt's diff against node scope before a reviewer is dispatched.",
+    )
+    parser.add_argument("node_id", help="node whose open attempt is being checked")
+    parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
+    parser.add_argument("--head-ref", required=True, help="commit the worker reported")
+    parser.add_argument("--handoff-ref", help="worker handoff artifact, to report context read beyond the contract")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+    args.dag = resolve_dag_path(args.dag)
+    dag = validate_or_exit(args.dag, args.json)
+    nodes = node_map(dag)
+    node = nodes.get(args.node_id)
+
+    try:
+        if node is None:
+            raise DagError(f"unknown node {args.node_id!r}")
+        if not node["attempts"] or node["attempts"][-1]["outcome"] is not None:
+            raise DagError(f"{args.node_id!r} has no open attempt to check")
+        changed = node_diff(args.dag, node, node["attempts"][-1], args.head_ref)
+        context_used: list[str] = []
+        if args.handoff_ref:
+            handoff = load_json_artifact(args.dag, args.handoff_ref, "handoff artifact")
+            context_used = handoff.get("context_used") or []
+    except DagError as exc:
+        if args.json:
+            print(json.dumps({"in_scope": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_TRANSITION
+
+    violations = [path for path in changed if not in_scope(path, node["scope"])]
+    declared = set(node["read_first"])
+    beyond_contract = sorted(
+        path for path in context_used
+        if path not in declared and not in_scope(path, node["scope"])
+    )
+    claims = claimed_by_others(dag, node["id"], changed)
+    output = {
+        "node": node["id"],
+        "head_ref": args.head_ref,
+        "in_scope": not violations,
+        "changed": changed,
+        "violations": violations,
+        "also_claimed_by": claims,
+        "context_beyond_contract": beyond_contract,
+    }
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        print(f"{node['id']} @ {args.head_ref}: {len(changed)} changed path(s)")
+        for path in changed:
+            print(f"  {'!' if path in violations else ' '} {path}")
+        if violations:
+            print("\nOut of scope. Do not dispatch a reviewer; return these to the worker or fail the attempt.")
+        if claims:
+            print("\nAlso claimed by unfinished nodes (overlap is legal; check for work done on their behalf):")
+            for path, owners in sorted(claims.items()):
+                print(f"  {path} <- {', '.join(owners)}")
+        if beyond_contract:
+            print("\nRead beyond read_first and scope (self-reported; a long list means the contract was thin):")
+            for path in beyond_contract:
+                print(f"  {path}")
+    return EXIT_INVALID if violations else 0
 
 
 def clear_handoff(node: dict[str, Any]) -> None:
@@ -1157,9 +1288,10 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     head_ref = resolve_commit(worktree, args.head_ref, "head_ref")
     changed = checked_changes(args.dag, node, attempt, head_ref)
     validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], head_ref, changed)
-    review = validate_review_artifact(args.dag, args.review_ref, node["id"], head_ref, len(reviews) + 1)
+    review = validate_review_artifact(args.dag, args.review_ref, node, head_ref, len(reviews) + 1)
+    escalations = review["controller_decisions"]
     if review["spec"] == "APPROVED" and review["quality"] == "APPROVED" and not review["blocking_findings"]:
-        outcome = "approved"
+        outcome = "escalated" if escalations else "approved"
     elif review["spec"] == "CANNOT_VERIFY":
         outcome = "cannot_verify"
     else:
@@ -1174,12 +1306,20 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
             "ref": args.review_ref,
             "handoff_ref": args.handoff_ref,
             "head_ref": head_ref,
+            "escalated_paths": sorted({finding["path"] for finding in escalations}),
             "reviewed_at": now,
         }
     )
     attempt["handoff_ref"] = args.handoff_ref
     attempt["head_ref"] = head_ref
-    return f"{node['id']}: review round {len(reviews)} -> {outcome}"
+    message = f"{node['id']}: review round {len(reviews)} -> {outcome}"
+    if outcome == "escalated":
+        message += (
+            "\nThe worker cannot fix these paths without leaving its scope: "
+            + ", ".join(reviews[-1]["escalated_paths"])
+            + "\nGive them an owner through a gap node or a replan, then re-review this head."
+        )
+    return message
 
 
 def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
@@ -1703,6 +1843,7 @@ def cmd_status(argv: list[str]) -> int:
                 "head_ref": attempt["head_ref"],
                 "review_rounds": len(attempt["reviews"]),
                 "last_review": attempt["reviews"][-1]["outcome"] if attempt["reviews"] else None,
+                "escalated_paths": attempt["reviews"][-1]["escalated_paths"] if attempt["reviews"] else [],
             }
         )
     unlocks: dict[str, list[str]] = {node_id: [] for node_id in nodes}
@@ -1758,6 +1899,11 @@ def cmd_status(argv: list[str]) -> int:
                 f"{attempt['worktree']} [{attempt['branch']}] base={attempt['base_ref'][:12]} "
                 f"reviews={attempt['review_rounds']} last={attempt['last_review'] or 'none'}"
             )
+            if attempt["escalated_paths"]:
+                print(
+                    "    needs an owner outside this node's scope: "
+                    + ", ".join(attempt["escalated_paths"])
+                )
         print("Roadmap (layers follow depends_on only):")
         markers = {"done": "x", "running": ">", "failed": "!", "blocked": "!", "pending": " "}
         for layer in roadmap:
@@ -1786,6 +1932,7 @@ def main() -> int:
         "ready-tasks": cmd_ready,
         "update-task": cmd_update,
         "status": cmd_status,
+        "check-scope": cmd_check_scope,
     }
     if command not in commands:
         print(f"ERROR: unknown command entrypoint {command!r}", file=sys.stderr)

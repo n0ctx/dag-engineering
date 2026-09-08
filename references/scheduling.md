@@ -9,7 +9,7 @@ The controller then decides whether dispatch has positive value. Consider:
 - critical-path delay and real wall-clock benefit;
 - repeated reconnaissance or duplicated context cost;
 - implicit shared state not captured by file paths;
-- `work_type` and `estimated_cost`;
+- `work_type`;
 - stable scope and acceptance;
 - worktree setup and later integration cost.
 

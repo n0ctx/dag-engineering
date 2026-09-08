@@ -111,11 +111,13 @@ Then derive resource conflicts:
 - Same-file work normally conflicts, but a conflict is not a fabricated dependency.
 - Include shared generated artifacts, migrations, schemas, lockfiles, branch-wide rewrites, and external mutable resources when relevant.
 
-Use `work_type` and `estimated_cost` to expose expensive investigation or integration work to the scheduler. Do not encode waves as persistent state; ready sets are derived.
+Use `work_type` to expose investigation or integration work to the scheduler. Do not encode waves as persistent state; ready sets are derived.
 
 ## 5. Write fresh-context node contracts
 
 For every node, provide objective, hard scope, `read_first`, inputs, exact upstream outputs, expected outputs, acceptance criteria, executable or inspectable verification, stop conditions through the shared worker protocol, and an initially empty handoff.
+
+`read_first` names the files, not the directories that contain them, and it must be sufficient on its own: it is the whole context the worker gets, and a worker told to read `src/auth/` will read the repository instead. This is the only place the cost of that reading can be controlled, since nothing at execution time can cap it.
 
 Acceptance belongs to the plan, not the worker or reviewer. Criteria must describe observable behavior or artifacts, not implementation activity. Every acceptance ID must be covered by at least one verification entry. A name search, file-existence check, import, or syntax check may support structural acceptance, but it cannot by itself verify behavioral acceptance.
 

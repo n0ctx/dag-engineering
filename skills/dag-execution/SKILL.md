@@ -71,7 +71,9 @@ Use a fresh worker with no inherited chat history. Give it only:
 - precise upstream handoff references and outputs;
 - necessary project constraints and paths;
 - its worktree/path, and an absolute report artifact path under the control plane reported by `status`;
-- the worker protocol from `${CLAUDE_SKILL_DIR}/references/node-contract.md`.
+- the worker protocol from `${CLAUDE_SKILL_DIR}/references/node-contract.md`, including its search boundary.
+
+State that boundary explicitly in the prompt rather than assuming it: `read_first` is the whole context, searching is limited to `scope.files` and the paths those files name, and a thin contract is reported as `NEEDS_CONTEXT` naming the missing file instead of being filled in by exploration. `scope.files` stops a worker from writing too widely; only this sentence stops it from reading too widely.
 
 Do not send the whole DAG, full PRD, prior worker reasoning, or full session history. The worker implements and reports; it does not define acceptance, approve the node, edit the DAG, integrate itself into the control branch, or dispatch its own reviewer.
 
@@ -85,9 +87,18 @@ For concurrent implementation nodes, each node gets an isolated worktree and bra
 
 ## Review and repair
 
-After implementation, create a bounded review package: original node contract, actual diff or immutable diff path, commit range, structured handoff, and relevant evidence. Dispatch a fresh read-only reviewer using the reviewer protocol. Do not include the implementer's reasoning transcript.
+Check scope first, before spending a reviewer on the diff:
 
-The reviewer checks both acceptance/scope compliance and code quality. It cannot invent acceptance criteria or choose a new architecture. Save its JSON verdict using the schema in `${CLAUDE_SKILL_DIR}/references/node-contract.md`, then record the round:
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/check-scope" <node-id> --head-ref "<reported-sha>" \
+  --handoff-ref ".dag/artifacts/<node-id>/handoff.json"
+```
+
+If it reports a violation, do not dispatch a reviewer. Return the paths to the worker or fail the attempt. The review gate would reject the same diff later anyway, after a full reviewer run has already been paid for.
+
+Then create a bounded review package: original node contract, actual diff or immutable diff path, commit range, structured handoff, relevant evidence, and any paths `check-scope` reported as also claimed by an unfinished node. Dispatch a fresh read-only reviewer using the reviewer protocol. Do not include the implementer's reasoning transcript.
+
+The reviewer checks both acceptance/scope compliance and code quality. It cannot invent acceptance criteria or choose a new architecture. Every finding it raises carries the path it is about, and that path decides whether it is a `blocking_finding` the worker can fix or a `controller_decision` outside the node's scope. Save its JSON verdict using the schema in `${CLAUDE_SKILL_DIR}/references/node-contract.md`, then record the round:
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> review \
@@ -96,7 +107,9 @@ The reviewer checks both acceptance/scope compliance and code quality. It cannot
   --head-ref "<reviewed-sha>"
 ```
 
-The runtime derives `approved`, `needs_fixes`, or `cannot_verify` from the artifact and binds it to the reviewed head. Deterministic defects go back to the original implementer, followed by a scoped fresh re-review.
+The runtime derives `approved`, `needs_fixes`, `cannot_verify`, or `escalated` from the artifact and binds it to the reviewed head. Deterministic defects go back to the original implementer, followed by a scoped fresh re-review.
+
+`escalated` means the reviewer found a blocking problem this diff caused outside `scope.files`, typically a caller the worker was not allowed to touch. Do not send it back as a fix round: the worker would have to leave its scope, and the scope gate will refuse the result. Give those paths an owner instead — `--add-gap-nodes`, or a replan if the contract itself was wrong — then re-review the same head, which passes once the problem belongs to someone.
 
 Run at most three review/fix rounds. `update-task` rejects a fourth round. After round three with open Critical/Important or spec findings, stop that loop and choose explicitly: add context, use a stronger model, re-slice, re-plan, or mark blocked. Never waive a load-bearing finding merely because the loop reached its cap.
 

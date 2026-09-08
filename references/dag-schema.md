@@ -55,7 +55,6 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
   "title": "Implement the authentication consumer",
   "objective": "One independently reviewable outcome",
   "work_type": "implementation",
-  "estimated_cost": "medium",
   "scope": {
     "files": ["src/auth/**", "tests/auth/**"],
     "forbidden": ["src/billing/**"]
@@ -90,7 +89,7 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 }
 ```
 
-`work_type` is `implementation`, `investigation`, `integration`, or `documentation`. `estimated_cost` is `low`, `medium`, or `high`; it informs judgment but never makes dispatch automatic.
+`work_type` is `implementation`, `investigation`, `integration`, or `documentation`. It informs judgment but never makes dispatch automatic.
 
 `status` is `pending`, `running`, `done`, `failed`, or `blocked`. `ready` is never stored.
 
@@ -106,6 +105,8 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 ## Path and contract rules
 
 - `scope.files`, `scope.forbidden`, and `read_first` contain project-relative paths or glob patterns. Absolute paths and `..` traversal are invalid.
+- `read_first` is the node's complete declared context, not a reading suggestion. `scope.files` bounds what a worker may write; nothing bounds what it may read, so a thin `read_first` is paid for in reconnaissance. The decomposition review treats an insufficient one as a finding.
+- A review outcome is `approved`, `needs_fixes`, `cannot_verify`, or `escalated`. `escalated` means the review raised a blocking problem located outside `scope.files`, which the worker cannot fix without tripping the scope gate; the affected paths are recorded in `escalated_paths` and the node cannot complete until they have an owner and the head is re-reviewed. Every review finding carries the path it is about, and the runtime rejects one filed on the wrong side of the scope boundary.
 - `scope.files`, `acceptance`, `verification`, and `outputs` are non-empty.
 - Node IDs and acceptance/verification IDs are unique within their owner.
 - Every verification entry covers at least one acceptance ID, and every acceptance ID has coverage.

@@ -4,15 +4,16 @@ A node reaches `done` only after worker evidence, fresh review, and controller v
 
 ## 1. Scope gate
 
-Use real Git data against the node's base/head or working-tree boundary:
+Run it against real Git data as soon as the worker reports, before a reviewer is dispatched:
 
 ```bash
-git diff --stat <base>..<head>
-git diff --name-only <base>..<head>
-git status --short
+"${CLAUDE_SKILL_DIR}/scripts/check-scope" <node-id> --head-ref <sha> \
+  --handoff-ref ".dag/artifacts/<node-id>/handoff.json"
 ```
 
-Compare every changed path with `scope.files` and `scope.forbidden`. Generated or untracked files count. A useful out-of-scope edit is still an out-of-scope edit: reject or explicitly re-plan it rather than silently widening the node.
+It compares every changed path with `scope.files` and `scope.forbidden`, refuses an unclean worktree, and writes nothing. Generated or untracked files count. A useful out-of-scope edit is still an out-of-scope edit: reject or explicitly re-plan it rather than silently widening the node.
+
+Read its other two reports as evidence rather than verdicts. Paths also claimed by an unfinished node are legal — that is what `conflicts_with` is for — but they are where a worker doing a neighbour's work shows up. Context read beyond the contract is self-reported and a long list indicts the node contract, not the worker.
 
 ## 2. Evidence gate
 
@@ -30,6 +31,8 @@ Confirm a fresh reviewer evaluated:
 - the current fix round rather than an earlier commit.
 
 Critical, Important, spec, or scope findings remain blocking until a scoped re-review marks them addressed or the controller re-plans. Minor findings may be recorded without extending the fix loop when they do not undermine acceptance.
+
+An `escalated` outcome is not a fix round. It names paths outside the node's scope that this diff broke, so returning them to the worker only produces a diff the scope gate will refuse. Give them an owner — a gap node or a replan — and then re-review the same head.
 
 ## 4. Independent controller gate
 

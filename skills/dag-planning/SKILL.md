@@ -117,7 +117,9 @@ Use `work_type` to expose investigation or integration work to the scheduler. Do
 
 For every node, provide objective, hard scope, `read_first`, inputs, exact upstream outputs, expected outputs, acceptance criteria, executable or inspectable verification, stop conditions through the shared worker protocol, and an initially empty handoff.
 
-`read_first` names the files, not the directories that contain them, and it must be sufficient on its own: it is the whole context the worker gets, and a worker told to read `src/auth/` will read the repository instead. This is the only place the cost of that reading can be controlled, since nothing at execution time can cap it.
+`read_first` names the files, not the directories that contain them, and it must be sufficient on its own: it is the whole context the worker gets, and a worker told to read `src/auth/` will read the repository instead. Nothing at execution time can cap that reading, so a node that does not fit in one context here cannot be executed at all: approval refuses more than 120,000 characters of `read_first`, or a `scope.files` expanding past 200 files or 20,000 lines. `validate-dag` reports both before you reach approval, and a node over either limit is split, not argued down.
+
+`scope.files` says where the node writes. It is not a reading budget and must not be widened to give a worker room to look around; a file the node must read is named in `read_first`.
 
 Acceptance belongs to the plan, not the worker or reviewer. Criteria must describe observable behavior or artifacts, not implementation activity. Every acceptance ID must be covered by at least one verification entry. A name search, file-existence check, import, or syntax check may support structural acceptance, but it cannot by itself verify behavioral acceptance.
 

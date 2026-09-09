@@ -72,7 +72,7 @@ The validator already proves the graph is well formed: no cycles, symmetric conf
 - **granularity**: a node whose first act must be broad architecture discovery, or one so small it carries no independent review value;
 - **acceptance**: criteria restating implementation activity, or behavioral criteria whose only verification is structural;
 - **coverage**: a source requirement, global acceptance criterion, or integration step that no node delivers;
-- **context**: `read_first` omits a file the node's acceptance plainly requires, or names a directory where it should name files, so a fresh worker has to survey the repository to find its own inputs. Nothing at execution time can cap how much a worker reads, which makes this the only point where that cost is controllable;
+- **context**: `read_first` omits a file the node's acceptance plainly requires, or names a directory where it should name files, so a fresh worker has to survey the repository to find its own inputs. The runtime already refuses a node whose declared context cannot fit in one worker, so this finding is for the case the size check cannot see: a contract that is small because it is incomplete;
 - **scope realism**: `scope.files` that do not match where the behavior actually lives;
 - **assumption laundering**: a decision parked in `assumptions` that should have been asked during clarification.
 

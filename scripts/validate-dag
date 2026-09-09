@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -21,6 +22,9 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 HARD_MAX_PARALLEL = 3
+READ_FIRST_CHAR_LIMIT = 120000
+SCOPE_FILE_LIMIT = 200
+SCOPE_LINE_LIMIT = 20000
 PLANNING_STATUSES = {
     "draft",
     "awaiting_approval",
@@ -61,6 +65,13 @@ class DagError(Exception):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def elapsed_since(timestamp: str) -> str:
+    """Age of a timestamp, for judging whether an open attempt is still alive."""
+    started = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    minutes = max(0, int((datetime.now(timezone.utc) - started).total_seconds() // 60))
+    return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
 
 
 def is_text(value: Any) -> bool:
@@ -339,6 +350,57 @@ def in_scope(path: str, scope: dict[str, Any]) -> bool:
     if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope["forbidden"]):
         return False
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in scope["files"])
+
+
+def context_size(root: Path, nodes: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Measure how much reading each node's contract commits its worker to.
+
+    `read_first` is the mandated read and the number that decides whether a node fits in one
+    context at all; `scope.files` is the widest place the worker can then be pointed at. Both
+    are authored at planning time and neither can be capped once a worker is running, so this
+    is where "too big to execute" stops being a judgement and becomes a number.
+    """
+    listing = run_git(root, "ls-files", "-z")
+    if listing.returncode != 0:
+        raise DagError(f"cannot list tracked files in {root}: {listing.stderr.strip()}")
+    tracked = [path for path in listing.stdout.split("\0") if path]
+    lines: dict[str, int] = {}
+    sizes: dict[str, dict[str, int]] = {}
+    for node in nodes:
+        matched = [path for path in tracked if in_scope(path, node["scope"])]
+        for path in matched:
+            if path in lines:
+                continue
+            try:
+                with (root / path).open("rb") as handle:
+                    lines[path] = sum(chunk.count(b"\n") for chunk in iter(lambda: handle.read(1 << 20), b""))
+            except OSError:
+                lines[path] = 0
+        declared = 0
+        for path in node["read_first"]:
+            try:
+                declared += len((root / path).read_text(encoding="utf-8", errors="ignore"))
+            except OSError:
+                continue
+        sizes[node["id"]] = {
+            "read_first_chars": declared,
+            "scope_files": len(matched),
+            "scope_lines": sum(lines[path] for path in matched),
+        }
+    return sizes
+
+
+def oversized_contexts(root: Path, nodes: list[dict[str, Any]]) -> list[str]:
+    """Report the nodes no worker could execute without running out of context."""
+    reports = []
+    for node_id, size in context_size(root, nodes).items():
+        if size["read_first_chars"] > READ_FIRST_CHAR_LIMIT:
+            reports.append(f"{node_id} declares {size['read_first_chars']} characters of read_first")
+        if size["scope_files"] > SCOPE_FILE_LIMIT or size["scope_lines"] > SCOPE_LINE_LIMIT:
+            reports.append(
+                f"{node_id} covers {size['scope_files']} file(s) and {size['scope_lines']} line(s) of scope"
+            )
+    return reports
 
 
 def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
@@ -1152,6 +1214,14 @@ def cmd_validate(argv: list[str]) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_USAGE
     errors, warnings = validate_dag(dag)
+    if not errors:
+        try:
+            warnings += [
+                f"{report}, which is more than one worker's context holds; approval refuses it"
+                for report in oversized_contexts(project_root(args.dag), [n for n in dag["nodes"] if n["status"] != "done"])
+            ]
+        except DagError as exc:
+            warnings.append(f"node context size not measured: {exc}")
     if args.json:
         print(json.dumps({"valid": not errors, "errors": errors, "warnings": warnings}, ensure_ascii=False, indent=2))
     else:
@@ -1178,6 +1248,10 @@ def cmd_ready(argv: list[str]) -> int:
     candidates = all_candidates
     if args.limit is not None:
         candidates = candidates[: args.limit]
+    try:
+        sizes = context_size(project_root(args.dag), candidates)
+    except DagError:
+        sizes = {}
     output = {
         "dag_id": dag["dag_id"],
         "planning_status": dag["planning_status"],
@@ -1190,6 +1264,7 @@ def cmd_ready(argv: list[str]) -> int:
                 "work_type": node["work_type"],
                 "depends_on": node["depends_on"],
                 "conflicts_with": node["conflicts_with"],
+                "context_size": sizes.get(node["id"]),
             }
             for node in candidates
         ],
@@ -1206,7 +1281,14 @@ def cmd_ready(argv: list[str]) -> int:
         else:
             print(f"Eligible candidates ({len(candidates)}; controller still selects):")
             for node in candidates:
-                print(f"- {node['id']}: {node['title']} [{node['work_type']}]")
+                size = sizes.get(node["id"])
+                surface = (
+                    f" | read_first={size['read_first_chars']}c"
+                    f" scope={size['scope_files']}f/{size['scope_lines']}L"
+                    if size
+                    else ""
+                )
+                print(f"- {node['id']}: {node['title']} [{node['work_type']}]{surface}")
     return 0
 
 
@@ -1415,6 +1497,14 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
         dirty = dirty_paths(worktree)
         if dirty:
             raise DagError("worktree is not clean outside .dag/: " + ", ".join(dirty))
+        # By now every dependency is done, so a read_first path that still does not exist is a
+        # contract defect, and the worker would go looking for its own inputs to make up for it.
+        absent = [path for path in node["read_first"] if not (worktree / path).exists()]
+        if absent:
+            raise DagError(
+                f"{args.node_id!r} declares read_first files that do not exist: {', '.join(absent)}. "
+                "Correct the contract with --revise; a worker sent after a missing input searches the repository"
+            )
         actual_branch = current_branch(worktree)
         if args.branch is not None and args.branch != actual_branch:
             raise DagError(f"--branch {args.branch!r} does not match current branch {actual_branch!r}")
@@ -1549,6 +1639,15 @@ def transition_planning(dag_path: Path, dag: dict[str, Any], target: str, refere
             raise DagError("the plan changed after its decomposition review; re-review the current DAG")
         if review["verdict"] != "approved":
             raise DagError("the decomposition review reported blocking findings; resolve them and re-review")
+        unfinished = [node for node in dag["nodes"] if node["status"] != "done"]
+        oversized = oversized_contexts(project_root(dag_path), unfinished)
+        if oversized:
+            raise DagError(
+                "; ".join(oversized)
+                + f". A node must fit in one worker's context: at most {READ_FIRST_CHAR_LIMIT} characters "
+                f"of read_first, and a scope no wider than {SCOPE_FILE_LIMIT} files or {SCOPE_LINE_LIMIT} "
+                "lines. Split the node, or name narrower files"
+            )
     if target == "approved" and is_safe_path(reference):
         artifact_path(dag_path, reference, "approval reference")
     if target == "complete":
@@ -1654,7 +1753,52 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     return f"created {candidate['dag_id']} with {len(candidate['nodes'])} nodes from {draft_ref}"
 
 
-def load_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> tuple[dict[str, Any], Path]:
+PATCH_FIELDS = {"dag_id", "update_nodes", "drop_nodes"}
+
+
+def apply_revision_patch(dag: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Build a full candidate plan from a document that names only the nodes that move.
+
+    Copying the whole control file to change one node costs the controller the entire plan
+    twice, once read and once written, and that cost grows with the plan rather than with the
+    change. Carrying the untouched nodes over here keeps it proportional; the result is still
+    validated as a whole plan, so nothing is traded away for the saving.
+
+    Fields absent from an entry keep their current value, which is also why a revision cannot
+    quietly rewrite an execution record: it never writes the fields it does not name.
+    """
+    unknown = sorted(set(patch) - PATCH_FIELDS)
+    if unknown:
+        raise DagError(f"unknown field(s) in revision patch: {', '.join(unknown)}")
+    updates = patch.get("update_nodes") or []
+    drops = patch.get("drop_nodes") or []
+    if not isinstance(updates, list) or any(not isinstance(entry, dict) for entry in updates):
+        raise DagError("update_nodes must be an array of node objects")
+    if not isinstance(drops, list) or any(not is_text(entry) for entry in drops):
+        raise DagError("drop_nodes must be an array of node IDs")
+    candidate = copy.deepcopy(dag)
+    known = {node["id"] for node in candidate["nodes"]}
+    missing = [node_id for node_id in drops if node_id not in known]
+    if missing:
+        raise DagError(f"drop_nodes names unknown node(s): {', '.join(missing)}")
+    candidate["nodes"] = [node for node in candidate["nodes"] if node["id"] not in set(drops)]
+    remaining = {node["id"]: node for node in candidate["nodes"]}
+    for entry in updates:
+        node_id = entry.get("id")
+        if not is_text(node_id):
+            raise DagError("every update_nodes entry needs an 'id'")
+        if node_id in set(drops):
+            raise DagError(f"{node_id!r} is both updated and dropped")
+        if node_id in remaining:
+            remaining[node_id].update(entry)
+        else:
+            candidate["nodes"].append(entry)
+    return candidate
+
+
+def load_draft(
+    dag_path: Path, dag: dict[str, Any], draft_ref: str, *, allow_patch: bool = False
+) -> tuple[dict[str, Any], Path]:
     """Load and validate a proposed plan, refusing one that belongs to a different effort."""
     draft = Path(draft_ref)
     if not draft.is_absolute():
@@ -1662,6 +1806,12 @@ def load_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> tuple[dic
     if not draft.is_file():
         raise DagError(f"draft not found: {draft_ref}")
     candidate = load_dag(draft.resolve(), sealed=False)
+    if "nodes" not in candidate:
+        if not allow_patch:
+            raise DagError(f"{draft_ref} carries no 'nodes'; this command takes a whole plan, not a patch")
+        if candidate.get("dag_id") != dag["dag_id"]:
+            raise DagError(f"patch dag_id must be {dag['dag_id']!r}; a different effort is a new control plane")
+        candidate = apply_revision_patch(dag, candidate)
     errors, _ = validate_dag(candidate)
     if errors:
         raise DagError("draft is not a valid DAG: " + "; ".join(errors))
@@ -1704,7 +1854,7 @@ def revise_dag(
     if not is_text(reason):
         raise DagError("--revise requires --reason recording why the plan no longer fits")
 
-    candidate, _ = load_draft(dag_path, dag, draft_ref)
+    candidate, _ = load_draft(dag_path, dag, draft_ref, allow_patch=True)
     changed_deliverable = [field for field in DELIVERABLE_FIELDS if candidate.get(field) != dag.get(field)]
     if changed_deliverable:
         raise DagError(
@@ -1812,7 +1962,11 @@ def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
         )
     running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
     if running:
-        raise DagError(f"settle running nodes before amending the plan: {', '.join(running)}")
+        raise DagError(
+            f"settle running nodes before amending the plan: {', '.join(running)}. A worker that never "
+            "reported back, including one that died mid-run, is settled with "
+            "'update-task <node> failed --reason \"<why>\"'"
+        )
 
     candidate, _ = load_draft(dag_path, dag, draft_ref)
     if candidate["planning_status"] in {"approved", "complete"}:
@@ -1870,7 +2024,11 @@ def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, referenc
     """Move the control file into .dag/archive/, closing this effort's lifecycle."""
     running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
     if running:
-        raise DagError(f"finish or fail the running nodes first: {', '.join(running)}")
+        raise DagError(
+            f"finish or fail the running nodes first: {', '.join(running)}. A worker that never reported "
+            "back, including one that died mid-run, is settled with "
+            "'update-task <node> failed --reason \"<why>\"'"
+        )
     complete = dag["planning_status"] == "complete"
     if complete and reason is not None:
         raise DagError("--reason applies to --abandon, not to archiving a completed DAG")
@@ -2020,13 +2178,55 @@ def cmd_update(argv: list[str]) -> int:
     return 0
 
 
+def node_brief(dag: dict[str, Any], dag_path: Path, node_id: str) -> dict[str, Any]:
+    """Emit one node's contract with everything a fresh worker needs and nothing else.
+
+    A worker handed the control file reads the whole plan to find its own three paragraphs,
+    which is both the largest avoidable read in the system and a route to context that was
+    deliberately withheld. This is the form the dispatch package is built from.
+    """
+    nodes = node_map(dag)
+    node = nodes.get(node_id)
+    if node is None:
+        raise DagError(f"unknown node {node_id!r}")
+    root = project_root(dag_path)
+    return {
+        "dag_id": dag["dag_id"],
+        "status": node["status"],
+        "attempt": len(node["attempts"]),
+        "contract": {field: node[field] for field in PLAN_NODE_FIELDS},
+        "upstream": [
+            {
+                "id": parent,
+                "outputs": nodes[parent]["outputs"],
+                "handoff_ref": nodes[parent]["handoff"]["ref"],
+                "commit": nodes[parent]["handoff"]["commit"],
+                "summary": nodes[parent]["handoff"]["summary"],
+            }
+            for parent in node["depends_on"]
+        ],
+        "artifact_dir": str(root / ".dag" / "artifacts" / node_id),
+    }
+
+
 def cmd_status(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="status", description="Summarize DAG progress and recovery state.")
     parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument(
+        "--node",
+        help="emit one node's dispatch brief as JSON instead of the summary, so no worker reads the control file",
+    )
     args = parser.parse_args(argv)
     args.dag = resolve_dag_path(args.dag)
     dag = validate_or_exit(args.dag, args.json)
+    if args.node:
+        try:
+            print(json.dumps(node_brief(dag, args.dag, args.node), ensure_ascii=False, indent=2))
+        except DagError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        return 0
     nodes = node_map(dag)
     counts = {status: 0 for status in ("done", "running", "failed", "blocked", "pending")}
     for node in nodes.values():
@@ -2058,10 +2258,18 @@ def cmd_status(argv: list[str]) -> int:
         if node["status"] != "running":
             continue
         attempt = node["attempts"][-1]
+        try:
+            worktree = resolve_worktree(args.dag, attempt["worktree"])
+            counted = run_git(worktree, "rev-list", "--count", f"{attempt['base_ref']}..HEAD")
+            landed = int(counted.stdout.strip()) if counted.returncode == 0 else None
+        except (DagError, ValueError):
+            landed = None
         active_attempts.append(
             {
                 "node": node_id,
                 "attempt": attempt["number"],
+                "running_for": elapsed_since(attempt["started_at"]),
+                "commits_landed": landed,
                 "worktree": attempt["worktree"],
                 "branch": attempt["branch"],
                 "base_ref": attempt["base_ref"],
@@ -2123,6 +2331,11 @@ def cmd_status(argv: list[str]) -> int:
                 f"  - {attempt['node']} attempt {attempt['attempt']}: "
                 f"{attempt['worktree']} [{attempt['branch']}] base={attempt['base_ref'][:12]} "
                 f"reviews={attempt['review_rounds']} last={attempt['last_review'] or 'none'}"
+            )
+            landed = attempt["commits_landed"]
+            print(
+                f"    running {attempt['running_for']}, "
+                + ("worktree unreadable" if landed is None else f"{landed} commit(s) landed")
             )
             if attempt["escalated_paths"]:
                 print(

@@ -1211,6 +1211,7 @@ class RuntimeTests(unittest.TestCase):
         value = dag([node("A")])
         value["nodes"][0]["read_first"] = ["docs/contract.md"]
         self.write(value)
+        self.track("docs/contract.md", "contract\n")
         self.start("A")
         head = self.commit_node("A")
         handoff, _, _ = self.artifacts(
@@ -1298,6 +1299,142 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(all(result.returncode == 0 for result in results), [result.stderr for result in results])
         saved = json.loads(self.path.read_text())
         self.assertEqual({item["status"] for item in saved["nodes"]}, {"running"})
+
+    def track(self, relative, contents):
+        """Commit a file so it counts toward a node's declared reading surface."""
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", relative], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", f"track {relative}"], check=True)
+
+    def approval_attempt(self, expect):
+        approval = self.root / ".dag" / "sources" / "approval.md"
+        approval.parent.mkdir(parents=True, exist_ok=True)
+        approval.write_text("approved\n", encoding="utf-8")
+        self.session = "session-plan"
+        self.design_review()
+        return self.run_cmd(
+            "update-task", "--planning-status", "approved",
+            "--reference", ".dag/sources/approval.md", expect=expect,
+        )
+
+    def test_approval_refuses_a_node_bigger_than_one_context(self):
+        self.track("docs/history.md", "x" * 120001)
+        plan = [node("A")]
+        plan[0]["read_first"] = ["docs/history.md"]
+        self.awaiting(plan)
+        result = self.approval_attempt(3)
+        self.assertIn("A declares 120001 characters of read_first", result.stderr)
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
+
+    def test_approval_refuses_a_scope_no_worker_could_hold(self):
+        self.track("src/generated.py", "PAD = 1\n" * 20001)
+        self.awaiting([node("A", files=["src/**"])])
+        result = self.approval_attempt(3)
+        self.assertIn("A covers 1 file(s) and 20001 line(s) of scope", result.stderr)
+        self.assertIn("Split the node", result.stderr)
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
+
+    def test_validate_warns_before_approval_refuses(self):
+        self.track("src/generated.py", "PAD = 1\n" * 20001)
+        self.write(dag([node("A", files=["src/**"])]))
+        report = json.loads(self.run_cmd("validate-dag", "--json").stdout)
+        self.assertTrue(report["valid"])
+        self.assertTrue(any("20001 line(s)" in warning for warning in report["warnings"]), report["warnings"])
+
+    def test_ready_tasks_reports_each_candidate_reading_surface(self):
+        self.track("src/A.py", "VALUE = 1\n" * 10)
+        self.track("docs/brief.md", "b" * 40)
+        plan = [node("A")]
+        plan[0]["read_first"] = ["docs/brief.md"]
+        self.write(dag(plan))
+        ready = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
+        self.assertEqual(
+            ready["candidates"][0]["context_size"],
+            {"read_first_chars": 40, "scope_files": 1, "scope_lines": 10},
+        )
+
+    def test_a_node_cannot_start_against_a_missing_declared_input(self):
+        plan = [node("A")]
+        plan[0]["read_first"] = ["docs/brief.md"]
+        self.write(dag(plan))
+        result = self.run_cmd("update-task", "A", "running", "--worktree", str(self.root), expect=3)
+        self.assertIn("read_first files that do not exist: docs/brief.md", result.stderr)
+        self.track("docs/brief.md", "brief\n")
+        self.start("A")
+        self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["status"], "running")
+
+    def test_node_brief_carries_the_contract_without_the_plan(self):
+        self.write(dag([node("A"), node("B"), node("C", depends=("A",))]))
+        self.complete("A")
+        brief = json.loads(self.run_cmd("status", "--node", "C").stdout)
+        self.assertEqual(brief["contract"]["id"], "C")
+        self.assertNotIn("attempts", brief["contract"])
+        self.assertEqual([parent["id"] for parent in brief["upstream"]], ["A"])
+        self.assertEqual(brief["upstream"][0]["outputs"], ["output A"])
+        self.assertNotIn("Node B", self.run_cmd("status", "--node", "C").stdout)
+
+    def test_status_reports_whether_a_running_attempt_produced_anything(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        idle = json.loads(self.run_cmd("status", "--json").stdout)["active_attempts"][0]
+        self.assertEqual(idle["commits_landed"], 0)
+        self.assertRegex(idle["running_for"], r"^\d+m$")
+        self.commit_node("A")
+        working = json.loads(self.run_cmd("status", "--json").stdout)["active_attempts"][0]
+        self.assertEqual(working["commits_landed"], 1)
+        self.assertIn("1 commit(s) landed", self.run_cmd("status").stdout)
+
+    def test_refusals_name_the_command_that_settles_a_dead_attempt(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        archive = self.run_cmd("update-task", "--archive", expect=3)
+        self.assertIn('update-task <node> failed --reason', archive.stderr)
+        self.run_cmd("update-task", "--planning-status", "replan_required",
+                     "--reference", ".dag/sources/fixture.md")
+        amend = self.run_cmd("update-task", "--amend", ".dag/draft.json", expect=3)
+        self.assertIn('update-task <node> failed --reason', amend.stderr)
+
+    def test_revision_patch_changes_only_the_nodes_it_names(self):
+        self.live_plan([node("A"), node("B")])
+        self.revise({"dag_id": "fixture", "update_nodes": [{"id": "B", "read_first": ["docs/spec.md"]}]},
+                    name="patch.json")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][1]["read_first"], ["docs/spec.md"])
+        self.assertEqual(saved["nodes"][1]["title"], "Node B")
+        self.assertEqual(saved["nodes"][0], node("A"))
+        self.assertEqual(saved["replans"][-1]["retouched"], ["B"])
+
+    def test_revision_patch_adds_and_drops(self):
+        self.live_plan([node("A"), node("B")])
+        self.revise(
+            {"dag_id": "fixture", "drop_nodes": ["B"], "update_nodes": [node("C")]},
+            name="patch.json", review=self.scoped_review(),
+        )
+        saved = json.loads(self.path.read_text())
+        self.assertEqual([item["id"] for item in saved["nodes"]], ["A", "C"])
+
+    def test_revision_patch_cannot_touch_an_execution_record(self):
+        self.write(dag([node("A"), node("B")]))
+        self.complete("A")
+        result = self.revise({"dag_id": "fixture", "update_nodes": [{"id": "A", "status": "pending"}]},
+                             name="patch.json", expect=3)
+        self.assertIn("cannot rewrite status", result.stderr)
+
+    def test_revision_patch_is_bound_to_this_effort(self):
+        self.live_plan([node("A")])
+        result = self.revise({"dag_id": "other", "update_nodes": [{"id": "A", "title": "x"}]},
+                             name="patch.json", expect=3)
+        self.assertIn("patch dag_id must be 'fixture'", result.stderr)
+        result = self.revise({"dag_id": "fixture", "nodes_to_update": []}, name="patch2.json", expect=3)
+        self.assertIn("unknown field(s) in revision patch: nodes_to_update", result.stderr)
+
+    def test_amend_takes_a_whole_plan_not_a_patch(self):
+        self.broken_plan([node("A"), node("B")])
+        ref = self.draft({"dag_id": "fixture", "update_nodes": [{"id": "B", "title": "x"}]}, name="patch.json")
+        result = self.run_cmd("update-task", "--amend", ref, expect=3)
+        self.assertIn("takes a whole plan, not a patch", result.stderr)
 
 
 if __name__ == "__main__":

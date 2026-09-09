@@ -6,18 +6,10 @@ The reviewer half of the protocol lives in `references/review-protocol.md`, whic
 
 ## Worker package
 
-Provide:
+`status --node <id>` emits exactly the package's contract half — the node's own fields plus each upstream node's outputs, handoff ref, and commit — so the controller never has to read the control file to build one, and the worker never has a reason to open it. Add the parts the control file does not hold:
 
 ```text
-node id and title
-objective
-scope.files and scope.forbidden
-read_first (the complete declared context, not a starting point)
-inputs
-precise upstream outputs and handoff refs
-expected outputs
-acceptance
-verification
+(from status --node <id>) contract, upstream outputs and handoff refs, artifact directory
 worktree/path
 report artifact path (absolute; a relative one lands in the worker's own worktree)
 project constraints that bind this node
@@ -25,9 +17,9 @@ project constraints that bind this node
 
 Do not provide full chat history, the whole DAG, every upstream report, or the implementer's future reviewer prompt.
 
-State the search boundary in the same package, because `scope.files` bounds what the worker may write and nothing bounds what it may read:
+State the reading boundary in the same package. `scope.files` is a write boundary; treating it as a search boundary points the worker at every file it is allowed to touch, which on a wide scope is the repository:
 
-> Read every file in `read_first` first; it is the whole context this node was planned with. Beyond it, search only inside `scope.files` and the paths those files name directly, such as an import or a caller you must change. Do not survey the repository, read unrelated modules, read Git history, or read documentation the contract does not name. If you cannot proceed on this context, report `NEEDS_CONTEXT` naming the file you need — do not go find it yourself.
+> Read every file in `read_first` first; it is the whole context this node was planned with. Beyond it, read only what those files name directly — an import you must follow, a caller you must change. Do not open `.dag/dag.json`: your contract is in this prompt, and the rest of the plan is deliberately not yours. Do not survey the repository, read unrelated modules, read Git history, or read documentation the contract does not name. If you cannot proceed on this context, report `NEEDS_CONTEXT` naming the file you need — do not go find it yourself.
 
 ## Worker protocol
 

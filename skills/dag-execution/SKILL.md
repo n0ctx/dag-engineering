@@ -37,6 +37,14 @@ If a node is still `running`, reconcile it before new dispatch:
 - if the attempt cannot be proven complete, mark it `failed` with a stale-attempt reason, then decide whether to add context, change model, re-slice, or retry;
 - never replay work merely because the old session disappeared.
 
+A worker that returns no handoff artifact has not reported, whether it stopped, errored, or ran out of context. Settle its attempt before doing anything else:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/update-task" <node-id> failed --reason "<what was and was not established>"
+```
+
+Never leave a node `running` behind a worker that is gone. `running` holds a parallel slot, blocks conflicting nodes, and refuses both amendment and archival, so one unsettled attempt stalls the whole graph. `status` reports how long each open attempt has run and how many commits it has landed; nothing landed after a long run is a dead attempt.
+
 Do not start nodes while `planning_status` is not `approved`. If any command reports that the control file was modified outside the runtime, stop and tell the user: something wrote state that no gate approved, and the correct response is to inspect it, not to re-seal past it.
 
 ## Select; do not mechanically drain
@@ -65,15 +73,19 @@ Mark a node running before dispatch:
   --branch "<expected branch>" --base-ref "<expected HEAD>"
 ```
 
-Use a fresh worker with no inherited chat history. Give it only:
+Build the package from the node's own brief, never from the control file:
 
-- the exact node contract;
-- precise upstream handoff references and outputs;
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/status" --node <node-id>
+```
+
+That is the contract, each upstream node's outputs and handoff refs, and the artifact directory — the whole plan costs an order of magnitude more to read and contains context this node was deliberately not given. Use a fresh worker with no inherited chat history and add only:
+
 - necessary project constraints and paths;
-- its worktree/path, and an absolute report artifact path under the control plane reported by `status`;
-- the worker protocol from `${CLAUDE_SKILL_DIR}/references/node-contract.md`, including its search boundary.
+- its worktree/path, and an absolute report artifact path;
+- the worker protocol from `${CLAUDE_SKILL_DIR}/references/node-contract.md`, including its reading boundary.
 
-State that boundary explicitly in the prompt rather than assuming it: `read_first` is the whole context, searching is limited to `scope.files` and the paths those files name, and a thin contract is reported as `NEEDS_CONTEXT` naming the missing file instead of being filled in by exploration. `scope.files` stops a worker from writing too widely; only this sentence stops it from reading too widely.
+State that boundary explicitly in the prompt rather than assuming it: `read_first` is the whole context, reading beyond it is limited to the paths those files name directly, `.dag/dag.json` is not to be opened, and a thin contract is reported as `NEEDS_CONTEXT` naming the missing file instead of being filled in by exploration. `scope.files` stops a worker from writing too widely; it is not a search boundary, and pointing a worker at a wide one is what exhausts its context.
 
 Do not send the whole DAG, full PRD, prior worker reasoning, or full session history. The worker implements and reports; it does not define acceptance, approve the node, edit the DAG, integrate itself into the control branch, or dispatch its own reviewer.
 
@@ -144,7 +156,13 @@ You own how the work is organised. You do not own what it delivers. That line, n
 
 Re-slice nodes, move responsibility between unstarted ones, add a node, drop one whose work another already covers, fix a stale path, re-brief a failed node before retrying it. The plan stays `approved` and execution never pauses.
 
-Write the draft by copying the control file and editing it. Nodes that ran keep their `status`, `attempts`, and `handoff` verbatim, and the contract of a `done` or `running` node is frozen — one was accepted against exactly that contract and the other is being executed against it right now. A `failed` or `blocked` node's contract is yours to correct.
+Write the draft as a patch that names only what moves, so its cost tracks the change rather than the plan:
+
+```json
+{"dag_id": "<same>", "update_nodes": [{"id": "<node>", "read_first": ["docs/spec.md"]}], "drop_nodes": []}
+```
+
+Fields left out keep their current value, an unknown `id` in `update_nodes` adds a node, and the merged result is validated as a whole plan. A full copy of the control file is still accepted where the change really is plan-wide. Nodes that ran keep their `status`, `attempts`, and `handoff` verbatim, and the contract of a `done` or `running` node is frozen — one was accepted against exactly that contract and the other is being executed against it right now. A `failed` or `blocked` node's contract is yours to correct.
 
 Dropping a node, or changing what one `outputs` or `depends_on`, moves an interface that downstream nodes were written against. `inputs` and `outputs` are prose, so no validator can tell whether a consumer still gets what it needs. For those changes the runtime names the affected downstream nodes and requires a scoped review of the change, using `${CLAUDE_SKILL_DIR}/references/decomposition.md`:
 

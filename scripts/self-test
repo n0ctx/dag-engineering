@@ -22,6 +22,7 @@ def node(node_id, *, depends=(), conflicts=(), files=None):
         "id": node_id,
         "title": f"Node {node_id}",
         "objective": f"Deliver {node_id}",
+        "execution_plan": [f"Implement and verify {node_id}"],
         "work_type": "implementation",
         "scope": {"files": list(files) if files else [f"src/{node_id}.py"], "forbidden": []},
         "read_first": [],
@@ -48,7 +49,7 @@ def node(node_id, *, depends=(), conflicts=(), files=None):
 def dag(nodes):
     timestamp = now()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "dag_id": "fixture",
         "objective": "Exercise runtime",
         "source_refs": [".dag/sources/fixture.md"],
@@ -205,6 +206,72 @@ class RuntimeTests(unittest.TestCase):
         ready = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
         self.assertEqual([item["id"] for item in ready["candidates"]], ["A", "B", "D"])
 
+    def test_execution_plan_is_required_nonempty_and_bounded(self):
+        for value, message in ((None, "execution_plan"), ([], "execution_plan"), (["step"] * 7, "at most 6")):
+            candidate = dag([node("A")])
+            if value is None:
+                del candidate["nodes"][0]["execution_plan"]
+            else:
+                candidate["nodes"][0]["execution_plan"] = value
+            self.write(candidate)
+            result = self.run_cmd("validate-dag", expect=1)
+            self.assertIn(message, result.stderr)
+
+    def test_plan_surfaces_include_execution_plan_and_fingerprint(self):
+        self.write(dag([node("A")]))
+        brief = json.loads(self.run_cmd("status", "--node", "A").stdout)
+        view = json.loads(self.run_cmd("status", "--plan-view").stdout)
+        request = json.loads(self.run_cmd("status", "--review-request").stdout)
+        self.assertIn("execution_plan", brief["contract"])
+        self.assertIn("execution_plan", view["nodes"][0])
+        self.assertIn("execution_plan", request["nodes"][0])
+        for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
+            self.assertIn(field, request)
+        before = view["plan_fingerprint"]
+        changed = json.loads(self.path.read_text())
+        changed["nodes"][0]["execution_plan"] = ["A different step"]
+        self.write(changed)
+        self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
+
+    def test_compact_review_rejects_missing_lane_fingerprint_and_bad_finding(self):
+        self.write(dag([node("A")]))
+        review_path = self.root / ".dag" / "artifacts" / "design-review" / "review.json"
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
+        lanes = {lane: {"checks_performed": [f"{lane} checks"], "findings": []} for lane in ("requirements", "graph", "execution")}
+        review_path.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes}), encoding="utf-8")
+        review = json.loads(review_path.read_text())
+        review["lanes"].pop("graph")
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
+        self.assertIn("required lane", result.stderr)
+
+        review = json.loads(review_path.read_text())
+        review["lanes"] = lanes
+        review["plan_fingerprint"] = "0" * 64
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
+        self.assertIn("fingerprint", result.stderr)
+
+        review = json.loads(review_path.read_text())
+        review["plan_fingerprint"] = fingerprint
+        review["lanes"]["requirements"]["findings"] = ["bad"]
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
+        self.assertIn("object", result.stderr)
+
+    def test_review_finding_lane_is_owned_by_enclosing_lane(self):
+        self.write(dag([node("A")]))
+        folder = self.root / ".dag" / "artifacts" / "lane-review"
+        folder.mkdir(parents=True, exist_ok=True)
+        fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
+        lanes = {lane: {"checks_performed": ["checked"], "findings": []} for lane in ("requirements", "graph", "execution")}
+        lanes["requirements"]["findings"] = [{"id": "f1", "lane": "graph", "severity": "minor", "kind": "scope", "nodes": ["A"], "detail": "ambiguous owner"}]
+        review = folder / "review.json"
+        review.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes}), encoding="utf-8")
+        result = self.run_cmd("update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3)
+        self.assertIn("controlled by its enclosing lane", result.stderr)
+
     def test_cycle_and_missing_dependency_fail(self):
         cycle = dag([node("A", depends=("B",)), node("B", depends=("A",))])
         self.write(cycle)
@@ -323,35 +390,22 @@ class RuntimeTests(unittest.TestCase):
             finding = {"id": raw.get("id", f"finding-{index}"), **raw}
             lane = finding.pop("lane", kind_lanes.get(finding.get("kind"), lanes[0]))
             grouped[lane].append(finding)
-        entries = []
+        request = review_dir / "review-request.json"
+        request.write_text(json.dumps({"dag_id": dag_id, "mode": mode, "plan_fingerprint": fingerprint, "required_lanes": lanes}), encoding="utf-8")
+        lane_results = {}
         for lane in lanes:
-            report = {
-                "dag_id": dag_id,
-                "plan_fingerprint": fingerprint,
-                "mode": mode,
-                "lane": lane,
-                "findings": grouped[lane],
-                "checks_performed": [f"{lane} checks"],
-            }
+            section = {"checks_performed": [f"{lane} checks"], "findings": grouped[lane]}
             if mode == "repair":
-                report["resolutions"] = [
-                    {"id": finding["id"], "status": "ADDRESSED", "detail": "fixed by the amendment"}
+                section["resolutions"] = [
+                    {"id": finding["id"], "status": "ADDRESSED", "detail": "fixed by amendment"}
                     for finding in pending.get("open_findings", []) if finding["lane"] == lane
                 ]
-            artifact = review_dir / f"{mode}-{lane}.json"
-            artifact.write_text(json.dumps(report), encoding="utf-8")
-            entries.append({"lane": lane, "ref": str(artifact.relative_to(self.root))})
-        manifest = review_dir / f"{mode}-manifest.json"
-        manifest.write_text(json.dumps({
-            "dag_id": dag_id,
-            "plan_fingerprint": fingerprint,
-            "mode": mode,
-            "reviews": entries,
-        }), encoding="utf-8")
-        ref = str(manifest.relative_to(self.root))
+            lane_results[lane] = section
+        review = review_dir / "review.json"
+        review.write_text(json.dumps({"dag_id": dag_id, "plan_fingerprint": fingerprint, "mode": mode, "lanes": lane_results}), encoding="utf-8")
+        ref = str(review.relative_to(self.root))
         self.run_cmd("update-task", "--decomposition-review", ref)
         return ref
-
     def approve_as(self, session):
         approval = self.root / ".dag" / "sources" / "approval.md"
         approval.parent.mkdir(parents=True, exist_ok=True)
@@ -558,7 +612,7 @@ class RuntimeTests(unittest.TestCase):
                               "--reference", ".dag/sources/approval.md", expect=3)
         self.assertIn("no decomposition review", result.stderr)
 
-    def test_blocking_design_findings_prevent_approval(self):
+    def test_user_decision_can_override_blocking_design_findings(self):
         self.awaiting([node("A"), node("B")])
         self.design_review([
             {"severity": "important", "kind": "missing_dependency", "nodes": ["B"],
@@ -569,9 +623,13 @@ class RuntimeTests(unittest.TestCase):
         approval = self.root / ".dag" / "sources" / "approval.md"
         approval.parent.mkdir(parents=True, exist_ok=True)
         approval.write_text("approved\n", encoding="utf-8")
-        result = self.run_cmd("update-task", "--planning-status", "approved",
-                              "--reference", ".dag/sources/approval.md", expect=3)
-        self.assertIn("blocking findings", result.stderr)
+        self.run_cmd("update-task", "--planning-status", "approved",
+                      "--reference", ".dag/sources/approval.md")
+        approved = json.loads(self.path.read_text())
+        self.assertEqual(approved["approval_ref"], ".dag/sources/approval.md")
+        self.assertEqual(approved["decomposition_review"]["decision_ref"], ".dag/sources/approval.md")
+        self.assertEqual(approved["decomposition_review"]["verdict"], "needs_changes")
+        self.assertEqual(len(approved["decomposition_review"]["findings"]), 1)
 
     def test_minor_findings_do_not_block_approval(self):
         self.awaiting([node("A")])
@@ -601,54 +659,6 @@ class RuntimeTests(unittest.TestCase):
         self.run_cmd("update-task", "A", "failed", "--reason", "stuck")
         self.run_cmd("validate-dag")
         self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["fingerprint"], before)
-
-    def test_design_review_artifact_must_reference_real_nodes(self):
-        self.awaiting([node("A")])
-        fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
-        folder = self.root / ".dag" / "artifacts" / "bad-review"
-        folder.mkdir(parents=True)
-        entries = []
-        for lane in ("requirements", "graph", "execution"):
-            artifact = folder / f"{lane}.json"
-            findings = [{"id": "ghost-1", "severity": "critical", "kind": "coverage",
-                         "nodes": ["ghost"], "detail": "invented node"}] if lane == "requirements" else []
-            artifact.write_text(json.dumps({
-                "dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lane": lane,
-                "findings": findings, "checks_performed": ["x"],
-            }), encoding="utf-8")
-            entries.append({"lane": lane, "ref": str(artifact.relative_to(self.root))})
-        manifest = folder / "manifest.json"
-        manifest.write_text(json.dumps({
-            "dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "reviews": entries,
-        }), encoding="utf-8")
-        result = self.run_cmd(
-            "update-task", "--decomposition-review", str(manifest.relative_to(self.root)), expect=3
-        )
-        self.assertIn("existing node IDs", result.stderr)
-
-    def test_plan_review_barrier_requires_every_lane_at_once(self):
-        self.awaiting([node("A")])
-        fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
-        folder = self.root / ".dag" / "artifacts" / "partial-review"
-        folder.mkdir(parents=True)
-        entries = []
-        for lane in ("requirements", "graph"):
-            report = folder / f"{lane}.json"
-            report.write_text(json.dumps({
-                "dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lane": lane,
-                "findings": [], "checks_performed": [f"{lane} checks"],
-            }), encoding="utf-8")
-            entries.append({"lane": lane, "ref": str(report.relative_to(self.root))})
-        manifest = folder / "manifest.json"
-        manifest.write_text(json.dumps({
-            "dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "reviews": entries,
-        }), encoding="utf-8")
-        before = self.path.read_bytes()
-        result = self.run_cmd(
-            "update-task", "--decomposition-review", str(manifest.relative_to(self.root)), expect=3
-        )
-        self.assertIn("every requested lane exactly once", result.stderr)
-        self.assertEqual(self.path.read_bytes(), before)
 
     def test_local_plan_fix_needs_only_affected_review_lanes(self):
         self.awaiting([node("A"), node("B")])
@@ -723,6 +733,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(saved["decomposition_review"]["open_findings"][0]["id"], "finding-1")
         self.assertTrue((self.root / ".dag" / "amended.json").exists())
         self.assertEqual(saved["replans"][-1]["ref"], ".dag/amended.json")
+
+        request = json.loads(self.run_cmd("status", "--review-request").stdout)
+        for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
+            self.assertIn(field, request)
+        review = self.root / ".dag" / "artifacts" / "design-review" / "review.json"
+        review.write_text(json.dumps({
+            "dag_id": "fixture",
+            "plan_fingerprint": request["plan_fingerprint"],
+            "mode": "repair",
+            "lanes": {
+                "graph": {
+                    "checks_performed": ["checked amended graph"],
+                    "findings": [{
+                        "id": "finding-1",
+                        "severity": "important",
+                        "kind": "missing_dependency",
+                        "nodes": ["B"],
+                        "detail": "new finding reused a prior ID",
+                    }],
+                    "resolutions": [{
+                        "id": "finding-1",
+                        "status": "ADDRESSED",
+                        "detail": "original dependency finding was fixed",
+                    }],
+                },
+            },
+        }), encoding="utf-8")
+        result = self.run_cmd(
+            "update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3,
+        )
+        self.assertIn("must not reuse prior finding IDs", result.stderr)
+
         self.design_review()
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
@@ -751,10 +793,12 @@ class RuntimeTests(unittest.TestCase):
         return json.loads(self.path.read_text())
 
     def revise(self, proposed, *, name="revision.json", reason="execution disproved the slice",
-               review=None, expect=0):
+               review=None, reference=None, expect=0):
         args = ["update-task", "--revise", self.draft(proposed, name=name), "--reason", reason]
         if review:
             args += ["--revision-review", review]
+        if reference:
+            args += ["--reference", reference]
         return self.run_cmd(*args, expect=expect)
 
     def scoped_review(self, findings=(), name="scoped-review.json"):
@@ -830,6 +874,21 @@ class RuntimeTests(unittest.TestCase):
         result = self.revise(proposed, review=review, expect=3)
         self.assertIn("blocking finding", result.stderr)
         self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"], ["output A"])
+
+    def test_revision_reference_is_required_persistent_and_recorded_for_override(self):
+        current = self.live_plan([node("A"), node("B", depends=("A",))])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["outputs"] = ["something else"]
+        review = self.scoped_review([
+            {"severity": "important", "kind": "scope_realism", "nodes": ["A"], "detail": "subjective concern"},
+        ])
+        result = self.revise(copy.deepcopy(proposed), review=review, reference=".dag/sources/missing-decision.md", expect=3)
+        self.assertIn("does not exist", result.stderr)
+        decision = self.root / ".dag" / "sources" / "decision.md"
+        decision.parent.mkdir(parents=True, exist_ok=True)
+        decision.write_text("user decision\n", encoding="utf-8")
+        self.revise(proposed, review=review, reference=".dag/sources/decision.md")
+        self.assertEqual(json.loads(self.path.read_text())["replans"][-1]["decision_ref"], ".dag/sources/decision.md")
 
     def test_revise_freezes_running_and_done_contracts(self):
         self.live_plan([node("A"), node("B")])

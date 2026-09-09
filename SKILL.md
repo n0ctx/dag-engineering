@@ -9,6 +9,8 @@ Compile large engineering work into a persistent DAG, then use it as the control
 
 ## Invariants
 
+- An explicit user decision outranks this skill's recommendations and subjective review findings. Preserve the finding, record the decision durably, and use the supported state or contract transition. It does not bypass runtime-enforced schema, acyclicity, path/scope, Git-SHA, evidence-binding, or external-authorization checks.
+
 - Git is the code truth, project documentation is the knowledge truth, `.dag/dag.json` is the execution-state truth, and a session is disposable computation.
 - The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. It is not the default implementation worker.
 - One project has one control plane: `.dag/` at the main worktree root, holding one `.dag/dag.json` at a time. A finished effort is archived before the next one starts.

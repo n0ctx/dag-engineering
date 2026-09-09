@@ -67,7 +67,7 @@ Persist questions, answers, source facts, and resulting decisions in `.dag/sourc
 
 ## 3. Decompose
 
-Apply `${SKILL_ROOT}/references/decomposition.md`. Do not duplicate its node-sizing, dependency/conflict, or contract rules here.
+Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally 1–6 ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
 
 ## 4. Draft and validate
 
@@ -90,19 +90,19 @@ A new request superseding an existing plan is not, by itself, a reason to abando
 
 ## 5. Review the decomposition
 
-Before showing the plan, export the plan view and dispatch the three narrow lanes (`requirements`, `graph`, `execution`) once, in parallel, for the same plan fingerprint:
+Before showing the plan, create one `review-request.json` containing the plan fingerprint, the complete review input, and the three lanes (`requirements`, `graph`, `execution`). Dispatch one independent reviewer to examine all three lanes in one pass and return one `review.json`; do not create `plan.json`, per-lane files, or a manifest. The single result uses a `lanes` object: each required lane appears exactly once as `{checks_performed: [...], findings: [...]}`. A full review has all three lanes; a repair has only the lanes named by the runtime request and retains resolutions for unresolved findings. The request includes only the contracts, relevant source references, and repository evidence needed for those lanes. A repair request contains only affected nodes and lanes, plus the evidence needed to reassess them and their downstream interfaces.
 
 ```bash
-"${SKILL_ROOT}/scripts/status" --plan-view > .dag/artifacts/decomposition-review/plan.json
+"${SKILL_ROOT}/scripts/status" --review-request > .dag/artifacts/decomposition-review/review-request.json
 ```
 
-Each lane receives only its contract, relevant source references, and repository evidence. Save one JSON verdict per lane under `.dag/artifacts/decomposition-review/`; after all requested lanes return, assemble one complete manifest and record it atomically:
+The reviewer must complete and disclose the full requested review. A review is independent advice, not a decision-maker above the user: `approval_ref` may record the user's clear, durable decision to approve or continue after seeing a blocking finding. That decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. Record the durable decision and rationale where the control plane requires it; do not suppress, rewrite, or omit findings.
 
 ```bash
-"${SKILL_ROOT}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review/manifest.json"
+"${SKILL_ROOT}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review/review.json"
 ```
 
-The runtime binds the manifest to the exact plan fingerprint and derives the verdict. Each requested lane appears once; `critical` and `important` findings block approval, while `minor` findings do not. Resolve blocking findings by amending the plan, not by abandoning and recreating it. An amendment clears the verdict; run only the affected repair lanes afterwards.
+The runtime derives the verdict from the complete review. `critical` and `important` findings block ordinary approval, while `minor` findings are recorded. Resolve blocking findings by amending the plan, not by abandoning and recreating it; an amendment clears the verdict and the next repair review includes only affected nodes and lanes.
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --amend ".dag/draft.json"

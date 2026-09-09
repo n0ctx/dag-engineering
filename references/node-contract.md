@@ -1,51 +1,33 @@
-# Node contract worker protocol
+# Node contract
 
-The controller packages one node for a fresh worker. The node contract is binding; a worker or reviewer reports against it and cannot amend it. Load `references/review-protocol.md` only when the controller reviews the result.
+The controller packages one node for one fresh worker. The node contract is binding; the worker and reviewer report against it and cannot amend it. The worker must not open `.dag/dag.json`.
 
-## Worker package
+## Package
 
-`status --node <id>` emits the node contract plus each upstream node's outputs, handoff reference, and commit. The controller builds the package; the worker must not open the control file. Add:
+Run `status --node <id>` and forward its original node brief once. Do not reconstruct or paraphrase its fields. Add only:
 
 ```text
 worktree/path
 absolute handoff artifact path
-project constraints binding this node
+binding project constraints
 ```
 
-Do not provide the whole DAG, chat history, unrelated upstream reports, or a future reviewer prompt. State the reading boundary in the same package:
+Do not send the whole DAG, chat history, unrelated upstream reports, worker reasoning, or a reviewer prompt. The package must state this reading boundary:
 
-- Read every file in `read_first` first; that is the planned context.
+- Read every `read_first` file before searching or editing.
 - `scope.files` is the write boundary, not a search budget.
-- Beyond `read_first`, read only files those files name directly (such as an import or caller that must change).
-- Do not open `.dag/dag.json`, survey the repository, read unrelated modules or history, or invent missing context.
-- If the contract is insufficient, report `NEEDS_CONTEXT` naming the file, artifact, or decision; do not expand the search to compensate.
+- Beyond `read_first`, read only files directly named by those files or required caller changes.
+- Do not survey the repository or invent missing context. If the contract is insufficient, report `NEEDS_CONTEXT` naming the missing file, artifact, or decision.
+
+`execution_plan` is a non-empty string array supplied by the controller: each string is one concrete route step for a low-cost worker. An equivalent local implementation is allowed, but the worker must stop and report `NEEDS_CONTEXT` before changing `scope`, interfaces, outputs, architecture, or acceptance. Such a change requires controller-led revise/replan; it is never an implicit worker decision.
 
 ## Worker protocol
 
-1. Read all `read_first` files before searching or editing.
-2. Raise scope or contract problems before guessing; implement only the declared objective and scope.
-3. Run focused verification, record reproducible evidence, and self-review the actual diff.
-4. Commit the node when the assigned workflow requires commits.
-5. Write the compact handoff artifact at the supplied path.
+Use the fixed prefix supplied by the controller: read `read_first`, follow `execution_plan`, write only paths matched by `scope.files`, report conflicts as `NEEDS_CONTEXT`, run verification, commit, and write handoff. Do the work directly; do not dispatch subagents or a reviewer.
 
-## You do not dispatch subagents
+Stop when a forbidden file must change, reality contradicts the contract, an upstream output is absent, acceptance cannot be met, or a new architecture choice is required. Use exactly one status: `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`. For the latter two, state the exact blocker, evidence, attempted bounded check, and required context or decision.
 
-Do the node's work yourself. Never spawn a subagent, especially a reviewer: the controller owns the fresh review gate, and a worker-spawned reviewer duplicates cost and cannot approve the node.
-
-Stop instead of expanding scope when a required file is outside `scope.files`, a forbidden file must change, reality contradicts the contract, an upstream output is absent, acceptance cannot be met, or a new architecture choice is required.
-
-Use exactly one status:
-
-- `DONE`: declared verification completed without known concern;
-- `DONE_WITH_CONCERNS`: requested work completed but an integration or correctness doubt remains;
-- `NEEDS_CONTEXT`: a specific missing fact, artifact, or decision is required;
-- `BLOCKED`: the node cannot be completed under its contract or capability.
-
-For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was tried, and the required decision/context. Do not continue open-ended exploration. Even a stopped attempt writes a handoff with its status, empty `files_changed` when appropriate, and the blocker in `unresolved`; chat-only stopping leaves no durable state.
-
-## Worker handoff
-
-Write a compact artifact at the exact path supplied by the controller, normally `<control-plane-root>/.dag/artifacts/<node-id>/handoff.json`:
+Every attempt writes the compact handoff at the supplied path, including stopped attempts:
 
 ```json
 {
@@ -53,11 +35,9 @@ Write a compact artifact at the exact path supplied by the controller, normally 
   "status": "DONE",
   "files_changed": ["project/relative/path"],
   "outputs": ["artifact or interface produced"],
-  "decisions": ["only durable decisions made within contract"],
-  "verification": [
-    {"command": "focused command", "result": "exit code and concise result", "artifact_ref": "path"}
-  ],
-  "context_used": ["every path read that read_first did not name"],
+  "decisions": ["durable decisions within the contract"],
+  "verification": [{"command": "focused command", "result": "exit code and concise result", "artifact_ref": "path"}],
+  "context_used": ["paths read beyond read_first"],
   "concerns": [],
   "unresolved": [],
   "downstream_notes": [],
@@ -65,4 +45,4 @@ Write a compact artifact at the exact path supplied by the controller, normally 
 }
 ```
 
-Keep chronology, searches, failed commands, and reasoning out of the handoff; link durable reports instead. After the worker reports, the controller checks scope, then reviews the diff using `${SKILL_ROOT}/references/review-protocol.md`.
+Keep chronology, searches, failed commands, and reasoning out of the handoff; link durable evidence instead. After the worker reports, the controller runs the scope gate and sends the strict package to an independent reviewer.

@@ -63,15 +63,23 @@ Avoid:
 
 When uncertainty is itself work, create a bounded `investigation` node with a decision artifact, explicit questions, a read budget or stop condition, and downstream nodes dependent on its accepted output.
 
+Every node carries a non-empty string-array `execution_plan` for a fresh implementer, normally 1–6 ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. The plan is an execution map, not a second contract: do not restate `objective`, `scope`, `inputs`, `outputs`, or `acceptance`, and do not copy verification commands. When the landing is unknown, use a bounded `investigation` node with a decision artifact rather than a guessed location.
+
+```json
+"execution_plan": [
+  "src/auth/client.py:AuthClient.login—Reject invalid credentials before session creation; covers AC1/V1"
+]
+```
+
 ## Decomposition review
 
-Split the fresh review into three narrow lanes dispatched in one batch and in parallel:
+Use one independent reviewer and one review package. The package reviews all three lanes in one pass:
 
 - `requirements`: objective, global acceptance, source references, assumptions, and coverage;
 - `graph`: dependency, conflict, and resource shape;
 - `execution`: scope, context, acceptance, and verification executability.
 
-Each lane receives only its relevant contract and repository evidence, never the planner's reasoning. For one plan fingerprint and review request, dispatch each lane once. The controller waits for all requested lanes, then atomically records one complete manifest. A repair review includes only affected lanes and does not add a pre-approval full-plan review.
+The controller writes one `review-request.json` containing the exact plan fingerprint and only the relevant contracts, source references, and repository evidence. The reviewer returns one `review.json` whose `lanes` object has each required lane exactly once as `{checks_performed: [...], findings: [...]}`; findings do not repeat the lane. A full review has `requirements`, `graph`, and `execution`; a repair has only the lanes named by the runtime request and retains resolutions for unresolved findings. There are no `plan.json`, per-lane result files, or manifest. The reviewer is an independent source of findings, not a decision-maker above the user. Full review and disclosure remain mandatory. A user who has seen a blocking finding may make a clear, durable decision to approve or continue, recorded through `approval_ref`; that decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. The runtime, not the reviewer, derives the verdict. `critical` and `important` findings block ordinary approval; `minor` findings are recorded.
 
 The validator already proves graph structure: no cycles, symmetric conflicts, undeclared same-file collisions between concurrent nodes, and acceptance coverage by verification. Review what scripts cannot decide:
 
@@ -84,25 +92,30 @@ The validator already proves graph structure: no cycles, symmetric conflicts, un
 - **scope realism**: `scope.files` does not match where behavior lives;
 - **assumption laundering**: a decision was parked in `assumptions` instead of clarified.
 
-Every finding names the offending nodes and the failure, not a style preference. Each lane writes a bound artifact whose `lane` matches the manifest and whose findings have stable IDs:
+Every finding names the offending nodes and the failure, not a style preference. The single `review.json` binds findings to the request fingerprint; each finding has a stable ID and does not repeat its enclosing lane:
 
 ```json
 {
   "dag_id": "auth-migration",
   "plan_fingerprint": "<current plan fingerprint>",
   "mode": "full",
-  "lane": "graph",
-  "findings": [
-    {
-      "id": "graph-001",
-      "severity": "important",
-      "kind": "missing_dependency",
-      "nodes": ["auth-client"],
-      "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency",
-      "suggestion": "add auth-client.depends_on = [define-auth-contract]"
-    }
-  ],
-  "checks_performed": ["dependency pass", "conflict pass", "node sizing"]
+  "lanes": {
+    "requirements": {"checks_performed": ["coverage pass"], "findings": []},
+    "graph": {
+      "checks_performed": ["dependency pass", "conflict pass", "node sizing"],
+      "findings": [
+        {
+          "id": "graph-001",
+          "severity": "important",
+          "kind": "missing_dependency",
+          "nodes": ["auth-client"],
+          "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency",
+          "suggestion": "add auth-client.depends_on = [define-auth-contract]"
+        }
+      ]
+    },
+    "execution": {"checks_performed": ["scope pass", "context pass"], "findings": []}
+  }
 }
 ```
 

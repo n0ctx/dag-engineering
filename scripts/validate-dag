@@ -1038,8 +1038,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
             if not isinstance(reviews, list):
                 errors.append(f"{a_label}.reviews: must be an array")
                 reviews = []
-            if len(reviews) > 3:
-                errors.append(f"{a_label}.reviews: at most three review/fix rounds are allowed")
             for r_index, review in enumerate(reviews):
                 r_label = f"{a_label}.reviews[{r_index}]"
                 if not isinstance(review, dict):
@@ -1396,8 +1394,6 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
         raise DagError("review requires --handoff-ref, --review-ref, and --head-ref")
     attempt = node["attempts"][-1]
     reviews = attempt["reviews"]
-    if len(reviews) >= 3:
-        raise DagError("review/fix circuit breaker reached: at most three rounds are allowed")
     if reviews and reviews[-1]["outcome"] == "approved":
         raise DagError("the current head already has an approved final review")
 

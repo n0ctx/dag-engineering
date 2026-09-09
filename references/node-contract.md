@@ -1,66 +1,51 @@
-# Node contract and worker protocol
+# Node contract worker protocol
 
-The controller packages one node for a fresh worker. The node contract is binding; worker and reviewer reports cannot amend it.
-
-The reviewer half of the protocol lives in `references/review-protocol.md`, which the controller loads when it reviews rather than when it dispatches.
+The controller packages one node for a fresh worker. The node contract is binding; a worker or reviewer reports against it and cannot amend it. Load `references/review-protocol.md` only when the controller reviews the result.
 
 ## Worker package
 
-`status --node <id>` emits exactly the package's contract half — the node's own fields plus each upstream node's outputs, handoff ref, and commit — so the controller never has to read the control file to build one, and the worker never has a reason to open it. Add the parts the control file does not hold:
+`status --node <id>` emits the node contract plus each upstream node's outputs, handoff reference, and commit. The controller builds the package; the worker must not open the control file. Add:
 
 ```text
-(from status --node <id>) contract, upstream outputs and handoff refs, artifact directory
 worktree/path
-report artifact path (absolute; a relative one lands in the worker's own worktree)
-project constraints that bind this node
+absolute handoff artifact path
+project constraints binding this node
 ```
 
-Do not provide full chat history, the whole DAG, every upstream report, or the implementer's future reviewer prompt.
+Do not provide the whole DAG, chat history, unrelated upstream reports, or a future reviewer prompt. State the reading boundary in the same package:
 
-State the reading boundary in the same package. `scope.files` is a write boundary; treating it as a search boundary points the worker at every file it is allowed to touch, which on a wide scope is the repository:
-
-> Read every file in `read_first` first; it is the whole context this node was planned with. Beyond it, read only what those files name directly — an import you must follow, a caller you must change. Do not open `.dag/dag.json`: your contract is in this prompt, and the rest of the plan is deliberately not yours. Do not survey the repository, read unrelated modules, read Git history, or read documentation the contract does not name. If you cannot proceed on this context, report `NEEDS_CONTEXT` naming the file you need — do not go find it yourself.
+- Read every file in `read_first` first; that is the planned context.
+- `scope.files` is the write boundary, not a search budget.
+- Beyond `read_first`, read only files those files name directly (such as an import or caller that must change).
+- Do not open `.dag/dag.json`, survey the repository, read unrelated modules or history, or invent missing context.
+- If the contract is insufficient, report `NEEDS_CONTEXT` naming the file, artifact, or decision; do not expand the search to compensate.
 
 ## Worker protocol
 
-The worker:
+1. Read all `read_first` files before searching or editing.
+2. Raise scope or contract problems before guessing; implement only the declared objective and scope.
+3. Run focused verification, record reproducible evidence, and self-review the actual diff.
+4. Commit the node when the assigned workflow requires commits.
+5. Write the compact handoff artifact at the supplied path.
 
-1. Reads all of `read_first` before searching or editing, and treats it as complete rather than as a starting point.
-2. Raises a scope or contract problem before guessing, and returns `NEEDS_CONTEXT` naming the missing file rather than exploring outside the boundary to compensate for a thin contract.
-3. Implements only the declared objective and scope.
-4. Runs focused verification and records reproducible evidence.
-5. Self-reviews the actual diff, but does not approve the node.
-6. Commits the node when the assigned workflow uses commits.
-7. Writes a short structured handoff artifact and returns only its status and reference.
+## You do not dispatch subagents
 
-The next block is copied exactly from Superpowers' current implementer prompt because recursive delegation would violate the same controller/reviewer separation here:
+Do the node's work yourself. Never spawn a subagent, especially a reviewer: the controller owns the fresh review gate, and a worker-spawned reviewer duplicates cost and cannot approve the node.
 
-## You Do Not Dispatch Subagents
-
-Do all of this task's work yourself. Never spawn a subagent to
-implement part of the task, and above all never spawn a reviewer to
-check your work. Self-review (below) means reading your own diff.
-Review is the controller's job: after you report, it dispatches a
-fresh reviewer against your diff. A reviewer you spawn duplicates
-that review at full cost, and its approval counts for nothing in
-the process. If you catch yourself thinking "an independent review
-would strengthen my report" — that review is already scheduled.
-Report instead.
-
-The worker must stop instead of expanding scope when a required file is outside `scope.files`, a forbidden file must change, code reality contradicts the contract, an upstream output is absent, acceptance cannot be met, or a new architecture choice is required.
+Stop instead of expanding scope when a required file is outside `scope.files`, a forbidden file must change, reality contradicts the contract, an upstream output is absent, acceptance cannot be met, or a new architecture choice is required.
 
 Use exactly one status:
 
-- `DONE`: work and declared verification completed without known concern;
-- `DONE_WITH_CONCERNS`: requested work completed, but correctness or integration doubt remains;
+- `DONE`: declared verification completed without known concern;
+- `DONE_WITH_CONCERNS`: requested work completed but an integration or correctness doubt remains;
 - `NEEDS_CONTEXT`: a specific missing fact, artifact, or decision is required;
-- `BLOCKED`: the worker cannot complete the node with the current contract or capability.
+- `BLOCKED`: the node cannot be completed under its contract or capability.
 
-For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was tried, and the decision/context needed. Do not keep exploring without a bounded hypothesis. Stopping is still a report: write the handoff artifact at the supplied path with that status, `commit` and `files_changed` empty, and the blocker in `unresolved`. A stop returned only as chat prose leaves the controller nothing durable to act on, and the node cannot be resolved from it.
+For `NEEDS_CONTEXT` or `BLOCKED`, report facts, the exact blocker, what was tried, and the required decision/context. Do not continue open-ended exploration. Even a stopped attempt writes a handoff with its status, empty `files_changed` when appropriate, and the blocker in `unresolved`; chat-only stopping leaves no durable state.
 
 ## Worker handoff
 
-Write a compact artifact at the exact path the controller supplied, normally `<control-plane-root>/.dag/artifacts/<node-id>/handoff.json`:
+Write a compact artifact at the exact path supplied by the controller, normally `<control-plane-root>/.dag/artifacts/<node-id>/handoff.json`:
 
 ```json
 {
@@ -80,8 +65,4 @@ Write a compact artifact at the exact path the controller supplied, normally `<c
 }
 ```
 
-`context_used` is required and may be empty. It is a self-report, so it gates nothing; it exists so that a node which had to read forty files to start is visible as a defective contract rather than as an invisible cost.
-
-Keep implementation chronology, searches, failed commands, and reasoning out of the handoff. Link durable reports instead.
-
-Once the worker reports, the controller checks scope, then reviews the diff using `${CLAUDE_SKILL_DIR}/references/review-protocol.md`.
+Keep chronology, searches, failed commands, and reasoning out of the handoff; link durable reports instead. After the worker reports, the controller checks scope, then reviews the diff using `${SKILL_ROOT}/references/review-protocol.md`.

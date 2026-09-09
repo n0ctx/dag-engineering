@@ -6,8 +6,8 @@ This skill contains small verbatim prompt excerpts from one MIT-licensed source.
 
 | Source | Commit | File | Copied section | Local destination | Mode | Reason |
 |---|---|---|---|---|---|---|
-| `obra/superpowers` | `b36e0829c6d0140e93cfef2ca599b1b07d4a7797` | `skills/writing-plans/SKILL.md` | `Task Right-Sizing`, lines 38–43 | `references/decomposition.md` | exact-copy | The review-boundary semantics are identical and the wording is evaluation-informed. |
-| `obra/superpowers` | `b36e0829c6d0140e93cfef2ca599b1b07d4a7797` | `skills/subagent-driven-development/implementer-prompt.md` | `You Do Not Dispatch Subagents`, lines 50–60 | `references/node-contract.md` | exact-copy | The controller/reviewer separation is identical. |
+| `obra/superpowers` | `b36e0829c6d0140e93cfef2ca599b1b07d4a7797` | `skills/writing-plans/SKILL.md` | `Task Right-Sizing`, lines 38–43 | `references/decomposition.md` | minimal adaptation (`task` → `node`) | Review-boundary semantics retained; wording is adapted only for DAG terminology. |
+| `obra/superpowers` | `b36e0829c6d0140e93cfef2ca599b1b07d4a7797` | `skills/subagent-driven-development/implementer-prompt.md` | `You Do Not Dispatch Subagents`, lines 50–60 | `references/node-contract.md` | condensed adaptation | Controller/reviewer separation retained while the reason is compressed. |
 | `obra/superpowers` | `b36e0829c6d0140e93cfef2ca599b1b07d4a7797` | `skills/subagent-driven-development/task-reviewer-prompt.md` | `Do Not Trust the Report`, lines 64–71 | `references/review-protocol.md` | exact-copy | The anti-anchoring rule is identical. |
 
 Everything else in this skill is adapted or independently implemented. In particular, Task Master was concept-only because its license adds the Commons Clause; no Task Master code or prompt was copied.

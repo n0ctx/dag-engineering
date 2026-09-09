@@ -144,7 +144,7 @@ The runtime appends an attempt when a node enters `running`:
 }
 ```
 
-It closes that attempt on `done`, `failed`, or `blocked`. Each `reviews` entry records `round`, derived `outcome`, artifact `ref`, reviewed `handoff_ref`, immutable `head_ref`, and `reviewed_at`. The runtime permits at most three entries per attempt. Do not store worker transcripts here.
+It closes that attempt on `done`, `failed`, or `blocked`. Each `reviews` entry records `round`, derived `outcome`, artifact `ref`, reviewed `handoff_ref`, immutable `head_ref`, and `reviewed_at`. Do not store worker transcripts here.
 
 `update-task` obtains an exclusive sibling lock before reading and replacing `dag.json`, so two controller updates cannot silently overwrite each other. The lock file is runtime state, not part of the DAG schema.
 

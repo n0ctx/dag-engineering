@@ -1231,25 +1231,6 @@ class RuntimeTests(unittest.TestCase):
         self.run_cmd("validate-dag")
         self.assertNotIn("estimated_cost", self.run_cmd("ready-tasks", "--json").stdout)
 
-    def test_review_circuit_breaker_is_stateful(self):
-        self.write(dag([node("A")]))
-        self.start("A")
-        for round_number in range(1, 4):
-            head = self.commit_node("A")
-            handoff, review, _ = self.artifacts("A", head, round_number=round_number, approved=False)
-            self.run_cmd(
-                "update-task", "A", "review", "--handoff-ref", handoff,
-                "--review-ref", review, "--head-ref", head,
-            )
-        head = self.commit_node("A")
-        handoff, review, _ = self.artifacts("A", head, round_number=4, approved=True)
-        result = self.run_cmd(
-            "update-task", "A", "review", "--handoff-ref", handoff,
-            "--review-ref", review, "--head-ref", head, expect=3,
-        )
-        self.assertIn("at most three rounds", result.stderr)
-        saved = json.loads(self.path.read_text())
-        self.assertEqual(len(saved["nodes"][0]["attempts"][0]["reviews"]), 3)
 
     def test_running_attempt_persists_git_recovery_state(self):
         self.write(dag([node("A")]))

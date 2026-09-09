@@ -2,6 +2,8 @@
 
 `<project>/.dag/dag.json` is controller-owned execution state. Use UTF-8 JSON and schema version `1`. Keep large reports under `.dag/artifacts/` and store only short references in the DAG.
 
+Nothing reads the control file directly except the runtime. `status --node <id>` emits one node's dispatch brief and `status --plan-view` emits every node's contract without the execution record; those are what a worker and a plan reviewer receive.
+
 ## Top level
 
 ```json

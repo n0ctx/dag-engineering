@@ -63,7 +63,7 @@ When uncertainty is itself the work, create a bounded `investigation` node with 
 
 ## Decomposition review
 
-A fresh reviewer that took no part in drafting judges the plan before it reaches the user. It receives the DAG, its `source_refs`, the objective and global acceptance, and the repository — never the planner's reasoning.
+A fresh reviewer that took no part in drafting judges the plan before it reaches the user. It receives the plan as `status --plan-view` writes it — every node's contract, the objective, global acceptance, assumptions, and `source_refs`, without the execution record — plus the repository, and never the planner's reasoning.
 
 The validator already proves the graph is well formed: no cycles, symmetric conflicts, no undeclared same-file collision between concurrent nodes, every acceptance criterion covered by a verification entry. This review covers what no script can decide:
 

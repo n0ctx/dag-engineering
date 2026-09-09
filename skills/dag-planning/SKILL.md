@@ -150,7 +150,13 @@ Audit the DAG against the evidence rule before presenting it. Walk every technol
 
 ## 7. Review the decomposition
 
-A plan that validates can still be a bad plan. Before showing it to the user, dispatch one fresh reviewer against the DAG using the protocol in `${CLAUDE_SKILL_DIR}/references/decomposition.md`. Give it the DAG, its source references, and the repository; never your own reasoning about why you split it this way. Save its JSON verdict under `.dag/artifacts/`, then record it:
+A plan that validates can still be a bad plan. Before showing it to the user, dispatch one fresh reviewer using the protocol in `${CLAUDE_SKILL_DIR}/references/decomposition.md`. Give it the plan, its source references, and the repository; never your own reasoning about why you split it this way. Write the plan out rather than transcribing it:
+
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/status" --plan-view > .dag/artifacts/decomposition-review/plan.json
+```
+
+That is every node's contract without the record of running them, which is what this review judges. Rebuilding the same view by hand costs the whole plan read and written again for each round. Save the reviewer's JSON verdict under `.dag/artifacts/`, then record it:
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review.json"

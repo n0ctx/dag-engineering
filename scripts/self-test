@@ -1375,6 +1375,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(brief["upstream"][0]["outputs"], ["output A"])
         self.assertNotIn("Node B", self.run_cmd("status", "--node", "C").stdout)
 
+    def test_plan_view_carries_every_contract_without_the_execution_record(self):
+        self.write(dag([node("A"), node("B", depends=("A",))]))
+        self.complete("A")
+        view = json.loads(self.run_cmd("status", "--plan-view").stdout)
+        self.assertEqual([item["id"] for item in view["nodes"]], ["A", "B"])
+        self.assertEqual(view["objective"], "Exercise runtime")
+        self.assertEqual(view["nodes"][0]["status"], "done")
+        self.assertEqual(view["nodes"][0]["acceptance"], [{"id": "AC1", "criterion": "A works"}])
+        for absent in ("attempts", "handoff"):
+            self.assertNotIn(absent, view["nodes"][0])
+        for absent in ("replans", "approval_ref", "planning_session", "decomposition_review"):
+            self.assertNotIn(absent, view)
+
     def test_status_reports_whether_a_running_attempt_produced_anything(self):
         self.write(dag([node("A")]))
         self.start("A")

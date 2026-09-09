@@ -192,7 +192,7 @@ Land parallel work only after each node passes its own gate, in dependency and i
 
 ## Final convergence
 
-All nodes being `done` is necessary but not sufficient. Re-read the original objective, source references, global acceptance, and integrated behavior. Perform a fresh whole-DAG convergence review for omitted requirements, inconsistent interfaces, and integration gaps.
+All nodes being `done` is necessary but not sufficient. Re-read the original objective, source references, global acceptance, and integrated behavior. Perform a fresh whole-plan convergence review for omitted requirements, inconsistent interfaces, and integration gaps, giving the reviewer `status --plan-view` and the integrated repository rather than the control file.
 
 If a gap exists, record failed convergence and its durable report:
 

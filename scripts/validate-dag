@@ -2209,6 +2209,25 @@ def node_brief(dag: dict[str, Any], dag_path: Path, node_id: str) -> dict[str, A
     }
 
 
+PLAN_VIEW_FIELDS = ("dag_id", "objective", "source_refs", "assumptions", "global_acceptance", "max_parallel")
+
+
+def plan_view(dag: dict[str, Any]) -> dict[str, Any]:
+    """Emit the plan without the record of running it, which is what a plan reviewer judges.
+
+    A decomposition or convergence reviewer reads every node, so it cannot be given a brief;
+    what it can be spared is the execution state, and being spared it is also what stops the
+    review from drifting into judging the work instead of the plan.
+    """
+    return {
+        **{field: dag[field] for field in PLAN_VIEW_FIELDS},
+        "nodes": [
+            {**{field: node[field] for field in PLAN_NODE_FIELDS}, "status": node["status"]}
+            for node in dag["nodes"]
+        ],
+    }
+
+
 def cmd_status(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="status", description="Summarize DAG progress and recovery state.")
     parser.add_argument("--dag", type=Path, help="control file path; defaults to the main worktree root")
@@ -2216,6 +2235,11 @@ def cmd_status(argv: list[str]) -> int:
     parser.add_argument(
         "--node",
         help="emit one node's dispatch brief as JSON instead of the summary, so no worker reads the control file",
+    )
+    parser.add_argument(
+        "--plan-view",
+        action="store_true",
+        help="emit the plan without its execution record as JSON, for a plan reviewer",
     )
     args = parser.parse_args(argv)
     args.dag = resolve_dag_path(args.dag)
@@ -2226,6 +2250,9 @@ def cmd_status(argv: list[str]) -> int:
         except DagError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return EXIT_USAGE
+        return 0
+    if args.plan_view:
+        print(json.dumps(plan_view(dag), ensure_ascii=False, indent=2))
         return 0
     nodes = node_map(dag)
     counts = {status: 0 for status in ("done", "running", "failed", "blocked", "pending")}

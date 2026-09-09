@@ -7,7 +7,7 @@ A node reaches `done` only after worker evidence, fresh review, and controller v
 Run it against real Git data as soon as the worker reports, before a reviewer is dispatched:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/check-scope" <node-id> --head-ref <sha> \
+"${SKILL_ROOT}/scripts/check-scope" <node-id> --head-ref <sha> \
   --handoff-ref ".dag/artifacts/<node-id>/handoff.json"
 ```
 
@@ -28,17 +28,17 @@ Confirm a fresh reviewer evaluated:
 - the original node contract and acceptance, not criteria it invented;
 - the actual diff or immutable review package;
 - scope compliance and test validity;
-- the current fix round rather than an earlier commit.
+- the immutable worker range and, when present, the reviewer-fix range rather than an earlier commit.
 
-Critical, Important, spec, or scope findings remain blocking until a scoped re-review marks them addressed or the controller re-plans. Minor findings may be recorded without extending the fix loop when they do not undermine acceptance.
+Critical and Important findings inside scope must be addressed in the reviewer's independent fix commit or remain blocking. The reviewer cannot approve its own fix; the controller checks the fix-only range and final acceptance. Spec, scope, or unsafe-repair findings are escalations or contract decisions for the controller. Minor findings may be recorded without another review when they do not undermine acceptance.
 
-An `escalated` outcome is not a fix round. It names paths outside the node's scope that this diff broke, so returning them to the worker only produces a diff the scope gate will refuse. Give them an owner — a gap node or a replan — and then re-review the same head.
+An `escalated` outcome is not a fix round. It names paths outside the node's scope that this diff broke, so returning them to the worker only produces a diff the scope gate will refuse. Give every path an owner with `resolve-escalation`; the unchanged head is not re-reviewed. Resolve an unchanged contract question with `resolve-contract`.
 
 ## 4. Independent controller gate
 
 The controller personally runs at least one real criterion directly tied to a node acceptance ID. Reading the worker or reviewer report is not a check. Prefer the smallest command or observable probe that would fail if the claimed behavior were absent.
 
-Record command, immutable Git head, timestamp, covered acceptance IDs, exit status, concise output, and the exact Git diff path list in a JSON artifact matching `${CLAUDE_SKILL_DIR}/references/dag-schema.md`. Pass that artifact to `update-task --verification-ref`.
+Record command, immutable Git head, timestamp, covered acceptance IDs, exit status, concise output, and the exact Git diff path list in a JSON artifact matching `${SKILL_ROOT}/references/dag-schema.md`. Pass that artifact to `update-task --verification-ref`.
 
 If the check fails, return the concrete finding to the implementer. The controller does not fix it inline by default, because implementing the fix would compromise its independent acceptance role.
 

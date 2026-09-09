@@ -110,13 +110,13 @@ Every `source_refs` entry must identify durable state: a project path, stable UR
 
 - `scope.files`, `scope.forbidden`, and `read_first` contain project-relative paths or glob patterns. Absolute paths and `..` traversal are invalid.
 - `read_first` is the node's complete declared context, not a reading suggestion, and `scope.files` bounds only what a worker may write. Approval refuses a node declaring more than 120,000 characters of `read_first`, or a `scope.files` expanding past 200 files or 20,000 lines of tracked content, because nothing at execution time can cap what a worker reads. `validate-dag` reports the same measurements as warnings, and `ready-tasks` prints them per candidate. Starting a node is refused while any `read_first` path is missing from the worktree: by then its dependencies are done, so an absent input sends the worker looking for its own.
-- A review outcome is `approved`, `needs_fixes`, `cannot_verify`, or `escalated`. `escalated` means the review raised a blocking problem located outside `scope.files`, which the worker cannot fix without tripping the scope gate; the affected paths are recorded in `escalated_paths` and the node cannot complete until they have an owner and the head is re-reviewed. Every review finding carries the path it is about, and the runtime rejects one filed on the wrong side of the scope boundary.
+- A review outcome is `approved`, `needs_fixes`, `cannot_verify`, or `escalated`. A review binds `worker_head` to the immutable worker delivery and may bind `reviewer_fix_head` to one independent reviewer repair commit. The controller accepts the final head only after checking the fix-only range and an independent acceptance check; the reviewer never accepts its own fix. `escalated` means a blocking problem is outside `scope.files`, unsafe to repair, or contract-bound; same-SHA escalation/contract resolution never re-reviews unchanged code. Every review finding carries a stable ID and the runtime rejects one filed on the wrong side of the scope boundary.
 - `scope.files`, `acceptance`, `verification`, and `outputs` are non-empty.
 - Node IDs and acceptance/verification IDs are unique within their owner.
 - Every verification entry covers at least one acceptance ID, and every acceptance ID has coverage.
 - `depends_on` and `conflicts_with` reference existing nodes and cannot reference self.
 - `conflicts_with` is symmetric. The validator rejects one-sided conflicts.
-- `decomposition_review` records a fresh reviewer's verdict on the plan, fingerprinted over the decomposition itself: objective, global acceptance, assumptions, source refs, and each node's contract. Execution state is excluded, so running a node never invalidates a review, while editing the plan does. `planning_status` cannot become `approved` without a matching `approved` verdict.
+- `decomposition_review` records one complete manifest of the three narrow lanes (or the affected subset for repair), fingerprinted over objective, global acceptance, assumptions, source refs, and each node contract. Each requested lane occurs exactly once; execution state is excluded. `planning_status` cannot become `approved` without a matching approved manifest. Repair approval does not trigger another full review; only final convergence is whole-plan.
 - `planning_session` is stamped by the runtime at the first approval and is never rewritten, including after a replan. Node execution is refused from that same session, so planning context cannot leak into execution. It stays null when no session identity is available, and the check then passes.
 - Two nodes that can run concurrently, meaning neither depends on the other, cannot have overlapping `scope.files` without a `conflicts_with` edge. The validator rejects the undeclared collision.
 - A done or running node cannot depend on a non-done node.
@@ -137,6 +137,8 @@ The runtime appends an attempt when a node enters `running`:
   "branch": "dag/implement-auth-consumer",
   "base_ref": "full-commit-sha",
   "head_ref": null,
+  "worker_head": null,
+  "reviewer_fix_head": null,
   "reviews": [],
   "handoff_ref": null,
   "verification_ref": null,
@@ -144,7 +146,7 @@ The runtime appends an attempt when a node enters `running`:
 }
 ```
 
-It closes that attempt on `done`, `failed`, or `blocked`. Each `reviews` entry records `round`, derived `outcome`, artifact `ref`, reviewed `handoff_ref`, immutable `head_ref`, and `reviewed_at`. Do not store worker transcripts here.
+It closes that attempt on `done`, `failed`, or `blocked`. Each `reviews` entry records `round`, derived `outcome`, artifact `ref`, reviewed `handoff_ref`, immutable final `head_ref`, `worker_head`, optional `reviewer_fix_head`, and `reviewed_at`. Active attempts also expose `open_escalations`/`escalation_resolution` and `open_contract_findings`/`contract_resolution`; older DAGs may omit these and remain readable. A same-head escalation or contract decision is resolved without re-review. Do not store worker transcripts here.
 
 `update-task` obtains an exclusive sibling lock before reading and replacing `dag.json`, so two controller updates cannot silently overwrite each other. The lock file is runtime state, not part of the DAG schema.
 

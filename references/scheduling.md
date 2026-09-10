@@ -13,8 +13,6 @@ The controller then decides whether dispatch has positive value. Consider:
 - stable scope and acceptance;
 - worktree setup and later integration cost.
 
-`max_parallel` is a ceiling recorded in the DAG and enforced when nodes start. One is normal; two require clear independence; more requires stable, highly independent work with obvious benefit. Several open-ended investigations are a reason to serialize, not a reason to fill slots.
-
 ## Dependency and failure behavior
 
 `depends_on` is semantic. A failed or blocked upstream node keeps dependents ineligible. Do not bypass it by manually marking downstream work running.

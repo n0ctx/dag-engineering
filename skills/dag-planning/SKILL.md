@@ -124,7 +124,7 @@ Whatever the review left open is the controller's close-out, not another review 
 
 ## 6. Approval gate
 
-For a newly generated or vague DAG, show objective, nodes, dependency edges, conflicts, expected parallel frontier, global acceptance, and every `assumptions` entry. Then stop for explicit approval. Default `max_parallel` to 1 unless safe isolation and meaningful wall-clock benefit are established.
+For a newly generated or vague DAG, show objective, nodes, dependency edges, conflicts, expected parallel frontier, global acceptance, and every `assumptions` entry. Then stop for explicit approval.
 
 Record approval only after persisting the exact approval and accepted DAG version under `.dag/sources/`:
 

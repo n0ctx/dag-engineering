@@ -21,9 +21,6 @@ from typing import Any
 
 
 SCHEMA_VERSION = 2
-READ_FIRST_CHAR_LIMIT = 120000
-SCOPE_FILE_LIMIT = 200
-SCOPE_LINE_LIMIT = 20000
 PLANNING_STATUSES = {
     "draft",
     "awaiting_approval",
@@ -352,13 +349,6 @@ def in_scope(path: str, scope: dict[str, Any]) -> bool:
 
 
 def context_size(root: Path, nodes: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Measure how much reading each node's contract commits its worker to.
-
-    `read_first` is the mandated read and the number that decides whether a node fits in one
-    context at all; `scope.files` is the widest place the worker can then be pointed at. Both
-    are authored at planning time and neither can be capped once a worker is running, so this
-    is where "too big to execute" stops being a judgement and becomes a number.
-    """
     listing = run_git(root, "ls-files", "-z")
     if listing.returncode != 0:
         raise DagError(f"cannot list tracked files in {root}: {listing.stderr.strip()}")
@@ -390,19 +380,6 @@ def context_size(root: Path, nodes: list[dict[str, Any]]) -> dict[str, dict[str,
             "scope_lines": sum(lines[path] for path in matched),
         }
     return sizes
-
-
-def oversized_contexts(root: Path, nodes: list[dict[str, Any]]) -> list[str]:
-    """Report the nodes no worker could execute without running out of context."""
-    reports = []
-    for node_id, size in context_size(root, nodes).items():
-        if size["read_first_chars"] > READ_FIRST_CHAR_LIMIT:
-            reports.append(f"{node_id} declares {size['read_first_chars']} characters of read_first")
-        if size["scope_files"] > SCOPE_FILE_LIMIT or size["scope_lines"] > SCOPE_LINE_LIMIT:
-            reports.append(
-                f"{node_id} covers {size['scope_files']} file(s) and {size['scope_lines']} line(s) of scope"
-            )
-    return reports
 
 
 def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
@@ -915,7 +892,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         "approval_ref",
         "planning_session",
         "decomposition_review",
-        "max_parallel",
         "created_at",
         "updated_at",
         "convergence",
@@ -991,9 +967,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
             ):
                 errors.append("decomposition_review.decision_ref: required when user approval overrides blocking findings")
 
-    max_parallel = dag.get("max_parallel")
-    if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or max_parallel < 1:
-        errors.append("max_parallel: must be an integer >= 1")
     for field in ("created_at", "updated_at"):
         if not is_timestamp(dag.get(field)):
             errors.append(f"{field}: must be a UTC RFC 3339 timestamp ending in Z")
@@ -1384,14 +1357,6 @@ def cmd_validate(argv: list[str]) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_USAGE
     errors, warnings = validate_dag(dag)
-    if not errors:
-        try:
-            warnings += [
-                f"{report}, which is more than one worker's context holds; consider splitting the node"
-                for report in oversized_contexts(project_root(args.dag), [n for n in dag["nodes"] if n["status"] != "done"])
-            ]
-        except DagError as exc:
-            warnings.append(f"node context size not measured: {exc}")
     if args.json:
         print(json.dumps({"valid": not errors, "errors": errors, "warnings": warnings}, ensure_ascii=False, indent=2))
     else:
@@ -1839,10 +1804,6 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
         active_conflicts = [conflict for conflict in node["conflicts_with"] if nodes[conflict]["status"] == "running"]
         if active_conflicts:
             raise DagError(f"cannot start {args.node_id!r}; active conflicts: {', '.join(active_conflicts)}")
-        active_count = sum(candidate["status"] == "running" for candidate in nodes.values())
-        limit = dag["max_parallel"]
-        if active_count >= limit:
-            raise DagError(f"cannot start {args.node_id!r}; active-node limit {limit} reached")
         if not is_text(args.worktree):
             raise DagError("--worktree is required when starting a node")
         worktree = resolve_worktree(args.dag, args.worktree)
@@ -2016,8 +1977,6 @@ def apply_reviewer_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) ->
     if len({entry["id"] for entry in draft_nodes}) != len(draft_nodes):
         raise DagError("reviewer draft has duplicate node IDs")
     candidate = copy.deepcopy(dag)
-    if "max_parallel" in value:
-        candidate["max_parallel"] = value["max_parallel"]
     proposed = {entry["id"]: entry for entry in draft_nodes}
     current = node_map(dag)
     merged: list[dict[str, Any]] = []
@@ -2577,7 +2536,7 @@ def node_brief(dag: dict[str, Any], dag_path: Path, node_id: str) -> dict[str, A
     }
 
 
-PLAN_VIEW_FIELDS = ("dag_id", "objective", "source_refs", "assumptions", "global_acceptance", "max_parallel")
+PLAN_VIEW_FIELDS = ("dag_id", "objective", "source_refs", "assumptions", "global_acceptance")
 
 
 def plan_view(dag: dict[str, Any]) -> dict[str, Any]:

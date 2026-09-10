@@ -59,7 +59,6 @@ def dag(nodes):
         "approval_ref": "fixture approval",
         "planning_session": None,
         "decomposition_review": None,
-        "max_parallel": 3,
         "created_at": timestamp,
         "updated_at": timestamp,
         "convergence": {"status": "pending", "verification_ref": None, "checked_at": None, "gaps": []},
@@ -204,7 +203,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("execution_plan", brief["contract"])
         self.assertIn("execution_plan", view["nodes"][0])
         self.assertIn("execution_plan", request["nodes"][0])
-        for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
+        for field in ("objective", "source_refs", "assumptions", "global_acceptance"):
             self.assertIn(field, request)
         before = view["plan_fingerprint"]
         changed = json.loads(self.path.read_text())
@@ -783,7 +782,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(saved["replans"][-1]["kind"], "revision")
 
         request = json.loads(self.run_cmd("status", "--review-request").stdout)
-        for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
+        for field in ("objective", "source_refs", "assumptions", "global_acceptance"):
             self.assertIn(field, request)
         self.design_review()
         self.approve_as("session-plan")
@@ -1768,27 +1767,6 @@ class RuntimeTests(unittest.TestCase):
             "update-task", "--planning-status", "approved",
             "--reference", ".dag/sources/approval.md", expect=expect,
         )
-
-    def test_approval_allows_a_node_bigger_than_one_context(self):
-        self.track("docs/history.md", "x" * 120001)
-        plan = [node("A")]
-        plan[0]["read_first"] = ["docs/history.md"]
-        self.awaiting(plan)
-        self.approval_attempt(0)
-        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
-
-    def test_approval_allows_a_scope_no_worker_could_hold(self):
-        self.track("src/generated.py", "PAD = 1\n" * 20001)
-        self.awaiting([node("A", files=["src/**"])])
-        self.approval_attempt(0)
-        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
-
-    def test_validate_warns_about_oversized_contexts(self):
-        self.track("src/generated.py", "PAD = 1\n" * 20001)
-        self.write(dag([node("A", files=["src/**"])]))
-        report = json.loads(self.run_cmd("validate-dag", "--json").stdout)
-        self.assertTrue(report["valid"])
-        self.assertTrue(any("20001 line(s)" in warning for warning in report["warnings"]), report["warnings"])
 
     def test_ready_tasks_reports_each_candidate_reading_surface(self):
         self.track("src/A.py", "VALUE = 1\n" * 10)

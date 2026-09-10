@@ -4,7 +4,7 @@
 
 ## Top level
 
-The required root fields are `schema_version`, `dag_id`, `objective`, `source_refs`, `assumptions`, `global_acceptance`, `planning_status`, `approval_ref`, `planning_session`, `decomposition_review`, `max_parallel`, `created_at`, `updated_at`, `convergence`, and `nodes`.
+The required root fields are `schema_version`, `dag_id`, `objective`, `source_refs`, `assumptions`, `global_acceptance`, `planning_status`, `approval_ref`, `planning_session`, `decomposition_review`, `created_at`, `updated_at`, `convergence`, and `nodes`.
 
 `planning_status` is `draft`, `awaiting_approval`, `approved`, `replan_required`, or `complete`. `convergence.status` is `pending`, `failed`, or `passed`; a failed result retains its `gaps` until explicit gap nodes and a later convergence review close them. `approval_ref` is the durable user approval or decision reference and may be null before approval. Timestamps are UTC RFC 3339 values ending in `Z`.
 
@@ -33,7 +33,7 @@ Normal plan review uses exactly:
 .dag/artifacts/<review>/review.json
 ```
 
-The runtime request contains `dag_id`, the current `plan_fingerprint`, the plan fields (`objective`, `source_refs`, `assumptions`, `global_acceptance`, `max_parallel`), and every node contract without execution records. One request shape serves new plans and revised plans alike.
+The runtime request contains `dag_id`, the current `plan_fingerprint`, the plan fields (`objective`, `source_refs`, `assumptions`, `global_acceptance`), and every node contract without execution records. One request shape serves new plans and revised plans alike.
 
 `review.json` is flat: `dag_id`, `plan_fingerprint`, `checks_performed` (a non-empty string array), `bugs`, `unsure`, and `draft_ref`. A bug entry names an ID, kind, detail, node references, and `fix` (what the reviewer draft changes); an unsure entry names an ID, kind, detail, node references, and `question` (the decision only the user or controller may make). Finding IDs must be unique and node references must name existing nodes. Bugs and the draft are two halves of one claim: a review with bugs must name its draft plan in `draft_ref` and be recorded with `--draft`, and a draft without bugs is refused. Recording applies the draft under the revision protections — the execution record, attempted and done nodes, and the deliverable fields cannot change — and no further review round follows the reviewer's own fixes. The verdict is `needs_changes` while any `unsure` entry remains, otherwise `approved`.
 

@@ -1,6 +1,6 @@
 # Node contract
 
-The controller packages one node for one fresh worker. The node contract is binding; the worker and reviewer report against it and cannot rewrite it. The worker must not open `.dag/dag.json`.
+The node contract is binding; the worker and reviewer report against it and cannot rewrite it. The worker must not open `.dag/dag.json`.
 
 ## Package
 

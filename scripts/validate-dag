@@ -43,7 +43,7 @@ PLANNING_STATUSES = {
 NODE_STATUSES = {"pending", "running", "done", "failed", "blocked"}
 WORK_TYPES = {"implementation", "investigation", "integration", "documentation"}
 CONVERGENCE_STATUSES = {"pending", "failed", "passed"}
-REVIEW_OUTCOMES = {"approved", "needs_fixes", "cannot_verify", "escalated"}
+REVIEW_OUTCOMES = {"approved", "cannot_verify", "escalated"}
 FINDING_SEVERITIES = {"critical", "important", "minor"}
 PLAN_REVIEW_LANES = ("requirements", "graph", "execution")
 PLAN_REVIEW_MODES = {"full", "repair"}
@@ -544,7 +544,6 @@ def validate_review_artifact(
     node: dict[str, Any],
     head_ref: str,
     expected_round: int,
-    previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     value = load_json_artifact(dag_path, ref, "review artifact")
     if value.get("node") != node["id"]:
@@ -561,11 +560,18 @@ def validate_review_artifact(
         raise DagError("reviewer_fix_head requires worker_head")
     if value.get("round") != expected_round:
         raise DagError(f"review artifact round must be {expected_round}")
-    if value.get("spec") not in {"APPROVED", "NEEDS_FIXES", "CANNOT_VERIFY"}:
-        raise DagError("review artifact has invalid spec verdict")
-    if value.get("quality") not in {"APPROVED", "NEEDS_FIXES"}:
-        raise DagError("review artifact has invalid quality verdict")
+    if value.get("spec") not in {"APPROVED", "CANNOT_VERIFY"}:
+        raise DagError(
+            "review artifact spec must be APPROVED or CANNOT_VERIFY; in-scope defects are "
+            "repaired in the reviewer's own fix commit, not reported for a worker round"
+        )
     validate_findings(value, node)
+    if value["blocking_findings"] and not reviewer_fix_head:
+        raise DagError(
+            "blocking findings require a reviewer fix commit: repair them in one in-scope "
+            "commit and mark each ADDRESSED in finding_resolutions, or record problems the "
+            "reviewer cannot safely repair under controller_decisions"
+        )
     if "finding_resolutions" in value:
         resolutions = value["finding_resolutions"]
         if not isinstance(resolutions, list):
@@ -577,52 +583,15 @@ def validate_review_artifact(
                 raise DagError(f"{label} must name a finding ID")
             if resolution["id"] in seen_resolution_ids:
                 raise DagError(f"{label}.id: duplicate finding resolution")
-            if resolution.get("status") not in {"ADDRESSED", "NOT_ADDRESSED"}:
-                raise DagError(f"{label}.status must be ADDRESSED or NOT_ADDRESSED")
+            if resolution.get("status") != "ADDRESSED":
+                raise DagError(f"{label}.status must be ADDRESSED")
             if not is_text(resolution.get("detail")):
                 raise DagError(f"{label}.detail must explain the resolution")
             seen_resolution_ids.add(resolution["id"])
-    unresolved: list[str] = []
-    legacy_resolutions: list[dict[str, Any]] = []
-    if previous and previous.get("outcome") == "needs_fixes":
-        expected = set(previous.get("blocking_finding_ids", []))
-        resolutions = value.get("finding_resolutions")
-        if resolutions is None:
-            resolutions = value.get("resolutions")
-            legacy_resolutions = resolutions if isinstance(resolutions, list) else []
-            if isinstance(resolutions, list):
-                value["finding_resolutions"] = resolutions
-        if not isinstance(resolutions, list):
-            raise DagError("a legacy fix review must verdict every prior blocking finding in finding_resolutions")
-        seen_resolutions: set[str] = set()
-        for index, resolution in enumerate(resolutions):
-            label = f"review artifact resolutions[{index}]"
-            if not isinstance(resolution, dict) or resolution.get("status") not in {"ADDRESSED", "NOT_ADDRESSED"}:
-                raise DagError(f"{label}: needs an ID and ADDRESSED or NOT_ADDRESSED status")
-            finding_id = resolution.get("id")
-            if finding_id not in expected or finding_id in seen_resolutions:
-                raise DagError(f"{label}.id: must name one prior blocking finding exactly once")
-            if not is_text(resolution.get("detail")):
-                raise DagError(f"{label}.detail: must explain the verdict")
-            seen_resolutions.add(finding_id)
-            if resolution["status"] == "NOT_ADDRESSED":
-                unresolved.append(finding_id)
-        if seen_resolutions != expected:
-            raise DagError("a fix review must verdict every prior blocking finding exactly once")
-    elif value.get("resolutions"):
-        raise DagError("resolutions is legacy-only; new reviews must use finding_resolutions")
-    refusing = value["spec"] == "NEEDS_FIXES" or value["quality"] == "NEEDS_FIXES"
-    if refusing and not (value["blocking_findings"] or value["controller_decisions"] or unresolved):
-        raise DagError(
-            "review artifact refuses the node without naming a finding; a NEEDS_FIXES verdict "
-            "must record what is wrong and where"
-        )
     if value["spec"] == "CANNOT_VERIFY" and not value.get("contract_findings"):
         raise DagError("a CANNOT_VERIFY review must name at least one contract_findings entry")
     if value["spec"] != "CANNOT_VERIFY" and value.get("contract_findings"):
         raise DagError("contract_findings are only valid with a CANNOT_VERIFY spec verdict")
-    value["_unresolved_ids"] = unresolved
-    value["_legacy_resolutions"] = bool(legacy_resolutions)
     return value
 
 
@@ -1827,7 +1796,7 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     # hide an out-of-scope worker commit.
     initial_changed = checked_changes(args.dag, node, attempt, head_ref)
     review = validate_review_artifact(
-        args.dag, args.review_ref, node, head_ref, len(reviews) + 1, reviews[-1] if reviews else None
+        args.dag, args.review_ref, node, head_ref, len(reviews) + 1
     )
     if review.get("reviewer_fix_head") and not review.get("worker_head"):
         raise DagError("reviewer_fix_head requires an explicit worker_head")
@@ -1848,43 +1817,26 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     handoff_head = worker_head if review.get("worker_head") else head_ref
     validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, worker_changed if review.get("worker_head") else final_changed)
     escalations = review["controller_decisions"]
-    # A fix round is only meaningful when something inside scope is named, so the buckets
-    # decide the outcome before the verdict fields do.
+    # In-scope defects arrive already repaired by the reviewer, so the outcome turns on
+    # contract findings and escalations alone.
     resolutions = review.get("finding_resolutions", [])
     blocking_ids = {item["id"] for item in review["blocking_findings"]}
-    resolved_ids = {item["id"] for item in resolutions if item.get("status") == "ADDRESSED"}
     if review.get("reviewer_fix_head"):
-        prior_ids = set(reviews[-1].get("blocking_finding_ids", [])) if reviews and reviews[-1].get("outcome") == "needs_fixes" else set()
-        expected_ids = prior_ids or blocking_ids
         resolution_ids = {item["id"] for item in resolutions}
-        unknown = resolution_ids - expected_ids
-        missing = expected_ids - resolution_ids
+        unknown = resolution_ids - blocking_ids
+        missing = blocking_ids - resolution_ids
         if unknown:
             raise DagError("reviewer fix has unknown finding resolutions: " + ", ".join(sorted(unknown)))
         if missing:
             raise DagError("reviewer fix must resolve every blocking finding exactly once: " + ", ".join(sorted(missing)))
-        if prior_ids and blocking_ids - prior_ids:
-            raise DagError(
-                "reviewer fix cannot introduce new blocking findings: "
-                + ", ".join(sorted(blocking_ids - prior_ids))
-            )
-        if any(item.get("status") != "ADDRESSED" for item in resolutions):
-            raise DagError("reviewer fix must mark every blocking finding ADDRESSED")
-    elif resolutions and not (reviews and reviews[-1].get("outcome") == "needs_fixes"):
-        raise DagError("finding_resolutions require a reviewer_fix_head in a new review")
-    unresolved_reviewer_fixes = {
-        item["id"] for item in resolutions if item.get("status") == "NOT_ADDRESSED"
-    }
-    if (review["blocking_findings"] and not review.get("reviewer_fix_head")) or review["_unresolved_ids"] or unresolved_reviewer_fixes:
-        outcome = "needs_fixes"
-    elif review["spec"] == "CANNOT_VERIFY":
+    elif resolutions:
+        raise DagError("finding_resolutions require a reviewer_fix_head")
+    if review["spec"] == "CANNOT_VERIFY":
         outcome = "cannot_verify"
     elif escalations:
         outcome = "escalated"
     else:
         outcome = "approved"
-    if reviews and reviews[-1]["outcome"] == "needs_fixes" and reviews[-1]["head_ref"] == head_ref:
-        raise DagError("a needs_fixes re-review requires a new head commit")
     now = utc_now()
     reviews.append(
         {
@@ -1896,9 +1848,7 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
             "worker_head": worker_head,
             "reviewer_fix_head": reviewer_fix_head,
             "escalated_paths": sorted({finding["path"] for finding in escalations}),
-            "blocking_finding_ids": sorted(
-                {finding["id"] for finding in review["blocking_findings"]} | set(review["_unresolved_ids"])
-            ),
+            "blocking_finding_ids": sorted(blocking_ids),
             "contract_finding_ids": sorted(finding["id"] for finding in review.get("contract_findings", [])),
             "reviewed_at": now,
         }

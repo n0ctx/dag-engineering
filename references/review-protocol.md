@@ -10,7 +10,8 @@ Provide only these inputs:
 - immutable `base_ref..worker_head` diff and changed paths;
 - the structured handoff;
 - relevant verification evidence;
-- output paths.
+- output paths;
+- the node worktree path and expected branch, so the reviewer can commit its fix there.
 
 Do not attach a controller summary, restated contract, whole DAG, unrelated reports, chat history, or worker reasoning. Review against the original contract.
 
@@ -18,7 +19,7 @@ Do not attach a controller summary, restated contract, whole DAG, unrelated repo
 
 The controller starts the reviewer prompt with this fixed preamble:
 
-> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and log every such read in `checks_performed`. Re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes a recorded finding naming the exact missing context — never a reason to keep exploring.
+> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and log every such read in `checks_performed`. Re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes a recorded finding naming the exact missing context — never a reason to keep exploring. Repair every in-scope defect you find in one commit on the node branch; the runtime rejects a review that reports in-scope defects without fixing them. A defect you cannot safely repair belongs in `controller_decisions`, not in `blocking_findings`.
 
 Checklist, in order:
 
@@ -36,11 +37,11 @@ Disclose every finding completely before deciding the verdict. A user's explicit
 
 Put findings in the path-appropriate field:
 
-- `blocking_findings`: an in-scope defect the reviewer may safely repair;
+- `blocking_findings`: an in-scope defect the reviewer repairs in its own fix commit;
 - `controller_decisions`: an out-of-scope, forbidden-scope, contract, unsafe-repair, or changed-caller problem the controller must resolve;
 - `out_of_scope_observations`: unrelated observations that are not caused by this diff and do not block the node.
 
-Do not send an in-scope repair back for another worker round. The reviewer may make at most one independent fix commit, entirely within scope, and must provide one `ADDRESSED` resolution for each original in-scope blocking finding. The reviewer cannot approve that fix; the controller performs the final acceptance check. An escalation does not complete the node.
+In-scope repairs never go back to the worker. The reviewer repairs every in-scope blocking finding in the same session: at most one independent fix commit, entirely within scope, with one `ADDRESSED` resolution per blocking finding. There is no report-only fix round — the runtime rejects a review whose blocking findings lack a fix commit. The reviewer cannot approve that fix; the controller performs the final acceptance check. An escalation does not complete the node.
 
 ## Review artifact
 
@@ -53,8 +54,7 @@ Save a project-relative JSON artifact and include the final reviewed head:
   "head_ref": "full final Git commit SHA",
   "worker_head": "full worker Git commit SHA",
   "reviewer_fix_head": null,
-  "spec": "APPROVED | NEEDS_FIXES | CANNOT_VERIFY",
-  "quality": "APPROVED | NEEDS_FIXES",
+  "spec": "APPROVED | CANNOT_VERIFY",
   "blocking_findings": [],
   "finding_resolutions": [],
   "controller_decisions": [],

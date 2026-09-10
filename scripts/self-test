@@ -125,8 +125,8 @@ class RuntimeTests(unittest.TestCase):
             ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
         ).stdout.strip()
 
-    def artifacts(self, node_id, head, *, round_number=1, approved=True,
-                  blocking=None, escalations=None, context_used=(), contract=()):
+    def artifacts(self, node_id, head, *, round_number=1,
+                  blocking=(), escalations=None, context_used=(), contract=()):
         folder = self.root / ".dag" / "artifacts" / node_id
         folder.mkdir(parents=True, exist_ok=True)
         handoff = folder / f"handoff-{round_number}.json"
@@ -143,10 +143,6 @@ class RuntimeTests(unittest.TestCase):
             "downstream_notes": [],
             "commit": head,
         }), encoding="utf-8")
-        if blocking is None:
-            blocking = [] if approved else [
-                {"id": f"code-{round_number}", "severity": "critical", "path": f"src/{node_id}.py", "detail": "fixture defect"}
-            ]
         blocking = [
             {"id": finding.get("id", f"code-{index}"), **finding}
             for index, finding in enumerate(blocking, 1)
@@ -159,28 +155,17 @@ class RuntimeTests(unittest.TestCase):
             {"id": finding.get("id", f"contract-{index}"), **finding}
             for index, finding in enumerate(contract, 1)
         ]
-        resolutions = []
-        if round_number > 1:
-            state = json.loads(self.path.read_text())
-            current = next(item for item in state["nodes"] if item["id"] == node_id)
-            previous = current["attempts"][-1]["reviews"][-1]
-            resolutions = [
-                {"id": finding_id, "status": "ADDRESSED", "detail": "fixed in this head"}
-                for finding_id in previous.get("blocking_finding_ids", [])
-            ]
         review = folder / f"review-{round_number}.json"
         review.write_text(json.dumps({
             "node": node_id,
             "head_ref": head,
             "round": round_number,
-            "spec": "CANNOT_VERIFY" if contract else ("APPROVED" if approved else "NEEDS_FIXES"),
-            "quality": "APPROVED" if approved else "NEEDS_FIXES",
+            "spec": "CANNOT_VERIFY" if contract else "APPROVED",
             "blocking_findings": blocking,
             "controller_decisions": escalations,
             "contract_findings": contract,
             "minor_findings": [],
             "out_of_scope_observations": [],
-            "resolutions": resolutions,
         }), encoding="utf-8")
         master = folder / "master.json"
         master.write_text(json.dumps({
@@ -1251,12 +1236,14 @@ class RuntimeTests(unittest.TestCase):
         self.write(dag([node("A")]))
         self.start("A")
         head = self.commit_node("A")
-        handoff, review, master = self.artifacts("A", head, approved=False)
+        handoff, review, master = self.artifacts("A", head, blocking=[
+            {"severity": "critical", "path": "src/A.py", "detail": "fixture defect"},
+        ])
         result = self.run_cmd(
             "update-task", "A", "review", "--handoff-ref", handoff,
-            "--review-ref", review, "--head-ref", head,
+            "--review-ref", review, "--head-ref", head, expect=3,
         )
-        self.assertIn("needs_fixes", result.stdout)
+        self.assertIn("blocking findings require a reviewer fix commit", result.stderr)
         self.run_cmd(
             "update-task", "A", "done", "--handoff-ref", handoff,
             "--verification-ref", master, "--head-ref", head, "--summary", "not done", expect=3,
@@ -1321,11 +1308,27 @@ class RuntimeTests(unittest.TestCase):
         node_state = next(n for n in json.loads(self.path.read_text())["nodes"] if n["id"] == node_id)
         return node_state["attempts"][-1]["reviews"][-1]
 
+    def review_with_fix(self, node_id, blocking, resolutions, expect=0):
+        worker = self.commit_node(node_id)
+        fix = self.commit_node(node_id)
+        handoff, review, _ = self.artifacts(node_id, worker, blocking=blocking)
+        report = json.loads((self.root / review).read_text())
+        report["head_ref"] = fix
+        report["worker_head"] = worker
+        report["reviewer_fix_head"] = fix
+        report["finding_resolutions"] = resolutions
+        (self.root / review).write_text(json.dumps(report), encoding="utf-8")
+        result = self.run_cmd(
+            "update-task", node_id, "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", fix, expect=expect,
+        )
+        return result, worker, fix
+
     def test_blocking_finding_must_be_inside_node_scope(self):
         self.write(dag([node("A")]))
         self.start("A")
         head = self.commit_node("A")
-        result = self.review("A", head, approved=False, expect=3, blocking=[
+        result = self.review("A", head, expect=3, blocking=[
             {"severity": "critical", "path": "src/other.py", "detail": "caller breaks"},
         ])
         self.assertIn("record it under controller_decisions", result.stderr)
@@ -1334,7 +1337,7 @@ class RuntimeTests(unittest.TestCase):
         self.write(dag([node("A")]))
         self.start("A")
         head = self.commit_node("A")
-        result = self.review("A", head, approved=False, expect=3, blocking=[
+        result = self.review("A", head, expect=3, blocking=[
             {"severity": "critical", "detail": "something is wrong"},
         ])
         self.assertIn("path: must be the project-relative file", result.stderr)
@@ -1417,122 +1420,84 @@ class RuntimeTests(unittest.TestCase):
             "--summary", "A delivered",
         )
 
-    def test_fix_review_must_verdict_each_prior_finding(self):
+    def test_fix_review_must_resolve_every_blocking_finding(self):
         self.write(dag([node("A")]))
         self.start("A")
-        first = self.commit_node("A")
-        self.review("A", first, approved=False)
-        second = self.commit_node("A")
-        handoff, review, _ = self.artifacts("A", second, round_number=2)
-        report = json.loads((self.root / review).read_text())
-        report["resolutions"] = []
-        (self.root / review).write_text(json.dumps(report), encoding="utf-8")
-        result = self.run_cmd(
-            "update-task", "A", "review", "--handoff-ref", handoff,
-            "--review-ref", review, "--head-ref", second, expect=3,
+        result, _, _ = self.review_with_fix(
+            "A",
+            blocking=[
+                {"severity": "critical", "path": "src/A.py", "detail": "first defect"},
+                {"severity": "critical", "path": "src/A.py", "detail": "second defect"},
+            ],
+            resolutions=[{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}],
+            expect=3,
         )
-        self.assertIn("every prior blocking finding", result.stderr)
+        self.assertIn("must resolve every blocking finding", result.stderr)
 
     def test_reviewer_fix_must_be_an_independent_commit(self):
         self.write(dag([node("A")]))
         self.start("A")
-        first = self.commit_node("A")
-        self.review("A", first, approved=False)
-        second = self.commit_node("A")
-        handoff, review, _ = self.artifacts("A", second, round_number=2)
+        head = self.commit_node("A")
+        handoff, review, _ = self.artifacts("A", head, blocking=[
+            {"severity": "critical", "path": "src/A.py", "detail": "fixture defect"},
+        ])
         report = json.loads((self.root / review).read_text())
-        report["worker_head"] = second
-        report["reviewer_fix_head"] = second
-        report["resolutions"] = [{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}]
+        report["worker_head"] = head
+        report["reviewer_fix_head"] = head
+        report["finding_resolutions"] = [{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}]
         (self.root / review).write_text(json.dumps(report), encoding="utf-8")
         result = self.run_cmd(
             "update-task", "A", "review", "--handoff-ref", handoff,
-            "--review-ref", review, "--head-ref", second, expect=3,
+            "--review-ref", review, "--head-ref", head, expect=3,
         )
         self.assertIn("independent commit", result.stderr)
-
-    def test_reviewer_fix_cannot_hide_a_new_blocking_finding(self):
-        self.write(dag([node("A")]))
-        self.start("A")
-        first = self.commit_node("A")
-        self.review("A", first, approved=False)
-        second = self.commit_node("A")
-        handoff, review, _ = self.artifacts("A", first, round_number=2)
-        report = json.loads((self.root / review).read_text())
-        report["head_ref"] = second
-        report["worker_head"] = first
-        report["reviewer_fix_head"] = second
-        report["blocking_findings"] = [{
-            "id": "new-defect", "severity": "critical", "path": "src/A.py", "detail": "new defect"
-        }]
-        report["resolutions"] = [{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}]
-        (self.root / review).write_text(json.dumps(report), encoding="utf-8")
-        result = self.run_cmd(
-            "update-task", "A", "review", "--handoff-ref", handoff,
-            "--review-ref", review, "--head-ref", second, expect=3,
-        )
-        self.assertIn("cannot introduce new blocking findings", result.stderr)
 
     def test_single_review_can_record_worker_and_reviewer_fix(self):
         self.write(dag([node("A")]))
         self.start("A")
-        worker = self.commit_node("A")
-        reviewer_fix = self.commit_node("A")
-        folder = self.root / ".dag" / "artifacts" / "A"
-        folder.mkdir(parents=True, exist_ok=True)
-        handoff = folder / "handoff-single.json"
-        handoff.write_text(json.dumps({
-            "node": "A", "status": "DONE", "files_changed": ["src/A.py"],
-            "outputs": ["output A"], "decisions": [],
-            "verification": [{"command": "fixture check", "result": "exit 0"}],
-            "context_used": [], "concerns": [], "unresolved": [], "downstream_notes": [],
-            "commit": worker,
-        }), encoding="utf-8")
-        review = folder / "review-single.json"
-        review.write_text(json.dumps({
-            "node": "A", "round": 1, "head_ref": reviewer_fix,
-            "worker_head": worker, "reviewer_fix_head": reviewer_fix,
-            "spec": "NEEDS_FIXES", "quality": "NEEDS_FIXES",
-            "blocking_findings": [{"id": "code-1", "severity": "critical", "path": "src/A.py", "detail": "defect"}],
-            "finding_resolutions": [{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}],
-            "controller_decisions": [], "contract_findings": [], "minor_findings": [],
-            "out_of_scope_observations": [],
-        }), encoding="utf-8")
-        result = self.run_cmd(
-            "update-task", "A", "review", "--handoff-ref", str(handoff.relative_to(self.root)),
-            "--review-ref", str(review.relative_to(self.root)), "--head-ref", reviewer_fix,
+        result, worker, fix = self.review_with_fix(
+            "A",
+            blocking=[{"severity": "critical", "path": "src/A.py", "detail": "defect"}],
+            resolutions=[{"id": "code-1", "status": "ADDRESSED", "detail": "fixed"}],
         )
         self.assertIn("approved", result.stdout)
         saved = json.loads(self.path.read_text())["nodes"][0]["attempts"][0]
         self.assertEqual(saved["worker_head"], worker)
-        self.assertEqual(saved["reviewer_fix_head"], reviewer_fix)
+        self.assertEqual(saved["reviewer_fix_head"], fix)
 
-    def test_both_finding_buckets_yield_needs_fixes(self):
+    def test_blocking_findings_require_a_reviewer_fix(self):
         self.write(dag([node("A")]))
         self.start("A")
         head = self.commit_node("A")
-        self.review("A", head, approved=False, escalations=[
+        result = self.review("A", head, expect=3, blocking=[
+            {"severity": "critical", "path": "src/A.py", "detail": "fixture defect"},
+        ], escalations=[
             {"severity": "important", "path": "src/caller.py", "detail": "caller breaks"},
         ])
-        review = self.last_review("A")
-        self.assertEqual(review["outcome"], "needs_fixes")
-        self.assertEqual(review["escalated_paths"], ["src/caller.py"])
+        self.assertIn("blocking findings require a reviewer fix commit", result.stderr)
 
-    def test_refusal_verdict_with_only_escalations_does_not_start_a_fix_round(self):
+    def test_needs_fixes_verdict_is_retired(self):
         self.write(dag([node("A")]))
         self.start("A")
         head = self.commit_node("A")
-        self.review("A", head, approved=False, blocking=[], escalations=[
+        handoff, review, _ = self.artifacts("A", head)
+        report = json.loads((self.root / review).read_text())
+        report["spec"] = "NEEDS_FIXES"
+        (self.root / review).write_text(json.dumps(report), encoding="utf-8")
+        result = self.run_cmd(
+            "update-task", "A", "review", "--handoff-ref", handoff,
+            "--review-ref", review, "--head-ref", head, expect=3,
+        )
+        self.assertIn("APPROVED or CANNOT_VERIFY", result.stderr)
+
+    def test_escalations_without_blocking_yield_escalated(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, escalations=[
             {"severity": "important", "path": "src/caller.py", "detail": "A's signature broke this caller"},
         ])
         self.assertEqual(self.last_review("A")["outcome"], "escalated")
-
-    def test_refusal_verdict_must_name_a_finding(self):
-        self.write(dag([node("A")]))
-        self.start("A")
-        head = self.commit_node("A")
-        result = self.review("A", head, approved=False, blocking=[], expect=3)
-        self.assertIn("without naming a finding", result.stderr)
 
     def test_control_plane_commits_do_not_count_as_node_scope(self):
         self.write(dag([node("A")]))

@@ -60,6 +60,13 @@ def dag(nodes):
         "planning_session": None,
         "decomposition_review": None,
         "max_parallel": 3,
+        "execution_tiering": {
+            "version": 1,
+            "nodes": {
+                item["id"]: {"executor_class": "tier2", "estimated_active_minutes": 5}
+                for item in nodes
+            },
+        },
         "created_at": timestamp,
         "updated_at": timestamp,
         "convergence": {"status": "pending", "verification_ref": None, "checked_at": None, "gaps": []},
@@ -217,6 +224,35 @@ class RuntimeTests(unittest.TestCase):
             result = self.run_cmd("validate-dag", expect=1)
             self.assertIn(message, result.stderr)
 
+    def test_execution_tiering_validates_estimate_and_scope(self):
+        value = dag([node("A")])
+        value["execution_tiering"]["nodes"]["A"]["estimated_active_minutes"] = 16
+        self.write(value)
+        result = self.run_cmd("validate-dag", expect=1)
+        self.assertIn("tier2 requires an integer from 5 to 15", result.stderr)
+
+        for index in range(9):
+            self.track(f"src/tier2-{index}.py", "VALUE = 1\n")
+        value = dag([node("A", files=["src/tier2-*.py"])])
+        self.write(value)
+        result = self.run_cmd("preflight-plan", expect=1)
+        self.assertIn("tier2 scope covers 9 tracked file(s), limit is 8", result.stderr)
+
+    def test_init_requires_execution_tiering(self):
+        value = dag([node("A")])
+        value["planning_status"] = "awaiting_approval"
+        value["approval_ref"] = None
+        del value["execution_tiering"]
+        result = self.run_cmd("update-task", "--init", self.draft(value), expect=3)
+        self.assertIn("new DAG must declare execution_tiering", result.stderr)
+
+        value = dag([node("A")])
+        value["planning_status"] = "awaiting_approval"
+        value["approval_ref"] = None
+        value["execution_tiering"]["nodes"] = {}
+        result = self.run_cmd("update-task", "--init", self.draft(value), expect=3)
+        self.assertIn("missing profile(s): A", result.stderr)
+
     def test_plan_surfaces_include_execution_plan_and_fingerprint(self):
         self.write(dag([node("A")]))
         brief = json.loads(self.run_cmd("status", "--node", "A").stdout)
@@ -225,11 +261,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("execution_plan", brief["contract"])
         self.assertIn("execution_plan", view["nodes"][0])
         self.assertIn("execution_plan", request["nodes"][0])
+        self.assertEqual(
+            brief["executor_profile"],
+            {"executor_class": "tier2", "estimated_active_minutes": 5},
+        )
+        self.assertIn("execution_tiering", view)
+        self.assertIn("execution_tiering", request)
         for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
             self.assertIn(field, request)
         before = view["plan_fingerprint"]
         changed = json.loads(self.path.read_text())
         changed["nodes"][0]["execution_plan"] = ["A different step"]
+        self.write(changed)
+        self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
+
+        before = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
+        changed = json.loads(self.path.read_text())
+        changed["execution_tiering"]["nodes"]["A"]["estimated_active_minutes"] = 6
         self.write(changed)
         self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
 

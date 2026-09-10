@@ -69,6 +69,8 @@ Persist questions, answers, source facts, and resulting decisions in `.dag/sourc
 
 Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally 1–6 ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
 
+Every newly created DAG also declares `execution_tiering.version: 1` and one profile per node. Use `micro` only for a 2–5 minute mechanical leaf, `tier2` only for a 5–15 minute decision-free leaf, and reserve `senior` or `controller` for an explicit design decision or graph-wide convergence. A `tier2` node must have one behavior, one bounded ownership surface, complete `read_first` context, and a defined `NEEDS_CONTEXT` stop; split it otherwise. Runtime rejects missing profiles, invalid estimates, and `micro`/`tier2` scopes wider than their limits before review or approval.
+
 ## 4. Draft and validate
 
 Write `.dag/draft.json`, then let the runtime install it:

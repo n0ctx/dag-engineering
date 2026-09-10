@@ -25,6 +25,14 @@ HARD_MAX_PARALLEL = 3
 READ_FIRST_CHAR_LIMIT = 120000
 SCOPE_FILE_LIMIT = 200
 SCOPE_LINE_LIMIT = 20000
+EXECUTOR_CLASSES = {"micro", "tier2", "senior", "controller"}
+EXECUTOR_MINUTES = {
+    "micro": (2, 5),
+    "tier2": (5, 15),
+    "senior": (1, 60),
+    "controller": (1, 60),
+}
+TIER_SCOPE_FILE_LIMITS = {"micro": 3, "tier2": 8}
 PLANNING_STATUSES = {
     "draft",
     "awaiting_approval",
@@ -641,8 +649,63 @@ def plan_fingerprint(dag: dict[str, Any]) -> str:
             for node in sorted(dag.get("nodes", []), key=lambda item: item.get("id") or "")
         ],
     }
+    if "execution_tiering" in dag:
+        shape["execution_tiering"] = dag["execution_tiering"]
     payload = json.dumps(shape, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_execution_tiering(
+    errors: list[str], dag: dict[str, Any], *, require_complete: bool = False
+) -> None:
+    """Validate the opt-in profile required for newly created DAGs.
+
+    Existing control planes predate execution tiers and stay readable. New
+    control planes must declare the profile at init time below.
+    """
+    policy = dag.get("execution_tiering")
+    if policy is None:
+        return
+    if not isinstance(policy, dict):
+        errors.append("execution_tiering: must be an object")
+        return
+    if policy.get("version") != 1:
+        errors.append("execution_tiering.version: must be 1")
+    profiles = policy.get("nodes")
+    if not isinstance(profiles, dict):
+        errors.append("execution_tiering.nodes: must be an object keyed by node ID")
+        return
+    raw_nodes = dag.get("nodes")
+    node_ids = {
+        node.get("id")
+        for node in raw_nodes
+        if isinstance(node, dict) and is_text(node.get("id"))
+    } if isinstance(raw_nodes, list) else set()
+    profile_ids = set(profiles)
+    if require_complete:
+        missing = sorted(node_ids - profile_ids)
+        extra = sorted(profile_ids - node_ids)
+        if missing:
+            errors.append("execution_tiering.nodes: missing profile(s): " + ", ".join(missing))
+        if extra:
+            errors.append("execution_tiering.nodes: unknown profile(s): " + ", ".join(extra))
+    for node_id in sorted(node_ids & profile_ids):
+        profile = profiles[node_id]
+        label = f"execution_tiering.nodes.{node_id}"
+        if not isinstance(profile, dict):
+            errors.append(f"{label}: must be an object")
+            continue
+        executor_class = profile.get("executor_class")
+        if executor_class not in EXECUTOR_CLASSES:
+            errors.append(f"{label}.executor_class: must be one of {', '.join(sorted(EXECUTOR_CLASSES))}")
+            continue
+        minutes = profile.get("estimated_active_minutes")
+        minimum, maximum = EXECUTOR_MINUTES[executor_class]
+        if not isinstance(minutes, int) or isinstance(minutes, bool) or not minimum <= minutes <= maximum:
+            errors.append(
+                f"{label}.estimated_active_minutes: {executor_class} requires an integer "
+                f"from {minimum} to {maximum}"
+            )
 
 
 def validate_design_review_artifact(
@@ -1035,6 +1098,7 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                     f"source_refs[{index}]: must be a durable project path, URL, issue ID, or commit reference"
                 )
     expect_string_list(errors, dag.get("assumptions"), "assumptions")
+    validate_execution_tiering(errors, dag)
     validate_criteria(errors, dag.get("global_acceptance"), "global_acceptance")
 
     planning_status = dag.get("planning_status")
@@ -1450,6 +1514,26 @@ def plan_preflight(dag_path: Path, dag: dict[str, Any]) -> tuple[list[str], list
                 errors.append(
                     f"{label}.run duplicates the scope gate with git diff; declare scope.files and use check-scope"
                 )
+    policy = dag.get("execution_tiering")
+    if isinstance(policy, dict) and isinstance(policy.get("nodes"), dict):
+        try:
+            sizes = context_size(root, dag.get("nodes", []))
+        except DagError as exc:
+            errors.append(f"execution_tiering: cannot measure scope: {exc}")
+        else:
+            for node in dag.get("nodes", []):
+                if not isinstance(node, dict) or not is_text(node.get("id")):
+                    continue
+                profile = policy["nodes"].get(node["id"])
+                if not isinstance(profile, dict):
+                    continue
+                executor_class = profile.get("executor_class")
+                maximum = TIER_SCOPE_FILE_LIMITS.get(executor_class)
+                if maximum is not None and sizes[node["id"]]["scope_files"] > maximum:
+                    errors.append(
+                        f"{node['id']}: {executor_class} scope covers "
+                        f"{sizes[node['id']]['scope_files']} tracked file(s), limit is {maximum}; split the node"
+                    )
     return errors, warnings
 
 
@@ -2248,6 +2332,15 @@ def init_dag(dag_path: Path, draft_ref: str) -> str:
     errors, _ = validate_dag(candidate)
     if errors:
         raise DagError("draft is not a valid DAG: " + "; ".join(errors))
+    if "execution_tiering" not in candidate:
+        raise DagError(
+            "new DAG must declare execution_tiering with one profile per node; "
+            "legacy DAGs remain readable but cannot be created without it"
+        )
+    tier_errors: list[str] = []
+    validate_execution_tiering(tier_errors, candidate, require_complete=True)
+    if tier_errors:
+        raise DagError("new DAG execution_tiering is invalid: " + "; ".join(tier_errors))
     if candidate["planning_status"] not in {"draft", "awaiting_approval"}:
         raise DagError(
             f"a new control file starts as 'draft' or 'awaiting_approval', not "
@@ -2773,6 +2866,7 @@ def node_brief(dag: dict[str, Any], dag_path: Path, node_id: str) -> dict[str, A
         "dag_id": dag["dag_id"],
         "status": node["status"],
         "attempt": len(node["attempts"]),
+        "executor_profile": (dag.get("execution_tiering") or {}).get("nodes", {}).get(node_id),
         "contract": {field: node[field] for field in PLAN_NODE_FIELDS},
         "upstream": [
             {
@@ -2798,7 +2892,7 @@ def plan_view(dag: dict[str, Any]) -> dict[str, Any]:
     what it can be spared is the execution state, and being spared it is also what stops the
     review from drifting into judging the work instead of the plan.
     """
-    return {
+    view = {
         **{field: dag[field] for field in PLAN_VIEW_FIELDS},
         "plan_fingerprint": plan_fingerprint(dag),
         "nodes": [
@@ -2806,10 +2900,15 @@ def plan_view(dag: dict[str, Any]) -> dict[str, Any]:
             for node in dag["nodes"]
         ],
     }
+    if "execution_tiering" in dag:
+        view["execution_tiering"] = dag["execution_tiering"]
+    return view
 
 
 def review_request_view(dag: dict[str, Any]) -> dict[str, Any]:
     plan = {field: dag[field] for field in PLAN_VIEW_FIELDS}
+    if "execution_tiering" in dag:
+        plan["execution_tiering"] = dag["execution_tiering"]
     review = dag.get("decomposition_review") or {}
     if review.get("verdict") is None and review.get("mode") == "repair":
         affected = set(review["affected_nodes"])

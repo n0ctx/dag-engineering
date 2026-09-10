@@ -21,6 +21,8 @@ Do not send the whole DAG, chat history, unrelated upstream reports, worker reas
 
 `execution_plan` is a non-empty string array supplied by the controller: each string is one concrete route step for a low-cost worker. An equivalent local implementation is allowed, but the worker must stop and report `NEEDS_CONTEXT` before changing `scope`, interfaces, outputs, architecture, or acceptance. Such a change requires controller-led revise/replan; it is never an implicit worker decision.
 
+- When `executor_profile` is present, stay within its estimated active time; a new design choice or a wider scope is `NEEDS_CONTEXT`, not an implicit extension.
+
 ## Worker protocol
 
 Use the fixed prefix supplied by the controller: read `read_first`, follow `execution_plan`, write only paths matched by `scope.files`, report conflicts as `NEEDS_CONTEXT`, run verification, commit, and write handoff. Do the work directly; do not dispatch subagents or a reviewer.

@@ -24,6 +24,8 @@ Trust Git, project artifacts, and the DAG over chat recollection. Reconcile ever
 
 ## Select and dispatch
 
+派发前追加以下读取边界：合同已经直接写出的结论就是 worker 的工作事实；除 `read_first` 外最多再读 5 个文件，每个文件只为落实一个具名主张或验收问题，不得做仓库调查。`scope.files` 是写边界；`scope.forbidden` 只是其他节点的写保护区，不是阅读任务，也不要为了熟悉上下文主动打开。若在预算内仍有不影响合同完成的未决问题，完成工作并在 handoff 以 `DONE_WITH_CONCERNS` 登记主张、证据和残余风险；只有问题阻塞合同或要求改变合同、scope、接口或架构时才返回 `NEEDS_CONTEXT`。
+
 Use:
 
 ```bash

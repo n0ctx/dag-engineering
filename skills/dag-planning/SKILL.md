@@ -67,6 +67,8 @@ Persist questions, answers, source facts, and resulting decisions in `.dag/sourc
 
 ## 3. Decompose
 
+合同信息密度规则：凡来源材料已经确定、且 fresh worker 可直接执行或判断的结论，写入节点现有的 `objective`、`inputs`、`outputs`、`acceptance` 或 `execution_plan`。结论只有在明确给出相关值、条件、边界或可观察结果时才算“能直接给”。`read_first` 只列合同无法直接表达、但验收或实现确实需要核对的最小证据文件；不要把它当通用背景阅读清单。
+
 Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally a few ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
 
 ## 4. Draft, install, and revise
@@ -97,6 +99,8 @@ A new request superseding an existing plan is not, by itself, a reason to abando
 Fix validator errors before presenting the plan. Preview coverage by mapping each source requirement and global acceptance criterion to nodes and verification paths, including integration work. Audit every technology or concrete interface, payload, status code, storage, or security choice against source evidence, an `assumptions` entry, or an investigation output.
 
 ## 5. Review the decomposition
+
+Context review must check that source-backed conclusions were placed directly in the node contract, and that each `read_first` entry supports a named unresolved judgment rather than broad context discovery.
 
 Before showing the plan, generate one review request package and dispatch one independent reviewer **with file-editing capability** to review the whole plan in one pass:
 

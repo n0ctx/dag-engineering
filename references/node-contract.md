@@ -4,6 +4,8 @@ The node contract is binding; the worker and reviewer report against it and cann
 
 ## Package
 
+合同是事实前置的：来源材料已经确定的结论必须直接写在现有合同字段中，使 worker 无需重新推导。`read_first` 只提供合同无法直接表达的最小证据入口；除它以外最多读取 5 个文件，每个文件对应一个具名主张或验收问题。`scope.files` 只规定可写路径；`scope.forbidden` 是写保护清单，不要求主动阅读。
+
 Run `status --node <id>` and forward its original node brief once. Do not reconstruct or paraphrase its fields. Add only:
 
 ```text
@@ -22,6 +24,8 @@ Do not send the whole DAG, chat history, unrelated upstream reports, worker reas
 `execution_plan` is a non-empty string array supplied by the controller: each string is one concrete route step for a low-cost worker. An equivalent local implementation is allowed, but the worker must stop and report `NEEDS_CONTEXT` before changing `scope`, interfaces, outputs, architecture, or acceptance. Such a change requires controller-led revise/replan; it is never an implicit worker decision.
 
 ## Worker protocol
+
+若合同足够完成工作、但读取预算耗尽后仍有不影响交付的未决问题，使用 `DONE_WITH_CONCERNS` 交付，并在 handoff 记录未决主张、已核对证据和残余风险；不要把这种情况默认升级为 `NEEDS_CONTEXT`。`NEEDS_CONTEXT` 仅用于问题阻塞合同，或必须改变合同、scope、接口或架构的情况。
 
 Use the fixed prefix supplied by the controller: read `read_first`, follow `execution_plan`, write only paths matched by `scope.files`, report conflicts as `NEEDS_CONTEXT`, run verification, commit, and write handoff. Do the work directly; do not dispatch subagents or a reviewer.
 

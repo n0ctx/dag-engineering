@@ -50,6 +50,8 @@ Use symmetric `conflicts_with` when concurrent activity is unsafe but neither no
 
 ## Independently executable contracts
 
+合同应直接携带可执行事实：来源已经确定的值、条件、边界和可观察结果，写入现有 `objective`、`inputs`、`outputs`、`acceptance` 或 `execution_plan`。只有 worker 必须重新打开来源才能判断的内容，才进入 `read_first`；每个条目都要对应一个具名主张。`scope.files` 是写边界，`scope.forbidden` 是写保护区，不是阅读清单。
+
 Use exact project-relative paths, interface names, durable upstream handoff references, and real verification commands. A technology or interface choice that sources do not establish belongs in `assumptions` or investigation output, never in a node contract as settled fact.
 
 Avoid:

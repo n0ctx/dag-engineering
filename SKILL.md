@@ -1,6 +1,6 @@
 ---
 name: dag-engineering
-description: Use only for large-scale, multi-session code engineering: turning a PRD, roadmap, or big refactor into a DAG, or continuing an effort tracked by .dag/dag.json. NOT for small or single-session tasks, quick fixes, single-file changes, non-code work, or any request a couple of tool calls can finish — handle those directly without this skill.
+description: "Use only for large-scale, multi-session code engineering: turning a PRD, roadmap, or big refactor into a DAG, or continuing an effort tracked by .dag/dag.json. NOT for small or single-session tasks, quick fixes, single-file changes, non-code work, or any request a couple of tool calls can finish — handle those directly without this skill."
 ---
 
 # DAG Engineering

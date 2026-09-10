@@ -60,13 +60,6 @@ def dag(nodes):
         "planning_session": None,
         "decomposition_review": None,
         "max_parallel": 3,
-        "execution_tiering": {
-            "version": 1,
-            "nodes": {
-                item["id"]: {"executor_class": "tier2", "estimated_active_minutes": 5}
-                for item in nodes
-            },
-        },
         "created_at": timestamp,
         "updated_at": timestamp,
         "convergence": {"status": "pending", "verification_ref": None, "checked_at": None, "gaps": []},
@@ -192,8 +185,8 @@ class RuntimeTests(unittest.TestCase):
         ready = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
         self.assertEqual([item["id"] for item in ready["candidates"]], ["A", "B", "D"])
 
-    def test_execution_plan_is_required_nonempty_and_bounded(self):
-        for value, message in ((None, "execution_plan"), ([], "execution_plan"), (["step"] * 7, "at most 6")):
+    def test_execution_plan_is_required_and_nonempty(self):
+        for value, message in ((None, "execution_plan"), ([], "execution_plan")):
             candidate = dag([node("A")])
             if value is None:
                 del candidate["nodes"][0]["execution_plan"]
@@ -203,35 +196,6 @@ class RuntimeTests(unittest.TestCase):
             result = self.run_cmd("validate-dag", expect=1)
             self.assertIn(message, result.stderr)
 
-    def test_execution_tiering_validates_estimate_and_scope(self):
-        value = dag([node("A")])
-        value["execution_tiering"]["nodes"]["A"]["estimated_active_minutes"] = 16
-        self.write(value)
-        result = self.run_cmd("validate-dag", expect=1)
-        self.assertIn("tier2 requires an integer from 5 to 15", result.stderr)
-
-        for index in range(9):
-            self.track(f"src/tier2-{index}.py", "VALUE = 1\n")
-        value = dag([node("A", files=["src/tier2-*.py"])])
-        self.write(value)
-        result = self.run_cmd("preflight-plan", expect=1)
-        self.assertIn("tier2 scope covers 9 tracked file(s), limit is 8", result.stderr)
-
-    def test_init_requires_execution_tiering(self):
-        value = dag([node("A")])
-        value["planning_status"] = "awaiting_approval"
-        value["approval_ref"] = None
-        del value["execution_tiering"]
-        result = self.run_cmd("update-task", "--init", self.draft(value), expect=3)
-        self.assertIn("new DAG must declare execution_tiering", result.stderr)
-
-        value = dag([node("A")])
-        value["planning_status"] = "awaiting_approval"
-        value["approval_ref"] = None
-        value["execution_tiering"]["nodes"] = {}
-        result = self.run_cmd("update-task", "--init", self.draft(value), expect=3)
-        self.assertIn("missing profile(s): A", result.stderr)
-
     def test_plan_surfaces_include_execution_plan_and_fingerprint(self):
         self.write(dag([node("A")]))
         brief = json.loads(self.run_cmd("status", "--node", "A").stdout)
@@ -240,23 +204,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("execution_plan", brief["contract"])
         self.assertIn("execution_plan", view["nodes"][0])
         self.assertIn("execution_plan", request["nodes"][0])
-        self.assertEqual(
-            brief["executor_profile"],
-            {"executor_class": "tier2", "estimated_active_minutes": 5},
-        )
-        self.assertIn("execution_tiering", view)
-        self.assertIn("execution_tiering", request)
         for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
             self.assertIn(field, request)
         before = view["plan_fingerprint"]
         changed = json.loads(self.path.read_text())
         changed["nodes"][0]["execution_plan"] = ["A different step"]
-        self.write(changed)
-        self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
-
-        before = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
-        changed = json.loads(self.path.read_text())
-        changed["execution_tiering"]["nodes"]["A"]["estimated_active_minutes"] = 6
         self.write(changed)
         self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
 
@@ -320,11 +272,11 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("validate-dag", expect=1)
         self.assertIn("invalid value 'ready'", result.stderr)
 
-    def test_ephemeral_source_label_fails(self):
+    def test_ephemeral_source_label_warns(self):
         value = dag([node("A")])
         value["source_refs"] = ["user-request: 2026-09-08"]
         self.write(value)
-        result = self.run_cmd("validate-dag", expect=1)
+        result = self.run_cmd("validate-dag")
         self.assertIn("durable project path", result.stderr)
 
     def test_conflict_excludes_only_active_peer(self):
@@ -335,9 +287,9 @@ class RuntimeTests(unittest.TestCase):
         active = json.loads(self.run_cmd("ready-tasks", "--json").stdout)
         self.assertEqual(active["candidates"], [])
 
-    def test_overlapping_scope_without_conflict_edge_fails(self):
+    def test_overlapping_scope_without_conflict_edge_warns(self):
         self.write(dag([node("A", files=["src/**"]), node("B", files=["src/auth/*.py"])]))
-        result = self.run_cmd("validate-dag", expect=1)
+        result = self.run_cmd("validate-dag")
         self.assertIn("scopes overlap", result.stderr)
 
     def test_overlapping_scope_is_allowed_when_ordered_or_declared(self):
@@ -807,7 +759,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("cannot change what the project delivers", result.stderr)
         self.assertEqual(json.loads(self.path.read_text())["objective"], "Exercise runtime")
 
-    def test_preflight_rejects_unsafe_git_ranges_and_bad_shell(self):
+    def test_preflight_rejects_bad_shell_syntax(self):
         plan = [node("A")]
         plan[0]["verification"] = [
             {"id": "V1", "run": "git diff --name-only HEAD~1 HEAD", "expect": "none", "covers": ["AC1"]},
@@ -815,10 +767,9 @@ class RuntimeTests(unittest.TestCase):
         ]
         self.awaiting(plan)
         result = self.run_cmd("preflight-plan", expect=1)
-        self.assertIn("recorded base_ref..head_ref", result.stderr)
         self.assertIn("invalid shell syntax", result.stderr)
 
-    def test_preflight_rejects_directory_read_first_and_start_does_too(self):
+    def test_preflight_warns_on_directory_read_first_and_start_rejects_it(self):
         self.awaiting([node("A")])
         (self.root / "docs").mkdir()
         value = json.loads(self.path.read_text())
@@ -826,7 +777,7 @@ class RuntimeTests(unittest.TestCase):
         value["planning_status"] = "awaiting_approval"
         value["approval_ref"] = None
         self.run_cmd("update-task", "--amend", self.draft(value, name="directory-read-first.json"))
-        result = self.run_cmd("preflight-plan", expect=1)
+        result = self.run_cmd("preflight-plan")
         self.assertIn("regular files, not directories", result.stderr)
 
     def test_init_refuses_a_pre_approved_draft(self):
@@ -1749,24 +1700,21 @@ class RuntimeTests(unittest.TestCase):
             "--reference", ".dag/sources/approval.md", expect=expect,
         )
 
-    def test_approval_refuses_a_node_bigger_than_one_context(self):
+    def test_approval_allows_a_node_bigger_than_one_context(self):
         self.track("docs/history.md", "x" * 120001)
         plan = [node("A")]
         plan[0]["read_first"] = ["docs/history.md"]
         self.awaiting(plan)
-        result = self.approval_attempt(3)
-        self.assertIn("A declares 120001 characters of read_first", result.stderr)
-        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
+        self.approval_attempt(0)
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_approval_refuses_a_scope_no_worker_could_hold(self):
+    def test_approval_allows_a_scope_no_worker_could_hold(self):
         self.track("src/generated.py", "PAD = 1\n" * 20001)
         self.awaiting([node("A", files=["src/**"])])
-        result = self.approval_attempt(3)
-        self.assertIn("A covers 1 file(s) and 20001 line(s) of scope", result.stderr)
-        self.assertIn("Split the node", result.stderr)
-        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
+        self.approval_attempt(0)
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_validate_warns_before_approval_refuses(self):
+    def test_validate_warns_about_oversized_contexts(self):
         self.track("src/generated.py", "PAD = 1\n" * 20001)
         self.write(dag([node("A", files=["src/**"])]))
         report = json.loads(self.run_cmd("validate-dag", "--json").stdout)

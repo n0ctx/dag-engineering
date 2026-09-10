@@ -29,7 +29,7 @@ Checklist, in order:
 4. Caller impact: only when the diff changes a caller-visible signature, return shape, or exception — run one targeted search for callers and read only the specific call sites at issue.
 5. Security, error handling, and unnecessary abstraction: judge from the diff itself, not from a codebase survey.
 
-Re-running the worker's full verification suite belongs to the controller's independent gate, not to review. For a `micro` or `tier2` node, stop after item 3 and escalate any remaining doubt as `unsure` instead of auditing design. Where the harness allows choosing the reviewer model, a cheaper model suffices for these checklist-only reviews.
+Re-running the worker's full verification suite belongs to the controller's independent gate, not to review. For a small, checklist-only node, stop after item 3 and escalate any remaining doubt as `unsure` instead of auditing design. Where the harness allows choosing the reviewer model, a cheaper model suffices for these checklist-only reviews.
 
 ## Findings and decisions
 

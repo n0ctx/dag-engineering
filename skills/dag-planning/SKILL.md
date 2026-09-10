@@ -67,9 +67,7 @@ Persist questions, answers, source facts, and resulting decisions in `.dag/sourc
 
 ## 3. Decompose
 
-Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally 1–6 ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
-
-Every newly created DAG also declares `execution_tiering.version: 1` and one profile per node. Use `micro` only for a 2–5 minute mechanical leaf, `tier2` only for a 5–15 minute decision-free leaf, and reserve `senior` or `controller` for an explicit design decision or graph-wide convergence. A `tier2` node must have one behavior, one bounded ownership surface, complete `read_first` context, and a defined `NEEDS_CONTEXT` stop; split it otherwise. Runtime rejects missing profiles, invalid estimates, and `micro`/`tier2` scopes wider than their limits before review or approval.
+Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally a few ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
 
 ## 4. Draft and validate
 
@@ -111,6 +109,8 @@ Record the verdict and the reviewer's own fixes in one step; pass the draft only
 ```
 
 The runtime validates the review against the current fingerprint, applies the draft under the amendment protections (the execution record, attempted and done nodes, and the deliverable fields cannot change), and derives the verdict: any `unsure` entry means `needs_changes`; otherwise `approved`. The reviewer's own fixes need no further repair round. Remaining `unsure` items are resolved by amending the plan, not by abandoning and recreating it; an amendment clears the verdict and the next repair review includes only affected nodes and lanes.
+
+The loop is bounded: one full review, one controller amendment settling what the review left open, and at most one repair review of that amendment. Anything still open after the repair review is not sent into another round — the controller amends it closed on its own judgment and carries the item to the approval gate, where the user's durable decision overrides a `needs_changes` verdict.
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --amend ".dag/draft.json"

@@ -8,19 +8,15 @@ The required root fields are `schema_version`, `dag_id`, `objective`, `source_re
 
 `planning_status` is `draft`, `awaiting_approval`, `approved`, `replan_required`, or `complete`. `convergence.status` is `pending`, `failed`, or `passed`; a failed result retains its `gaps` until explicit gap nodes and a later convergence review close them. `approval_ref` is the durable user approval or decision reference and may be null before approval. Timestamps are UTC RFC 3339 values ending in `Z`.
 
-## Execution tiering
-
-New DAGs must include `execution_tiering`; legacy DAGs without it remain readable. Its `version` is `1`, and `nodes` maps every node ID exactly once to an object with `executor_class` and `estimated_active_minutes`. `micro` is 2–5 minutes and may cover at most 3 tracked scope files; `tier2` is 5–15 minutes and may cover at most 8. `senior` and `controller` are 1–60 minutes and are reserved for explicit design decisions and graph-wide convergence. Minutes mean active agent time, not test wall time. The runtime validates profiles, includes them in review fingerprints, and refuses to create a new DAG without them.
-
 ## Node contract
 
 Each node contains `id`, `title`, `objective`, `execution_plan`, `work_type`, `scope`, `read_first`, `depends_on`, `conflicts_with`, `inputs`, `outputs`, `acceptance`, `verification`, `status`, `attempts`, and `handoff`.
 
-`execution_plan` is a required non-empty string array; every step is non-empty and the validator limits it to six steps. It appears in the node brief, plan view, review request, and plan fingerprint. It describes execution within one node and is not a cross-node interface, so changing only this field does not trigger downstream interface review.
+`execution_plan` is a required non-empty string array; every step is non-empty. It appears in the node brief, plan view, review request, and plan fingerprint. It describes execution within one node and is not a cross-node interface, so changing only this field does not trigger downstream interface review.
 
 `work_type` is `implementation`, `investigation`, `integration`, or `documentation`. Node status is `pending`, `running`, `done`, `failed`, or `blocked`. Contracts for `pending`, `failed`, and `blocked` nodes may be revised. `running` and `done` contracts are frozen. Dependencies reference existing nodes, conflicts are symmetric, and the graph must be acyclic. Parallel scopes may not overlap unless ordered or explicitly conflicted.
 
-Paths in `scope.files`, `scope.forbidden`, and `read_first` are safe project-relative paths or globs. `scope.files`, `acceptance`, `verification`, and `outputs` are non-empty. Every verification covers an acceptance criterion. Read context and scope limits are enforced before dispatch.
+Paths in `scope.files`, `scope.forbidden`, and `read_first` are safe project-relative paths or globs. `scope.files`, `acceptance`, `verification`, and `outputs` are non-empty. Every verification covers an acceptance criterion. Read context and scope size are measured and reported before dispatch.
 
 ## Attempts, handoff, and evidence
 

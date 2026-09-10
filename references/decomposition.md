@@ -28,10 +28,6 @@ For this DAG, a good node also has:
 
 Combine mechanically identical, same-shaped edits on one review surface. Split outcomes that could receive different verdicts, interfaces that must be accepted before consumers start, or failures that should not invalidate neighboring work. Do not create bookkeeping nodes for one import, symbol rename, test run, or commit, or subsystem-sized nodes that require a new architecture while being implemented.
 
-## Execution tiering
-
-Every new DAG assigns each node an execution profile. `micro` is a 2–5 minute mechanical leaf. `tier2` is a 5–15 minute, decision-free leaf: one behavior, one bounded ownership surface, all required context in `read_first`, and an explicit `NEEDS_CONTEXT` stop when its contract proves insufficient. `senior` is for an explicit cross-module design decision; `controller` is for graph-wide convergence or scheduling. Do not label a broad node `tier2` to make it dispatchable: split it at independently reviewable behaviors. Runtime rejects a `micro` scope over 3 tracked files or a `tier2` scope over 8; review must still reject hidden architecture choices and unrelated behavior bundles.
-
 ## Dependency pass
 
 Ask for each pair:
@@ -67,7 +63,7 @@ Avoid:
 
 When uncertainty is itself work, create a bounded `investigation` node with a decision artifact, explicit questions, a read budget or stop condition, and downstream nodes dependent on its accepted output.
 
-Every node carries a non-empty string-array `execution_plan` for a fresh implementer, normally 1–6 ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. The plan is an execution map, not a second contract: do not restate `objective`, `scope`, `inputs`, `outputs`, or `acceptance`, and do not copy verification commands. When the landing is unknown, use a bounded `investigation` node with a decision artifact rather than a guessed location.
+Every node carries a non-empty string-array `execution_plan` for a fresh implementer, normally a few ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. The plan is an execution map, not a second contract: do not restate `objective`, `scope`, `inputs`, `outputs`, or `acceptance`, and do not copy verification commands. When the landing is unknown, use a bounded `investigation` node with a decision artifact rather than a guessed location.
 
 ```json
 "execution_plan": [

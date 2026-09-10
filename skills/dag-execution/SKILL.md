@@ -69,6 +69,10 @@ Do not dispatch review after a scope violation. Otherwise provide the strict pac
 
 The runtime derives the review outcome from the artifact and binds the head. Dispatch the reviewer with edit and commit capability in the node's worktree: it repairs every in-scope defect on the spot in one independent fix commit within the same session and cannot approve its own fix. The review artifact records repaired defects as `bugs` (which require the reviewer's `fix_commit`) and everything the reviewer cannot settle alone as `unsure` with a reason. There is no report-only round that returns in-scope defects to the worker. Contract, scope, unsafe-repair, and caller decisions return to the controller as `unsure` entries.
 
+## Controller close-out
+
+The reviewer round is the last dispatch. Whatever is still open after it — a remaining defect, a gate rejecting an artifact over a fixable discrepancy, an `unsure` item the controller can settle from evidence — the controller closes itself: make the final judgment, repair in the node's worktree, commit, and record the closing review, handoff, and verification artifacts through the same runtime gates. Never send the node back for another worker or reviewer round; the whole loop is worker, reviewer, and at most this one close-out. The runtime binds commits and artifacts, not authorship — the close-out faces the same gates, and every recorded check must actually have run.
+
 ## Master verification
 
 Apply `references/verification.md`. The controller independently checks scope, reproducible evidence, the actual contract and diff, and at least one real acceptance criterion. Record completion only after creating the handoff and master-verification artifacts:

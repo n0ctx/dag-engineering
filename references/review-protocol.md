@@ -12,9 +12,23 @@ Provide only these inputs:
 - relevant verification evidence;
 - output paths.
 
-Do not attach a controller summary, restated contract, whole DAG, unrelated reports, chat history, or worker reasoning. Review against the original contract. Read outside the diff only `read_first` files or a specific caller needed to settle a claim. If a changed signature, return shape, exception, or other caller-visible contract is involved, search its callers before judging it.
+Do not attach a controller summary, restated contract, whole DAG, unrelated reports, chat history, or worker reasoning. Review against the original contract.
 
-Verify claims against the diff and reproducible evidence. Check the acceptance criteria, caller/integration impact, test validity, security, error handling, and unnecessary abstraction. A design rationale in the handoff is not evidence.
+## Bounded review procedure
+
+The controller starts the reviewer prompt with this fixed preamble:
+
+> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and log every such read in `checks_performed`. Re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes a recorded finding naming the exact missing context — never a reason to keep exploring.
+
+Checklist, in order:
+
+1. Scope: the changed-path list against `scope.files` and `scope.forbidden`. Both are in the package; this needs no repository reading.
+2. Acceptance: each criterion against the diff and the supplied evidence, one by one. A design rationale in the handoff is not evidence.
+3. Test validity: the changed tests actually exercise the claimed behavior. Read only test files that appear in the diff.
+4. Caller impact: only when the diff changes a caller-visible signature, return shape, or exception — run one targeted search for callers and read only the specific call sites at issue.
+5. Security, error handling, and unnecessary abstraction: judge from the diff itself, not from a codebase survey.
+
+Re-running the worker's full verification suite belongs to the controller's independent gate, not to review. For a `micro` or `tier2` node, stop after item 3 and escalate any remaining doubt as a finding instead of auditing design. Where the harness allows choosing the reviewer model, a cheaper model suffices for these checklist-only reviews.
 
 ## Findings and decisions
 

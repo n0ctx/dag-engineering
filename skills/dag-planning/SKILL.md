@@ -94,6 +94,8 @@ A new request superseding an existing plan is not, by itself, a reason to abando
 
 Before showing the plan, create one `review-request.json` containing the plan fingerprint, the complete review input, and the three lanes (`requirements`, `graph`, `execution`). Dispatch one independent reviewer to examine all three lanes in one pass and return one `review.json`; do not create `plan.json`, per-lane files, or a manifest. The single result uses a `lanes` object: each required lane appears exactly once as `{checks_performed: [...], findings: [...]}`. A full review has all three lanes; a repair has only the lanes named by the runtime request and retains resolutions for unresolved findings. The request includes only the contracts, relevant source references, and repository evidence needed for those lanes. A repair request contains only affected nodes and lanes, plus the evidence needed to reassess them and their downstream interfaces.
 
+Bind the dispatched reviewer to the request package. It judges the plan against the supplied contracts, source references, and cited repository evidence, and works the required lanes linearly rather than re-running reconnaissance. Its repository access is limited to targeted existence checks on paths and symbols the plan cites; a citation it cannot confirm is a finding, not an invitation to locate the right one. Any claim it cannot settle from the package becomes a finding naming the missing evidence. Every repository check it performs goes into the lane's `checks_performed`.
+
 ```bash
 "${SKILL_ROOT}/scripts/status" --review-request > .dag/artifacts/decomposition-review/review-request.json
 ```

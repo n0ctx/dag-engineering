@@ -1491,6 +1491,49 @@ class RuntimeTests(unittest.TestCase):
             "--verification-ref", master, "--head-ref", head, "--summary", "A delivered",
         )
 
+    def test_controller_settles_an_escalated_path_no_dependent_can_own(self):
+        self.write(dag([node("A"), node("B", depends=("A",), files=["src/other.py"])]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, unsure=[
+            {"reason": "scope", "path": "generated/index.json", "detail": "no node writes this"},
+        ])
+        result = self.run_cmd(
+            "update-task", "A", "resolve-escalation",
+            "--owner", "generated/index.json=controller", expect=3,
+        )
+        self.assertIn("--reference", result.stderr)
+        decision = self.root / ".dag" / "decision.md"
+        decision.write_text("controller settled the generated index\n", encoding="utf-8")
+        self.run_cmd(
+            "update-task", "A", "resolve-escalation",
+            "--owner", "generated/index.json=controller", "--reference", ".dag/decision.md",
+        )
+        attempt = json.loads(self.path.read_text())["nodes"][0]["attempts"][-1]
+        self.assertEqual(attempt["open_escalations"], [])
+        self.assertEqual(attempt["escalation_resolution"]["reference"], ".dag/decision.md")
+        self.assertEqual(
+            attempt["escalation_resolution"]["owners"],
+            [{"path": "generated/index.json", "node": "controller"}],
+        )
+
+    def test_controller_cannot_take_a_path_a_dependent_node_owns(self):
+        self.write(dag([node("A"), node("B", depends=("A",), files=["src/caller.py"])]))
+        self.start("A")
+        head = self.commit_node("A")
+        self.review("A", head, unsure=[
+            {"reason": "scope", "path": "src/caller.py", "detail": "B owns this caller"},
+        ])
+        decision = self.root / ".dag" / "decision.md"
+        decision.write_text("controller tries to take a path B can own\n", encoding="utf-8")
+        result = self.run_cmd(
+            "update-task", "A", "resolve-escalation",
+            "--owner", "src/caller.py=controller", "--reference", ".dag/decision.md", expect=3,
+        )
+        self.assertIn("can be owned by B", result.stderr)
+        attempt = json.loads(self.path.read_text())["nodes"][0]["attempts"][-1]
+        self.assertEqual(len(attempt["open_escalations"]), 1)
+
     def test_contract_question_resolves_without_rereviewing_unchanged_code(self):
         self.write(dag([node("A")]))
         self.start("A")

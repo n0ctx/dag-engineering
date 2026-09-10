@@ -40,7 +40,7 @@ Every finding lands in exactly one field:
 - `bugs`: an in-scope defect the reviewer has already repaired in its fix commit; `detail` names the file, what was wrong, and how it was fixed;
 - `unsure`: everything the reviewer cannot or should not settle alone, with a `reason`:
   - `contract`: the contract or acceptance text admits two plausible readings — the controller settles it with `resolve-contract`;
-  - `scope`: the defect sits outside `scope.files` or inside `scope.forbidden`, where a fix would trip the scope gate — the controller assigns an owner with `resolve-escalation`;
+  - `scope`: the defect sits outside `scope.files` or inside `scope.forbidden`, where a fix would trip the scope gate — the controller assigns an owner with `resolve-escalation`, or settles it itself against a durable reference when no dependent node can write that path;
   - `unsafe`: repairing it would exceed the review package or risk behavior the reviewer cannot re-verify — the controller decides.
 
 In-scope repairs never go back to the worker. The reviewer repairs every bug in the same session: at most one independent fix commit, entirely within scope. There is no report-only fix round — the runtime rejects a review whose `bugs` lack a `fix_commit`, and a `fix_commit` without `bugs`. The reviewer cannot approve that fix; the controller performs the final acceptance check. An escalation does not complete the node.

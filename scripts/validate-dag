@@ -1693,6 +1693,23 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     return message
 
 
+CONTROLLER_OWNER = "controller"
+
+
+def escalation_owner_candidates(
+    nodes: dict[str, dict[str, Any]], closure: dict[str, set[str]], node_id: str, path: str
+) -> list[str]:
+    """The unfinished dependents whose scope already covers an escalated path."""
+    return sorted(
+        other_id
+        for other_id, other in nodes.items()
+        if other_id != node_id
+        and other["status"] in {"pending", "failed", "blocked"}
+        and in_scope(path, other["scope"])
+        and node_id in closure.get(other_id, set())
+    )
+
+
 def resolve_escalation(dag: dict[str, Any], node: dict[str, Any], args: argparse.Namespace) -> str:
     if node["status"] != "running":
         raise DagError("resolve-escalation applies only to a running node")
@@ -1711,7 +1728,27 @@ def resolve_escalation(dag: dict[str, Any], node: dict[str, Any], args: argparse
         raise DagError("--owner must assign every escalated path exactly once: " + ", ".join(sorted(paths)))
     nodes = node_map(dag)
     closure = dependency_closure(nodes)
+    if CONTROLLER_OWNER in owners.values() and not (
+        is_text(args.reference) and is_safe_path(args.reference)
+    ):
+        raise DagError(
+            f"owner {CONTROLLER_OWNER!r} requires --reference naming the durable artifact that "
+            "records what the controller settled and on what evidence"
+        )
     for path, owner_id in owners.items():
+        if owner_id == CONTROLLER_OWNER:
+            # A path no dependent node can write is nobody's to hand off: control-plane
+            # artifacts, generated files, external systems. Without this the review that
+            # names one cannot be closed at all. It stays narrow — the moment any
+            # dependent could own the path, the handoff is still mandatory.
+            candidates = escalation_owner_candidates(nodes, closure, node["id"], path)
+            if candidates:
+                raise DagError(
+                    f"{path!r} can be owned by {', '.join(candidates)}; the controller settles "
+                    "only paths no dependent node can own"
+                )
+            artifact_path(args.dag, args.reference, "escalation resolution reference")
+            continue
         owner = nodes.get(owner_id)
         if owner is None or owner_id == node["id"]:
             raise DagError(f"owner for {path!r} must be another DAG node")
@@ -1725,6 +1762,7 @@ def resolve_escalation(dag: dict[str, Any], node: dict[str, Any], args: argparse
         "review_round": attempt["reviews"][-1]["round"],
         "head_ref": attempt["head_ref"],
         "owners": [{"path": path, "node": owners[path]} for path in sorted(owners)],
+        "reference": args.reference,
         "recorded_at": utc_now(),
     }
     attempt["open_escalations"] = []

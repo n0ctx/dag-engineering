@@ -34,6 +34,8 @@ Findings inside scope are recorded as `bugs` and must be repaired in the reviewe
 
 An `escalated` outcome is not a fix round. It names paths outside the node's scope that this diff broke, so returning them to the worker only produces a diff the scope gate will refuse. Give every path an owner with `resolve-escalation`; the unchanged head is not re-reviewed. Resolve an unchanged contract question with `resolve-contract`.
 
+A path no unfinished dependent node can write is nobody's to hand off — a control-plane artifact, a generated file, an external system. Settle it as the controller with `--owner "<path>=controller"` plus a `--reference` naming the durable artifact that records the judgment and its evidence. The runtime refuses that owner the moment any dependent node's `scope.files` covers the path, so it never becomes a way around assigning real work.
+
 ## 4. Independent controller gate
 
 The controller personally runs at least one real criterion directly tied to a node acceptance ID. Reading the worker or reviewer report is not a check. Prefer the smallest command or observable probe that would fail if the claimed behavior were absent.

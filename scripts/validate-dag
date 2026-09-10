@@ -44,7 +44,7 @@ NODE_STATUSES = {"pending", "running", "done", "failed", "blocked"}
 WORK_TYPES = {"implementation", "investigation", "integration", "documentation"}
 CONVERGENCE_STATUSES = {"pending", "failed", "passed"}
 REVIEW_OUTCOMES = {"approved", "cannot_verify", "escalated"}
-FINDING_SEVERITIES = {"critical", "important", "minor"}
+UNSURE_REASONS = {"contract", "scope", "unsafe"}
 PLAN_REVIEW_LANES = ("requirements", "graph", "execution")
 PLAN_REVIEW_MODES = {"full", "repair"}
 WORKER_DONE_STATUSES = {"DONE", "DONE_WITH_CONCERNS"}
@@ -495,47 +495,55 @@ def validate_finding_id(value: Any, label: str) -> None:
 
 
 def validate_findings(value: dict[str, Any], node: dict[str, Any]) -> None:
-    """Partition a review's findings on the boundary the worker can actually act within.
+    """Partition a review's findings on the boundary the reviewer can actually act within.
 
-    A finding inside `scope.files` drives the fix loop. A finding outside it cannot be
-    fixed without tripping the scope gate, so it belongs to the controller. Enforcing the
-    partition in both directions is what stops a reviewer from deadlocking the fix loop
-    against the scope gate, or from routing a fixable defect around the loop.
+    A bug inside `scope.files` is already repaired by the reviewer in its fix commit.
+    An unsure entry is everything the reviewer cannot or should not settle alone: a
+    contract question, a defect outside its scope, or a repair too unsafe to attempt.
+    Enforcing the partition in both directions stops a reviewer from deadlocking the
+    fix loop against the scope gate, or from routing a fixable defect around the loop.
     """
     seen: set[str] = set()
 
-    def check_list(name: str, want_in_scope: bool | None = None) -> None:
-        findings = value.get(name) if want_in_scope is not None else value.get(name, [])
-        if not isinstance(findings, list):
-            raise DagError(f"review artifact {name} must be an array")
-        for index, finding in enumerate(findings):
-            label = f"review artifact {name}[{index}]"
-            if not isinstance(finding, dict):
-                raise DagError(f"{label}: must be an object")
-            validate_finding_id(finding.get("id"), label)
-            if finding["id"] in seen:
-                raise DagError(f"{label}.id: duplicate finding ID {finding['id']!r}")
-            seen.add(finding["id"])
-            if finding.get("severity") not in FINDING_SEVERITIES:
-                raise DagError(
-                    f"{label}.severity: must be one of {', '.join(sorted(FINDING_SEVERITIES))}"
-                )
-            if not is_text(finding.get("detail")):
-                raise DagError(f"{label}.detail: must be a non-empty string")
-            path = finding.get("path")
-            if not is_safe_path(path):
-                raise DagError(f"{label}.path: must be the project-relative file the finding is about")
-            if want_in_scope is not None and in_scope(path, node["scope"]) is not want_in_scope:
-                side = "outside" if want_in_scope else "inside"
-                other = "controller_decisions" if want_in_scope else "blocking_findings"
-                raise DagError(
-                    f"{label}.path {path!r} is {side} {node['id']!r} scope.files; "
-                    f"record it under {other} instead"
-                )
-    for name, want_in_scope in (("blocking_findings", True), ("controller_decisions", False)):
-        check_list(name, want_in_scope)
-    for name in ("contract_findings", "minor_findings", "out_of_scope_observations"):
-        check_list(name)
+    def claim(finding: Any, label: str) -> dict[str, Any]:
+        if not isinstance(finding, dict):
+            raise DagError(f"{label}: must be an object")
+        validate_finding_id(finding.get("id"), label)
+        if finding["id"] in seen:
+            raise DagError(f"{label}.id: duplicate finding ID {finding['id']!r}")
+        seen.add(finding["id"])
+        if not is_text(finding.get("detail")):
+            raise DagError(f"{label}.detail: must be a non-empty string")
+        path = finding.get("path")
+        if not is_safe_path(path):
+            raise DagError(f"{label}.path: must be the project-relative file the finding is about")
+        return finding
+
+    bugs = value.get("bugs")
+    if not isinstance(bugs, list):
+        raise DagError("review artifact bugs must be an array")
+    for index, finding in enumerate(bugs):
+        label = f"review artifact bugs[{index}]"
+        finding = claim(finding, label)
+        if not in_scope(finding["path"], node["scope"]):
+            raise DagError(
+                f"{label}.path {finding['path']!r} is outside {node['id']!r} scope.files; "
+                "record it under unsure instead"
+            )
+    unsure = value.get("unsure")
+    if not isinstance(unsure, list):
+        raise DagError("review artifact unsure must be an array")
+    for index, finding in enumerate(unsure):
+        label = f"review artifact unsure[{index}]"
+        finding = claim(finding, label)
+        reason = finding.get("reason")
+        if reason not in UNSURE_REASONS:
+            raise DagError(f"{label}.reason: must be one of {', '.join(sorted(UNSURE_REASONS))}")
+        if reason == "scope" and in_scope(finding["path"], node["scope"]):
+            raise DagError(
+                f"{label}.path {finding['path']!r} is inside {node['id']!r} scope.files; "
+                "record it under bugs instead"
+            )
 
 
 def validate_review_artifact(
@@ -551,47 +559,24 @@ def validate_review_artifact(
     if value.get("head_ref") != head_ref:
         raise DagError("review artifact head_ref must equal the review command's --head-ref")
     worker_head = value.get("worker_head")
-    reviewer_fix_head = value.get("reviewer_fix_head")
+    fix_commit = value.get("fix_commit")
     if worker_head is not None and not is_text(worker_head):
         raise DagError("review artifact worker_head must be a commit SHA")
-    if reviewer_fix_head is not None and not is_text(reviewer_fix_head):
-        raise DagError("review artifact reviewer_fix_head must be a commit SHA")
-    if reviewer_fix_head is not None and worker_head is None:
-        raise DagError("reviewer_fix_head requires worker_head")
+    if fix_commit is not None and not is_text(fix_commit):
+        raise DagError("review artifact fix_commit must be a commit SHA")
+    if fix_commit is not None and worker_head is None:
+        raise DagError("fix_commit requires worker_head")
     if value.get("round") != expected_round:
         raise DagError(f"review artifact round must be {expected_round}")
-    if value.get("spec") not in {"APPROVED", "CANNOT_VERIFY"}:
-        raise DagError(
-            "review artifact spec must be APPROVED or CANNOT_VERIFY; in-scope defects are "
-            "repaired in the reviewer's own fix commit, not reported for a worker round"
-        )
     validate_findings(value, node)
-    if value["blocking_findings"] and not reviewer_fix_head:
+    if value["bugs"] and not fix_commit:
         raise DagError(
-            "blocking findings require a reviewer fix commit: repair them in one in-scope "
-            "commit and mark each ADDRESSED in finding_resolutions, or record problems the "
-            "reviewer cannot safely repair under controller_decisions"
+            "bugs require a reviewer fix commit: repair every in-scope defect in one "
+            "in-scope commit and record it as fix_commit, or record problems the "
+            "reviewer cannot safely repair under unsure"
         )
-    if "finding_resolutions" in value:
-        resolutions = value["finding_resolutions"]
-        if not isinstance(resolutions, list):
-            raise DagError("review artifact finding_resolutions must be an array")
-        seen_resolution_ids: set[str] = set()
-        for index, resolution in enumerate(resolutions):
-            label = f"review artifact finding_resolutions[{index}]"
-            if not isinstance(resolution, dict) or not is_text(resolution.get("id")):
-                raise DagError(f"{label} must name a finding ID")
-            if resolution["id"] in seen_resolution_ids:
-                raise DagError(f"{label}.id: duplicate finding resolution")
-            if resolution.get("status") != "ADDRESSED":
-                raise DagError(f"{label}.status must be ADDRESSED")
-            if not is_text(resolution.get("detail")):
-                raise DagError(f"{label}.detail must explain the resolution")
-            seen_resolution_ids.add(resolution["id"])
-    if value["spec"] == "CANNOT_VERIFY" and not value.get("contract_findings"):
-        raise DagError("a CANNOT_VERIFY review must name at least one contract_findings entry")
-    if value["spec"] != "CANNOT_VERIFY" and value.get("contract_findings"):
-        raise DagError("contract_findings are only valid with a CANNOT_VERIFY spec verdict")
+    if fix_commit and not value["bugs"]:
+        raise DagError("fix_commit requires at least one bug entry describing what it repairs")
     return value
 
 
@@ -1299,7 +1284,7 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
             ):
                 if field not in attempt:
                     errors.append(f"{a_label}: missing required field {field!r}")
-            for field in ("worker_head", "reviewer_fix_head"):
+            for field in ("worker_head", "fix_commit"):
                 if field in attempt and attempt.get(field) is not None and not is_text(attempt.get(field)):
                     errors.append(f"{a_label}.{field}: must be null or a non-empty string")
             for field in ("worktree", "branch", "base_ref"):
@@ -1338,7 +1323,7 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                 )
                 if review.get("outcome") == "escalated" and not review.get("escalated_paths"):
                     errors.append(f"{r_label}.escalated_paths: an escalated review must name the paths")
-                for field in ("blocking_finding_ids", "contract_finding_ids"):
+                for field in ("bug_ids", "contract_finding_ids"):
                     if field in review:
                         expect_string_list(errors, review.get(field), f"{r_label}.{field}")
             for field in ("open_escalations", "open_contract_findings"):
@@ -1798,42 +1783,32 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     review = validate_review_artifact(
         args.dag, args.review_ref, node, head_ref, len(reviews) + 1
     )
-    if review.get("reviewer_fix_head") and not review.get("worker_head"):
-        raise DagError("reviewer_fix_head requires an explicit worker_head")
+    if review.get("fix_commit") and not review.get("worker_head"):
+        raise DagError("fix_commit requires an explicit worker_head")
     worker_head = resolve_commit(worktree, review.get("worker_head") or head_ref, "worker_head")
-    reviewer_fix_head = review.get("reviewer_fix_head")
-    if reviewer_fix_head:
-        reviewer_fix_head = resolve_commit(worktree, reviewer_fix_head, "reviewer_fix_head")
-        if reviewer_fix_head != head_ref:
-            raise DagError("reviewer_fix_head must equal the review command's --head-ref")
+    fix_commit = review.get("fix_commit")
+    if fix_commit:
+        fix_commit = resolve_commit(worktree, fix_commit, "fix_commit")
+        if fix_commit != head_ref:
+            raise DagError("fix_commit must equal the review command's --head-ref")
     worker_changed = checked_range_changes(worktree, node, attempt["base_ref"], worker_head)
     final_changed = initial_changed
-    if reviewer_fix_head:
-        if reviewer_fix_head == worker_head:
-            raise DagError("reviewer_fix_head must contain an independent commit after worker_head")
-        fix_changed = checked_range_changes(worktree, node, worker_head, reviewer_fix_head)
+    if fix_commit:
+        if fix_commit == worker_head:
+            raise DagError("fix_commit must contain an independent commit after worker_head")
+        fix_changed = checked_range_changes(worktree, node, worker_head, fix_commit)
         if not fix_changed:
-            raise DagError("reviewer_fix_head must contain a non-empty descendant fix commit")
+            raise DagError("fix_commit must contain a non-empty descendant fix commit")
     handoff_head = worker_head if review.get("worker_head") else head_ref
     validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, worker_changed if review.get("worker_head") else final_changed)
-    escalations = review["controller_decisions"]
     # In-scope defects arrive already repaired by the reviewer, so the outcome turns on
-    # contract findings and escalations alone.
-    resolutions = review.get("finding_resolutions", [])
-    blocking_ids = {item["id"] for item in review["blocking_findings"]}
-    if review.get("reviewer_fix_head"):
-        resolution_ids = {item["id"] for item in resolutions}
-        unknown = resolution_ids - blocking_ids
-        missing = blocking_ids - resolution_ids
-        if unknown:
-            raise DagError("reviewer fix has unknown finding resolutions: " + ", ".join(sorted(unknown)))
-        if missing:
-            raise DagError("reviewer fix must resolve every blocking finding exactly once: " + ", ".join(sorted(missing)))
-    elif resolutions:
-        raise DagError("finding_resolutions require a reviewer_fix_head")
-    if review["spec"] == "CANNOT_VERIFY":
+    # the unsure entries alone: a contract question cannot_verify, any other unsure
+    # escalates, and neither means approved.
+    escalations = [item for item in review["unsure"] if item.get("reason") != "contract"]
+    contract_findings = [item for item in review["unsure"] if item.get("reason") == "contract"]
+    if contract_findings:
         outcome = "cannot_verify"
-    elif escalations:
+    elif review["unsure"]:
         outcome = "escalated"
     else:
         outcome = "approved"
@@ -1846,10 +1821,10 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
             "handoff_ref": args.handoff_ref,
             "head_ref": head_ref,
             "worker_head": worker_head,
-            "reviewer_fix_head": reviewer_fix_head,
+            "fix_commit": fix_commit,
             "escalated_paths": sorted({finding["path"] for finding in escalations}),
-            "blocking_finding_ids": sorted(blocking_ids),
-            "contract_finding_ids": sorted(finding["id"] for finding in review.get("contract_findings", [])),
+            "bug_ids": sorted(finding["id"] for finding in review["bugs"]),
+            "contract_finding_ids": sorted(finding["id"] for finding in contract_findings),
             "reviewed_at": now,
         }
     )
@@ -1858,11 +1833,11 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
         finding for finding in escalations if finding["id"] not in known_escalations
     )
     if outcome == "cannot_verify":
-        attempt["open_contract_findings"] = list(review.get("contract_findings", []))
+        attempt["open_contract_findings"] = list(contract_findings)
     attempt["handoff_ref"] = args.handoff_ref
     attempt["head_ref"] = head_ref
     attempt["worker_head"] = worker_head
-    attempt["reviewer_fix_head"] = reviewer_fix_head
+    attempt["fix_commit"] = fix_commit
     message = f"{node['id']}: review round {len(reviews)} -> {outcome}"
     if outcome == "escalated":
         message += (
@@ -2972,7 +2947,7 @@ def cmd_status(argv: list[str]) -> int:
                 "review_rounds": len(attempt["reviews"]),
                 "last_review": attempt["reviews"][-1]["outcome"] if attempt["reviews"] else None,
                 "worker_head": attempt.get("worker_head"),
-                "reviewer_fix_head": attempt.get("reviewer_fix_head"),
+                "fix_commit": attempt.get("fix_commit"),
                 "open_escalations": attempt.get("open_escalations", []),
                 "escalation_resolution": attempt.get("escalation_resolution"),
                 "open_contract_findings": attempt.get("open_contract_findings", []),
@@ -3058,10 +3033,10 @@ def cmd_status(argv: list[str]) -> int:
                 )
             if attempt["open_contract_findings"]:
                 print("    contract findings unresolved: " + ", ".join(finding["id"] for finding in attempt["open_contract_findings"]))
-            if attempt["worker_head"] or attempt["reviewer_fix_head"]:
+            if attempt["worker_head"] or attempt["fix_commit"]:
                 print(
                     "    heads: worker=" + str(attempt["worker_head"] or "none")[:12]
-                    + " reviewer_fix=" + str(attempt["reviewer_fix_head"] or "none")[:12]
+                    + " fix=" + str(attempt["fix_commit"] or "none")[:12]
                 )
         print("Roadmap (layers follow depends_on only):")
         markers = {"done": "x", "running": ">", "failed": "!", "blocked": "!", "pending": " "}

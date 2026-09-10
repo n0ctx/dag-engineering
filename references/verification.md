@@ -30,7 +30,7 @@ Confirm a fresh reviewer evaluated:
 - scope compliance and test validity;
 - the immutable worker range and, when present, the reviewer-fix range rather than an earlier commit.
 
-Findings inside scope must be repaired in the reviewer's independent fix commit within the same review; there is no report-only round that defers them to the worker. The reviewer cannot approve its own fix; the controller checks the fix-only range and final acceptance. Spec, scope, or unsafe-repair findings are escalations or contract decisions for the controller. Minor findings may be recorded without another review when they do not undermine acceptance.
+Findings inside scope are recorded as `bugs` and must be repaired in the reviewer's independent fix commit within the same review; there is no report-only round that defers them to the worker. The reviewer cannot approve its own fix; the controller checks the fix-only range and final acceptance. Everything the reviewer cannot settle alone is recorded as `unsure` with a reason: a `contract` question resolves with `resolve-contract`; `scope` and `unsafe` entries are escalations the controller settles with `resolve-escalation` or a durable decision.
 
 An `escalated` outcome is not a fix round. It names paths outside the node's scope that this diff broke, so returning them to the worker only produces a diff the scope gate will refuse. Give every path an owner with `resolve-escalation`; the unchanged head is not re-reviewed. Resolve an unchanged contract question with `resolve-contract`.
 

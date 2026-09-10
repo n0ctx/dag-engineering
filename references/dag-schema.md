@@ -24,7 +24,7 @@ Paths in `scope.files`, `scope.forbidden`, and `read_first` are safe project-rel
 
 ## Attempts, handoff, and evidence
 
-An attempt records `number`, `started_at`, `finished_at`, `outcome`, `worktree`, `branch`, `base_ref`, `head_ref`, `worker_head`, `reviewer_fix_head`, `reviews`, `handoff_ref`, `verification_ref`, and `failure_reason`. It closes with outcome `done`, `failed`, or `blocked`.
+An attempt records `number`, `started_at`, `finished_at`, `outcome`, `worktree`, `branch`, `base_ref`, `head_ref`, `worker_head`, `fix_commit`, `reviews`, `handoff_ref`, `verification_ref`, and `failure_reason`. It closes with outcome `done`, `failed`, or `blocked`.
 
 Handoff artifacts are JSON objects with the node, a worker completion status, commit, changed files, verification, and context used. A done node requires a final approved review (or a narrow recorded resolution), a master verification artifact, matching Git head, and complete evidence. Artifact paths must exist, be non-empty, and remain within the project. Scope files must equal the sorted Git diff paths; out-of-scope changes fail closed.
 
@@ -57,5 +57,5 @@ Independent review and all findings remain durable. A user’s persisted `approv
 - The runtime seals `dag.json` in `.dag/.dag.json.seal` after every write and verifies it before every read. `--reseal --reason` is the deliberate repair path and records the reason in `reseal`.
 - `planning_session` is stamped on first approval and preserved through amendments/revisions. A planning session cannot execute its own DAG.
 - Amend/revise preserve attempts, handoffs, and statuses for work already run. Running contracts cannot change; done contracts cannot change; revise requires scoped review when changed interfaces affect dependants.
-- Node review outcomes bind the reviewed handoff and immutable Git head. Reviewer-fix heads must be independent; a done node also requires a matching master verification artifact and scope/evidence checks.
+- Node review outcomes bind the reviewed handoff and immutable Git head. Reviewer fix commits (`fix_commit`) must be independent descendants of `worker_head`; a done node also requires a matching master verification artifact and scope/evidence checks.
 - Failed convergence gaps are imported only through a reviewed gap-node artifact whose `dag_id` and `addresses_gaps` exactly match the recorded gaps. Import appends pending nodes, records the artifact in `source_refs`, clears approval, and returns planning to `awaiting_approval`.

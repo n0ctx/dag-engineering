@@ -67,7 +67,7 @@ Do not dispatch review after a scope violation. Otherwise provide the strict pac
   --head-ref "<reviewed-sha>"
 ```
 
-The runtime derives the review outcome from the artifact and binds the head. Dispatch the reviewer with edit and commit capability in the node's worktree: it repairs every in-scope finding in one independent fix commit within the same session and cannot approve its own fix. There is no report-only round that returns in-scope defects to the worker. Contract, scope, unsafe-repair, and caller decisions return to the controller.
+The runtime derives the review outcome from the artifact and binds the head. Dispatch the reviewer with edit and commit capability in the node's worktree: it repairs every in-scope defect on the spot in one independent fix commit within the same session and cannot approve its own fix. The review artifact records repaired defects as `bugs` (which require the reviewer's `fix_commit`) and everything the reviewer cannot settle alone as `unsure` with a reason. There is no report-only round that returns in-scope defects to the worker. Contract, scope, unsafe-repair, and caller decisions return to the controller as `unsure` entries.
 
 ## Master verification
 

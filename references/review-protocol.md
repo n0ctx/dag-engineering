@@ -19,7 +19,7 @@ Do not attach a controller summary, restated contract, whole DAG, unrelated repo
 
 The controller starts the reviewer prompt with this fixed preamble:
 
-> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and log every such read in `checks_performed`. Re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes a recorded finding naming the exact missing context — never a reason to keep exploring. Repair every in-scope defect you find in one commit on the node branch; the runtime rejects a review that reports in-scope defects without fixing them. A defect you cannot safely repair belongs in `controller_decisions`, not in `blocking_findings`.
+> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes an `unsure` entry naming the exact missing context — never a reason to keep exploring. Every in-scope defect you find, fix on the spot in one commit on the node branch and record it under `bugs`; the runtime rejects `bugs` without a `fix_commit`. Anything you cannot safely repair or should not decide alone goes under `unsure`.
 
 Checklist, in order:
 
@@ -29,19 +29,21 @@ Checklist, in order:
 4. Caller impact: only when the diff changes a caller-visible signature, return shape, or exception — run one targeted search for callers and read only the specific call sites at issue.
 5. Security, error handling, and unnecessary abstraction: judge from the diff itself, not from a codebase survey.
 
-Re-running the worker's full verification suite belongs to the controller's independent gate, not to review. For a `micro` or `tier2` node, stop after item 3 and escalate any remaining doubt as a finding instead of auditing design. Where the harness allows choosing the reviewer model, a cheaper model suffices for these checklist-only reviews.
+Re-running the worker's full verification suite belongs to the controller's independent gate, not to review. For a `micro` or `tier2` node, stop after item 3 and escalate any remaining doubt as `unsure` instead of auditing design. Where the harness allows choosing the reviewer model, a cheaper model suffices for these checklist-only reviews.
 
 ## Findings and decisions
 
 Disclose every finding completely before deciding the verdict. A user's explicit, durable decision outranks subjective review preferences and tradeoffs, but it must use the supported resolution or revise/replan transition; it does not fabricate an approved node review. Runtime-enforced schema, acyclicity, path/scope, Git-SHA, evidence-binding, and external-authorization checks remain mandatory. Any contract or acceptance change requires controller-led revise/replan and cannot be covered silently.
 
-Put findings in the path-appropriate field:
+Every finding lands in exactly one field:
 
-- `blocking_findings`: an in-scope defect the reviewer repairs in its own fix commit;
-- `controller_decisions`: an out-of-scope, forbidden-scope, contract, unsafe-repair, or changed-caller problem the controller must resolve;
-- `out_of_scope_observations`: unrelated observations that are not caused by this diff and do not block the node.
+- `bugs`: an in-scope defect the reviewer has already repaired in its fix commit; `detail` names the file, what was wrong, and how it was fixed;
+- `unsure`: everything the reviewer cannot or should not settle alone, with a `reason`:
+  - `contract`: the contract or acceptance text admits two plausible readings — the controller settles it with `resolve-contract`;
+  - `scope`: the defect sits outside `scope.files` or inside `scope.forbidden`, where a fix would trip the scope gate — the controller assigns an owner with `resolve-escalation`;
+  - `unsafe`: repairing it would exceed the review package or risk behavior the reviewer cannot re-verify — the controller decides.
 
-In-scope repairs never go back to the worker. The reviewer repairs every in-scope blocking finding in the same session: at most one independent fix commit, entirely within scope, with one `ADDRESSED` resolution per blocking finding. There is no report-only fix round — the runtime rejects a review whose blocking findings lack a fix commit. The reviewer cannot approve that fix; the controller performs the final acceptance check. An escalation does not complete the node.
+In-scope repairs never go back to the worker. The reviewer repairs every bug in the same session: at most one independent fix commit, entirely within scope. There is no report-only fix round — the runtime rejects a review whose `bugs` lack a `fix_commit`, and a `fix_commit` without `bugs`. The reviewer cannot approve that fix; the controller performs the final acceptance check. An escalation does not complete the node.
 
 ## Review artifact
 
@@ -53,15 +55,15 @@ Save a project-relative JSON artifact and include the final reviewed head:
   "round": 1,
   "head_ref": "full final Git commit SHA",
   "worker_head": "full worker Git commit SHA",
-  "reviewer_fix_head": null,
-  "spec": "APPROVED | CANNOT_VERIFY",
-  "blocking_findings": [],
-  "finding_resolutions": [],
-  "controller_decisions": [],
-  "minor_findings": [],
-  "out_of_scope_observations": [],
-  "checks_performed": []
+  "fix_commit": null,
+  "bugs": [],
+  "unsure": []
 }
 ```
 
-The runtime derives the outcome from verdicts and findings; neither worker nor controller supplies an unverified approval flag. After review, the controller independently verifies a real acceptance criterion and records the runtime transition.
+- a bug entry is `{"id": "b1", "detail": "what was wrong and how it was fixed", "path": "src/foo.ts"}`; `path` must be inside `scope.files`;
+- an unsure entry is `{"id": "u1", "detail": "...", "path": "src/foo.ts", "reason": "contract|scope|unsafe"}`;
+- omit `worker_head` (or set it null) when the reviewer lands no fix commit; it is required when `fix_commit` is present;
+- `fix_commit` must equal `head_ref` and be an independent, non-empty, in-scope descendant of `worker_head`.
+
+The runtime derives the outcome from `unsure`: any `reason: "contract"` entry gives `cannot_verify`; any other `unsure` entry gives `escalated`; otherwise `approved`. Neither worker nor controller supplies an unverified approval flag. After review, the controller independently verifies a real acceptance criterion and records the runtime transition.

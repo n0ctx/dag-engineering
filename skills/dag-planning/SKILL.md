@@ -92,21 +92,25 @@ A new request superseding an existing plan is not, by itself, a reason to abando
 
 ## 5. Review the decomposition
 
-Before showing the plan, create one `review-request.json` containing the plan fingerprint, the complete review input, and the three lanes (`requirements`, `graph`, `execution`). Dispatch one independent reviewer to examine all three lanes in one pass and return one `review.json`; do not create `plan.json`, per-lane files, or a manifest. The single result uses a `lanes` object: each required lane appears exactly once as `{checks_performed: [...], findings: [...]}`. A full review has all three lanes; a repair has only the lanes named by the runtime request and retains resolutions for unresolved findings. The request includes only the contracts, relevant source references, and repository evidence needed for those lanes. A repair request contains only affected nodes and lanes, plus the evidence needed to reassess them and their downstream interfaces.
+Before showing the plan, create one `review-request.json` containing the plan fingerprint, the complete review input, and the three lanes (`requirements`, `graph`, `execution`). Dispatch one independent reviewer **with file-editing capability** to examine all three lanes in one pass and return one `review.json`; do not create `plan.json`, per-lane files, or a manifest. The reviewer works fix-first, like an execution reviewer: copy the plan from the request package into `.dag/draft.json`, repair every defect it can fix directly in that draft, and record each one as a bug; everything that needs the user or controller goes into `unsure`. The single result uses a `lanes` object: each required lane appears exactly once as `{checks_performed: [...], bugs: [...], unsure: [...]}`. A full review has all three lanes; a repair has only the lanes named by the runtime request and retains `resolutions` confirming each prior open item. The request includes only the contracts, relevant source references, and repository evidence needed for those lanes. A repair request contains only affected nodes and lanes, plus the evidence needed to reassess them and their downstream interfaces.
 
-Bind the dispatched reviewer to the request package. It judges the plan against the supplied contracts, source references, and cited repository evidence, and works the required lanes linearly rather than re-running reconnaissance. Its repository access is limited to targeted existence checks on paths and symbols the plan cites; a citation it cannot confirm is a finding, not an invitation to locate the right one. Any claim it cannot settle from the package becomes a finding naming the missing evidence. Every repository check it performs goes into the lane's `checks_performed`.
+Bind the dispatched reviewer to the request package. It judges the plan against the supplied contracts, source references, and cited repository evidence, and works the required lanes linearly rather than re-running reconnaissance. Its repository access is limited to targeted existence checks on paths and symbols the plan cites; a citation it cannot confirm is a finding, not an invitation to locate the right one. Any claim it cannot settle from the package becomes an `unsure` entry naming the missing evidence. Every repository check it performs goes into the lane's `checks_performed`.
 
 ```bash
 "${SKILL_ROOT}/scripts/status" --review-request > .dag/artifacts/decomposition-review/review-request.json
 ```
 
-The reviewer must complete and disclose the full requested review. A review is independent advice, not a decision-maker above the user: `approval_ref` may record the user's clear, durable decision to approve or continue after seeing a blocking finding. That decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. Record the durable decision and rationale where the control plane requires it; do not suppress, rewrite, or omit findings.
+The reviewer must complete and disclose the full requested review. A review is independent advice, not a decision-maker above the user: `approval_ref` may record the user's clear, durable decision to approve or continue after seeing an open `unsure` item. That decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. Record the durable decision and rationale where the control plane requires it; do not suppress, rewrite, or omit findings.
+
+Record the verdict and the reviewer's own fixes in one step; pass the draft only when the review reports bugs:
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review/review.json"
+"${SKILL_ROOT}/scripts/update-task" --decomposition-review ".dag/artifacts/decomposition-review/review.json" \
+  --draft ".dag/draft.json"
 ```
 
-The runtime derives the verdict from the complete review. `critical` and `important` findings block ordinary approval, while `minor` findings are recorded. Resolve blocking findings by amending the plan, not by abandoning and recreating it; an amendment clears the verdict and the next repair review includes only affected nodes and lanes.
+The runtime validates the review against the current fingerprint, applies the draft under the amendment protections (the execution record, attempted and done nodes, and the deliverable fields cannot change), and derives the verdict: any `unsure` entry means `needs_changes`; otherwise `approved`. The reviewer's own fixes need no further repair round. Remaining `unsure` items are resolved by amending the plan, not by abandoning and recreating it; an amendment clears the verdict and the next repair review includes only affected nodes and lanes.
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --amend ".dag/draft.json"

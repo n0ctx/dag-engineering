@@ -83,7 +83,7 @@ Use one independent reviewer and one review package. The package reviews all thr
 - `graph`: dependency, conflict, and resource shape;
 - `execution`: scope, context, acceptance, and verification executability.
 
-The controller writes one `review-request.json` containing the exact plan fingerprint and only the relevant contracts, source references, and repository evidence. The reviewer returns one `review.json` whose `lanes` object has each required lane exactly once as `{checks_performed: [...], findings: [...]}`; findings do not repeat the lane. A full review has `requirements`, `graph`, and `execution`; a repair has only the lanes named by the runtime request and retains resolutions for unresolved findings. There are no `plan.json`, per-lane result files, or manifest. The reviewer is an independent source of findings, not a decision-maker above the user. Full review and disclosure remain mandatory. A user who has seen a blocking finding may make a clear, durable decision to approve or continue, recorded through `approval_ref`; that decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. The runtime, not the reviewer, derives the verdict. `critical` and `important` findings block ordinary approval; `minor` findings are recorded.
+The controller writes one `review-request.json` containing the exact plan fingerprint and only the relevant contracts, source references, and repository evidence. The reviewer is dispatched with file-editing capability and works fix-first: it copies the plan from the request into a draft, repairs every defect it can fix directly in the draft, and records each as a bug. The reviewer returns one `review.json` whose `lanes` object has each required lane exactly once as `{checks_performed: [...], bugs: [...], unsure: [...]}`; entries do not repeat the lane. A full review has `requirements`, `graph`, and `execution`; a repair has only the lanes named by the runtime request and retains `resolutions` confirming each prior open item. There are no `plan.json`, per-lane result files, or manifest. The reviewer is an independent source of findings, not a decision-maker above the user. Full review and disclosure remain mandatory. A user who has seen an open `unsure` item may make a clear, durable decision to approve or continue, recorded through `approval_ref`; that decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. The runtime, not the reviewer, derives the verdict: any `unsure` entry means `needs_changes`, otherwise `approved`.
 
 The validator already proves graph structure: no cycles, symmetric conflicts, undeclared same-file collisions between concurrent nodes, and acceptance coverage by verification. Review what scripts cannot decide:
 
@@ -96,34 +96,35 @@ The validator already proves graph structure: no cycles, symmetric conflicts, un
 - **scope realism**: `scope.files` does not match where behavior lives;
 - **assumption laundering**: a decision was parked in `assumptions` instead of clarified.
 
-Every finding names the offending nodes and the failure, not a style preference. The single `review.json` binds findings to the request fingerprint; each finding has a stable ID and does not repeat its enclosing lane:
+Every finding names the offending nodes and the failure, not a style preference. Bugs carry a `fix` describing what the reviewer's draft changes; unsure entries carry a `question` stating the decision only the user or controller may make. The single `review.json` binds its entries to the request fingerprint and names the reviewer's draft in `draft_ref` when it reports bugs:
 
 ```json
 {
   "dag_id": "auth-migration",
   "plan_fingerprint": "<current plan fingerprint>",
   "mode": "full",
+  "draft_ref": ".dag/draft.json",
   "lanes": {
-    "requirements": {"checks_performed": ["coverage pass"], "findings": []},
+    "requirements": {"checks_performed": ["coverage pass"], "bugs": [], "unsure": []},
     "graph": {
       "checks_performed": ["dependency pass", "conflict pass", "node sizing"],
-      "findings": [
+      "bugs": [
         {
           "id": "graph-001",
-          "severity": "important",
           "kind": "missing_dependency",
           "nodes": ["auth-client"],
           "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency",
-          "suggestion": "add auth-client.depends_on = [define-auth-contract]"
+          "fix": "add auth-client.depends_on = [define-auth-contract] in the draft"
         }
-      ]
+      ],
+      "unsure": []
     },
-    "execution": {"checks_performed": ["scope pass", "context pass"], "findings": []}
+    "execution": {"checks_performed": ["scope pass", "context pass"], "bugs": [], "unsure": []}
   }
 }
 ```
 
-The runtime derives the verdict; a reviewer does not pass its own approval flag. `critical` and `important` findings block approval, while `minor` findings are recorded.
+The runtime derives the verdict; a reviewer does not pass its own approval flag. Any open `unsure` entry blocks approval until the controller amends the plan or the user records a durable override; bugs are already fixed in the draft and never block on their own.
 
 ## Scoped review revision
 

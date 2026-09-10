@@ -688,7 +688,7 @@ def validate_design_review_artifact(
     return value
 
 
-def validate_plan_finding(
+def validate_plan_entry(
     finding: Any, label: str, known: set[str], lane: str, seen: set[str]
 ) -> dict[str, Any]:
     if not isinstance(finding, dict):
@@ -698,8 +698,6 @@ def validate_plan_finding(
     if finding_id in seen:
         raise DagError(f"{label}.id: duplicate finding ID {finding_id!r}")
     seen.add(finding_id)
-    if finding.get("severity") not in DESIGN_SEVERITIES:
-        raise DagError(f"{label}.severity: must be one of {', '.join(sorted(DESIGN_SEVERITIES))}")
     if not is_text(finding.get("kind")):
         raise DagError(f"{label}.kind: must be a non-empty string")
     if not is_text(finding.get("detail")):
@@ -710,8 +708,32 @@ def validate_plan_finding(
     return {**finding, "lane": lane}
 
 
+def validate_plan_bug(
+    finding: Any, label: str, known: set[str], lane: str, seen: set[str]
+) -> dict[str, Any]:
+    finding = validate_plan_entry(finding, label, known, lane, seen)
+    if not is_text(finding.get("fix")):
+        raise DagError(f"{label}.fix: must describe what the reviewer draft changes")
+    return finding
+
+
+def validate_plan_unsure(
+    finding: Any, label: str, known: set[str], lane: str, seen: set[str]
+) -> dict[str, Any]:
+    finding = validate_plan_entry(finding, label, known, lane, seen)
+    if not is_text(finding.get("question")):
+        raise DagError(f"{label}.question: must state the decision the user or controller must make")
+    return finding
+
+
 def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any]) -> dict[str, Any]:
-    """Validate the compact, single review.json result."""
+    """Validate the compact, single review.json result.
+
+    The reviewer works fix-first: a lane's `bugs` are defects it already repaired in its
+    draft plan, and its `unsure` entries are everything only the user or controller may
+    decide. Bugs and a draft are two halves of one claim, so the runtime requires both
+    or neither.
+    """
     value = load_json_artifact(dag_path, ref, "plan review artifact")
     if value.get("dag_id") != dag["dag_id"]:
         raise DagError(f"plan review artifact dag_id must be {dag['dag_id']!r}")
@@ -740,6 +762,8 @@ def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any])
     known = {node["id"] for node in dag["nodes"]}
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
+    bugs: list[dict[str, Any]] = []
+    open_unsure: list[dict[str, Any]] = []
     for lane in required:
         section = lanes[lane]
         if not isinstance(section, dict):
@@ -747,20 +771,35 @@ def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any])
         checks = section.get("checks_performed")
         if not isinstance(checks, list) or not checks or any(not is_text(item) for item in checks):
             raise DagError(f"{lane}.checks_performed must be a non-empty string array")
-        findings = section.get("findings")
-        if not isinstance(findings, list):
-            raise DagError(f"{lane}.findings must be an array")
-        for index, finding in enumerate(findings):
-            if not isinstance(finding, dict):
-                raise DagError(f"{lane}.findings[{index}] must be an object")
-            if "lane" in finding:
-                raise DagError(f"{lane}.findings[{index}].lane is controlled by its enclosing lane")
-            finding = {**finding, "lane": lane}
-            normalized.append(validate_plan_finding(finding, f"{lane}.findings[{index}]", known, lane, seen))
+        for name, validator, bucket in (
+            ("bugs", validate_plan_bug, bugs),
+            ("unsure", validate_plan_unsure, open_unsure),
+        ):
+            entries = section.get(name)
+            if not isinstance(entries, list):
+                raise DagError(f"{lane}.{name} must be an array")
+            for index, finding in enumerate(entries):
+                label = f"{lane}.{name}[{index}]"
+                if isinstance(finding, dict) and "lane" in finding:
+                    raise DagError(f"{label}.lane is controlled by its enclosing lane")
+                finding = validator(finding, label, known, lane, seen)
+                normalized.append(finding)
+                bucket.append(finding)
         if mode == "repair":
             resolutions = section.get("resolutions")
             if not isinstance(resolutions, list):
                 raise DagError(f"{lane}.resolutions must be an array")
+    draft_ref = value.get("draft_ref")
+    if bugs and draft_ref is None:
+        raise DagError(
+            "plan review bugs require a reviewer draft: fix them in a draft plan, record "
+            "its path in draft_ref, and pass it with --draft"
+        )
+    if draft_ref is not None:
+        if not is_safe_path(draft_ref):
+            raise DagError("plan review draft_ref must be a safe project-relative path")
+        if not bugs:
+            raise DagError("draft_ref requires at least one bug across the review lanes")
     if mode == "repair":
         previous = {item["id"]: item for item in pending.get("open_findings", [])}
         reused = set(previous) & seen
@@ -785,7 +824,16 @@ def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any])
         for finding_id, resolution in resolutions.items():
             if resolution["status"] == "NOT_ADDRESSED":
                 normalized.append({**previous[finding_id], "lane": previous[finding_id].get("lane")})
-    return {"mode": mode, "refs": [ref], "findings": normalized, "required_lanes": required}
+                open_unsure.append({**previous[finding_id], "lane": previous[finding_id].get("lane")})
+    return {
+        "mode": mode,
+        "refs": [ref],
+        "findings": normalized,
+        "bugs": bugs,
+        "open_findings": open_unsure,
+        "required_lanes": required,
+        "draft_ref": draft_ref,
+    }
 
 
 
@@ -2106,8 +2154,82 @@ def reseal_dag(dag_path: Path, reason: str) -> str:
     return f"resealed {dag_path}: {reason}"
 
 
-def record_design_review(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
-    """Atomically record all requested plan-review lanes after the barrier."""
+def apply_reviewer_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> dict[str, Any]:
+    """Apply a plan reviewer's own fixes under the amendment protections.
+
+    The plan reviewer works fix-first like an execution reviewer: defects it can repair
+    land in a draft plan, and only what it cannot decide alone reaches `unsure`. The
+    draft may reorganise unstarted work, but the execution record, attempted and done
+    nodes, and the deliverable fields are not its to change.
+    """
+    value = load_json_artifact(dag_path, draft_ref, "reviewer draft")
+    if value.get("dag_id") != dag["dag_id"]:
+        raise DagError(f"reviewer draft dag_id must be {dag['dag_id']!r}; a different effort is a new control plane")
+    changed_deliverable = [field for field in DELIVERABLE_FIELDS if value.get(field) != dag.get(field)]
+    if changed_deliverable:
+        raise DagError(
+            f"a reviewer draft cannot change what the project delivers ({', '.join(changed_deliverable)}); "
+            "that is the user's call, so record it under unsure instead"
+        )
+    draft_nodes = value.get("nodes")
+    if not isinstance(draft_nodes, list) or not draft_nodes:
+        raise DagError("reviewer draft nodes must be a non-empty array")
+    if any(not isinstance(entry, dict) or not is_text(entry.get("id")) for entry in draft_nodes):
+        raise DagError("every reviewer draft node needs an id")
+    if len({entry["id"] for entry in draft_nodes}) != len(draft_nodes):
+        raise DagError("reviewer draft has duplicate node IDs")
+    candidate = copy.deepcopy(dag)
+    for field in ("max_parallel", "execution_tiering"):
+        if field in value:
+            candidate[field] = value[field]
+    proposed = {entry["id"]: entry for entry in draft_nodes}
+    current = node_map(dag)
+    merged: list[dict[str, Any]] = []
+    for node in dag["nodes"]:
+        replacement = proposed.get(node["id"])
+        if replacement is None:
+            if node["attempts"]:
+                raise DagError(f"{node['id']!r} has an execution record and cannot be dropped by a reviewer draft")
+            continue
+        for field in ("status", "attempts", "handoff"):
+            if field in replacement and replacement[field] != node[field]:
+                raise DagError(f"{node['id']!r}: a reviewer draft cannot rewrite {field}, which is the execution record")
+        if node["status"] == "done":
+            changed = [
+                field
+                for field in PLAN_NODE_FIELDS
+                if field in replacement and replacement.get(field) != node.get(field)
+            ]
+            if changed:
+                raise DagError(
+                    f"{node['id']!r} is done and its contract is frozen, because its diff was accepted "
+                    f"against it; changed: {', '.join(changed)}"
+                )
+        merged.append(
+            {**replacement, "status": node["status"], "attempts": node["attempts"], "handoff": node["handoff"]}
+        )
+    for entry in draft_nodes:
+        if entry["id"] not in current:
+            merged.append(entry)
+    candidate["nodes"] = merged
+    errors, _ = validate_dag(candidate)
+    if errors:
+        raise DagError("reviewer draft would produce invalid DAG: " + "; ".join(errors))
+    preflight_errors, _ = plan_preflight(dag_path, candidate)
+    if preflight_errors:
+        raise DagError("reviewer draft failed plan preflight: " + "; ".join(preflight_errors))
+    return candidate
+
+
+def record_design_review(
+    dag_path: Path, dag: dict[str, Any], ref: str, draft_ref: str | None = None
+) -> str:
+    """Record all requested plan-review lanes after the barrier, applying the reviewer's draft in one step.
+
+    A review that reports bugs carries the reviewer's repaired plan as a draft: the
+    runtime applies it under the amendment protections and records the verdict against
+    the new fingerprint, so the reviewer's own fixes need no further repair round.
+    """
     existing = dag.get("decomposition_review")
     if isinstance(existing, dict) and existing.get("verdict") is not None:
         if existing.get("fingerprint") == plan_fingerprint(dag):
@@ -2116,22 +2238,35 @@ def record_design_review(dag_path: Path, dag: dict[str, Any], ref: str) -> str:
     if preflight_errors:
         raise DagError("plan preflight failed before review: " + "; ".join(preflight_errors))
     artifact = validate_plan_review_artifact(dag_path, ref, dag)
-    blocking = [
-        finding for finding in artifact["findings"] if finding["severity"] in {"critical", "important"}
-    ]
-    verdict = "needs_changes" if blocking else "approved"
-    dag["decomposition_review"] = {
+    if bool(draft_ref) != bool(artifact["draft_ref"]):
+        raise DagError(
+            "review bugs require --draft naming the reviewer draft, and --draft is only "
+            "valid for a review whose lanes report bugs"
+        )
+    if draft_ref and artifact["draft_ref"] != draft_ref:
+        raise DagError(f"review draft_ref {artifact['draft_ref']!r} does not match --draft {draft_ref!r}")
+    base_fingerprint = plan_fingerprint(dag)
+    candidate = apply_reviewer_draft(dag_path, dag, draft_ref) if draft_ref else dag
+    verdict = "needs_changes" if artifact["open_findings"] else "approved"
+    candidate["decomposition_review"] = {
         "ref": ref,
         "refs": artifact["refs"],
-        "fingerprint": plan_fingerprint(dag),
+        "fingerprint": plan_fingerprint(candidate),
+        "base_fingerprint": base_fingerprint,
         "mode": artifact["mode"],
         "verdict": verdict,
         "findings": artifact["findings"],
         "required_lanes": artifact["required_lanes"],
-        "open_findings": [item for item in artifact["findings"] if item["severity"] in {"critical", "important"}],
+        "open_findings": artifact["open_findings"],
         "recorded_at": utc_now(),
+        **({"draft_ref": draft_ref} if draft_ref else {}),
     }
-    detail = f"{len(blocking)} blocking of {len(artifact['findings'])} findings"
+    if candidate is not dag:
+        dag.clear()
+        dag.update(candidate)
+    detail = f"{len(artifact['open_findings'])} open unsure of {len(artifact['findings'])} findings"
+    if draft_ref:
+        detail += f"; {len(artifact['bugs'])} bug(s) fixed in {draft_ref}"
     return f"{artifact['mode']} plan review: {verdict} ({detail}; {len(artifact['refs'])} lanes)"
 
 
@@ -2389,10 +2524,7 @@ def repair_review_request(dag: dict[str, Any], candidate: dict[str, Any]) -> dic
     if unfinished_dependents(current, output_changes):
         return None
 
-    open_findings = [
-        finding for finding in review.get("findings", [])
-        if finding.get("severity") in {"critical", "important"}
-    ]
+    open_findings = list(review.get("open_findings") or [])
     lanes = {finding["lane"] for finding in open_findings if finding.get("lane") in PLAN_REVIEW_LANES}
     for fields in changed.values():
         lanes.update(lane for lane, owned in REVIEW_LANE_FIELDS.items() if set(fields) & owned)
@@ -2661,6 +2793,7 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--add-gap-nodes", metavar="REF", help="import reviewed gap nodes from a project-relative JSON artifact")
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
+    parser.add_argument("--draft", metavar="DRAFT", help="reviewer-fixed draft plan applied with a decomposition review that reports bugs")
     parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
     parser.add_argument("--revise", metavar="DRAFT", help="reorganise an approved plan without changing what it delivers")
     parser.add_argument("--revision-review", metavar="REF", help="scoped review of a revision that drops or re-wires a node")
@@ -2735,7 +2868,7 @@ def cmd_update(argv: list[str]) -> int:
             elif args.add_gap_nodes:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
             elif args.decomposition_review:
-                message = record_design_review(args.dag, dag, args.decomposition_review)
+                message = record_design_review(args.dag, dag, args.decomposition_review, args.draft)
             elif args.amend:
                 message = amend_dag(args.dag, dag, args.amend)
             elif args.revise:

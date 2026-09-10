@@ -69,7 +69,7 @@ Persist questions, answers, source facts, and resulting decisions in `.dag/sourc
 
 Apply `${SKILL_ROOT}/references/decomposition.md`. Every node in the new schema has a non-empty string-array `execution_plan`, normally a few ordered steps. Each string uses `project-relative landing (to a symbol or section when known)—concrete action; covers AC*/V*`. Do not repeat the node's objective, scope, inputs, outputs, or acceptance, and do not copy verification commands. If the landing cannot be identified, make that uncertainty a bounded investigation node instead of inventing a path. Do not duplicate the remaining node-sizing, dependency, conflict, or contract rules here.
 
-## 4. Draft and validate
+## 4. Draft, install, and revise
 
 Write `.dag/draft.json`, then let the runtime install it:
 
@@ -86,17 +86,27 @@ If an unfinished DAG already exists, report its state and ask whether to resume 
 "${SKILL_ROOT}/scripts/update-task" --abandon --reason "<why>" --reference "<path under .dag/sources/>"
 ```
 
-A new request superseding an existing plan is not, by itself, a reason to abandon it. Fix validator errors before presenting the plan. Preview coverage by mapping each source requirement and global acceptance criterion to nodes and verification paths, including integration work. Audit every technology or concrete interface, payload, status code, storage, or security choice against source evidence, an `assumptions` entry, or an investigation output.
+A new request superseding an existing plan is not, by itself, a reason to abandon it. Changing an existing plan — whether it is still a draft, awaiting approval, approved, or sent back for replanning — is always the same command, and it always restarts the review cycle:
+
+```bash
+"${SKILL_ROOT}/scripts/update-task" --revise ".dag/draft.json" --reason "<one line: why the plan changed>"
+```
+
+`--revise` takes a whole plan draft or a patch (`{"dag_id", "update_nodes", "drop_nodes"}`), preserves every execution record, and returns the plan to `awaiting_approval` with its review cleared, because a changed plan is unproven again. It refuses only a completed plan and a failed convergence (failed convergence is repaired with `--add-gap-nodes`). The controller judges its own changes; nothing about changing the plan requires a separate scoped review.
+
+Fix validator errors before presenting the plan. Preview coverage by mapping each source requirement and global acceptance criterion to nodes and verification paths, including integration work. Audit every technology or concrete interface, payload, status code, storage, or security choice against source evidence, an `assumptions` entry, or an investigation output.
 
 ## 5. Review the decomposition
 
-Before showing the plan, create one `review-request.json` containing the plan fingerprint, the complete review input, and the three lanes (`requirements`, `graph`, `execution`). Dispatch one independent reviewer **with file-editing capability** to examine all three lanes in one pass and return one `review.json`; do not create `plan.json`, per-lane files, or a manifest. The reviewer works fix-first, like an execution reviewer: copy the plan from the request package into `.dag/draft.json`, repair every defect it can fix directly in that draft, and record each one as a bug; everything that needs the user or controller goes into `unsure`. The single result uses a `lanes` object: each required lane appears exactly once as `{checks_performed: [...], bugs: [...], unsure: [...]}`. A full review has all three lanes; a repair has only the lanes named by the runtime request and retains `resolutions` confirming each prior open item. The request includes only the contracts, relevant source references, and repository evidence needed for those lanes. A repair request contains only affected nodes and lanes, plus the evidence needed to reassess them and their downstream interfaces.
-
-Bind the dispatched reviewer to the request package. It judges the plan against the supplied contracts, source references, and cited repository evidence, and works the required lanes linearly rather than re-running reconnaissance. Its repository access is limited to targeted existence checks on paths and symbols the plan cites; a citation it cannot confirm is a finding, not an invitation to locate the right one. Any claim it cannot settle from the package becomes an `unsure` entry naming the missing evidence. Every repository check it performs goes into the lane's `checks_performed`.
+Before showing the plan, generate one review request package and dispatch one independent reviewer **with file-editing capability** to review the whole plan in one pass:
 
 ```bash
 "${SKILL_ROOT}/scripts/status" --review-request > .dag/artifacts/decomposition-review/review-request.json
 ```
+
+The request package carries the plan fingerprint and every node contract without execution records. Bind the dispatched reviewer to it. The reviewer works fix-first, like an execution reviewer: copy the plan from the request package into `.dag/draft.json`, repair every defect it can fix directly in that draft, and record each one as a bug; everything that needs the user or controller goes into `unsure`. Repository access is limited to targeted existence checks on paths and symbols the plan cites; a citation it cannot confirm is a finding, not an invitation to locate the right one. Every repository check it performs goes into `checks_performed`. There are no per-lane files or separate review modes: one request, one `review.json` shaped as `{dag_id, plan_fingerprint, checks_performed, bugs, unsure, draft_ref?}`.
+
+A bug entry names an ID, kind, detail, the node references, and `fix` (what the reviewer draft changes); an unsure entry names an ID, kind, detail, the node references, and `question` (the decision only the user or controller may make). Finding IDs must be unique and node references must exist.
 
 The reviewer must complete and disclose the full requested review. A review is independent advice, not a decision-maker above the user: `approval_ref` may record the user's clear, durable decision to approve or continue after seeing an open `unsure` item. That decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. Record the durable decision and rationale where the control plane requires it; do not suppress, rewrite, or omit findings.
 
@@ -108,13 +118,9 @@ Record the verdict and the reviewer's own fixes in one step; pass the draft only
   --draft ".dag/draft.json"
 ```
 
-The runtime validates the review against the current fingerprint, applies the draft under the amendment protections (the execution record, attempted and done nodes, and the deliverable fields cannot change), and derives the verdict: any `unsure` entry means `needs_changes`; otherwise `approved`. The reviewer's own fixes need no further repair round. Remaining `unsure` items are resolved by amending the plan, not by abandoning and recreating it; an amendment clears the verdict and the next repair review includes only affected nodes and lanes.
+The runtime validates the review against the current fingerprint, applies the draft under the revision protections (the execution record, attempted and done nodes, and the deliverable fields cannot change), and derives the verdict: any `unsure` entry means `needs_changes`; otherwise `approved`. The reviewer's own fixes need no further review round.
 
-The loop is bounded: one full review, one controller amendment settling what the review left open, and at most one repair review of that amendment. Anything still open after the repair review is not sent into another round — the controller amends it closed on its own judgment and carries the item to the approval gate, where the user's durable decision overrides a `needs_changes` verdict.
-
-```bash
-"${SKILL_ROOT}/scripts/update-task" --amend ".dag/draft.json"
-```
+Whatever the review left open is the controller's close-out, not another review round: settle each `unsure` item from evidence with a further `--revise`, or judge that the item is the user's call and carry it, openly disclosed, to the approval gate, where the user's durable decision overrides a `needs_changes` verdict.
 
 ## 6. Approval gate
 

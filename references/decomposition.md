@@ -73,13 +73,30 @@ Every node carries a non-empty string-array `execution_plan` for a fresh impleme
 
 ## Decomposition review
 
-Use one independent reviewer and one review package. The package reviews all three lanes in one pass:
+Use one independent reviewer and one review package covering the whole plan in one pass: requirements (objective, global acceptance, source references, assumptions, coverage), graph (dependency, conflict, and resource shape), and execution (scope, context, acceptance, and verification executability).
 
-- `requirements`: objective, global acceptance, source references, assumptions, and coverage;
-- `graph`: dependency, conflict, and resource shape;
-- `execution`: scope, context, acceptance, and verification executability.
+The controller writes one `review-request.json` containing the exact plan fingerprint and every node contract without execution records. The reviewer is dispatched with file-editing capability and works fix-first: it copies the plan from the request into a draft, repairs every defect it can fix directly in the draft, and records each as a bug. The reviewer returns one flat `review.json`:
 
-The controller writes one `review-request.json` containing the exact plan fingerprint and only the relevant contracts, source references, and repository evidence. The reviewer is dispatched with file-editing capability and works fix-first: it copies the plan from the request into a draft, repairs every defect it can fix directly in the draft, and records each as a bug. The reviewer returns one `review.json` whose `lanes` object has each required lane exactly once as `{checks_performed: [...], bugs: [...], unsure: [...]}`; entries do not repeat the lane. A full review has `requirements`, `graph`, and `execution`; a repair has only the lanes named by the runtime request and retains `resolutions` confirming each prior open item. There are no `plan.json`, per-lane result files, or manifest. The reviewer is an independent source of findings, not a decision-maker above the user. Full review and disclosure remain mandatory. A user who has seen an open `unsure` item may make a clear, durable decision to approve or continue, recorded through `approval_ref`; that decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. The runtime, not the reviewer, derives the verdict: any `unsure` entry means `needs_changes`, otherwise `approved`.
+```json
+{
+  "dag_id": "auth-migration",
+  "plan_fingerprint": "<current plan fingerprint>",
+  "checks_performed": ["coverage pass", "dependency pass", "conflict pass", "node sizing", "scope pass", "context pass"],
+  "draft_ref": ".dag/draft.json",
+  "bugs": [
+    {
+      "id": "graph-001",
+      "kind": "missing_dependency",
+      "nodes": ["auth-client"],
+      "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency",
+      "fix": "add auth-client.depends_on = [define-auth-contract] in the draft"
+    }
+  ],
+  "unsure": []
+}
+```
+
+There are no `plan.json`, per-lane result files, manifests, or review modes. The reviewer is an independent source of findings, not a decision-maker above the user. Full review and disclosure remain mandatory. A user who has seen an open `unsure` item may make a clear, durable decision to approve or continue, recorded through `approval_ref`; that decision cannot bypass runtime-enforced schema, acyclicity, paths, scope, Git/SHA, evidence-binding, or authorization-boundary checks. The runtime, not the reviewer, derives the verdict: any `unsure` entry means `needs_changes`, otherwise `approved`.
 
 The validator already proves graph structure: no cycles, symmetric conflicts, undeclared same-file collisions between concurrent nodes, and acceptance coverage by verification. Review what scripts cannot decide:
 
@@ -92,48 +109,9 @@ The validator already proves graph structure: no cycles, symmetric conflicts, un
 - **scope realism**: `scope.files` does not match where behavior lives;
 - **assumption laundering**: a decision was parked in `assumptions` instead of clarified.
 
-Every finding names the offending nodes and the failure, not a style preference. Bugs carry a `fix` describing what the reviewer's draft changes; unsure entries carry a `question` stating the decision only the user or controller may make. The single `review.json` binds its entries to the request fingerprint and names the reviewer's draft in `draft_ref` when it reports bugs:
+Every finding names the offending nodes and the failure, not a style preference. Bugs carry a `fix` describing what the reviewer's draft changes; unsure entries carry a `question` stating the decision only the user or controller may make. The single `review.json` binds its entries to the request fingerprint and names the reviewer's draft in `draft_ref` when it reports bugs.
 
-```json
-{
-  "dag_id": "auth-migration",
-  "plan_fingerprint": "<current plan fingerprint>",
-  "mode": "full",
-  "draft_ref": ".dag/draft.json",
-  "lanes": {
-    "requirements": {"checks_performed": ["coverage pass"], "bugs": [], "unsure": []},
-    "graph": {
-      "checks_performed": ["dependency pass", "conflict pass", "node sizing"],
-      "bugs": [
-        {
-          "id": "graph-001",
-          "kind": "missing_dependency",
-          "nodes": ["auth-client"],
-          "detail": "auth-client consumes the token shape that define-auth-contract produces, but declares no dependency",
-          "fix": "add auth-client.depends_on = [define-auth-contract] in the draft"
-        }
-      ],
-      "unsure": []
-    },
-    "execution": {"checks_performed": ["scope pass", "context pass"], "bugs": [], "unsure": []}
-  }
-}
-```
-
-The runtime derives the verdict; a reviewer does not pass its own approval flag. Any open `unsure` entry blocks approval until the controller amends the plan or the user records a durable override; bugs are already fixed in the draft and never block on their own.
-
-## Scoped review revision
-
-When the controller reorganizes a live plan, use scoped review rather than full decomposition review. It answers only whether the change breaks downstream work. Dispatch the scoped reviewer with edit capability and fix-first instructions, the same shape as a plan review: it repairs what it can directly in the controller's revision draft and records each fix as a bug; what needs the user or controller becomes an unsure entry.
-
-Give it the changed neighborhood, never the whole DAG or repository:
-
-- nodes dropped, added, or retouched, before and after;
-- the execution fact that caused the change;
-- unfinished contracts that transitively depend on changed nodes;
-- nothing else.
-
-The reviewer returns one JSON artifact with `checks_performed`, `bugs` (each naming ID, kind, detail, nodes, and the fix applied to the draft), and `unsure` (each naming ID, kind, detail, nodes, and the question to decide). The validator reruns structural checks. Scoped review judges the prose interface: whether downstream nodes still receive what their `inputs` and `outputs` promise. Bugs never block the revision, because they are already fixed in the draft being revised; an open `unsure` entry blocks it until the reviewer reworks the draft or the user records a durable decision.
+The runtime derives the verdict; a reviewer does not pass its own approval flag. Any open `unsure` entry blocks approval until the controller settles it with a further `--revise` or the user records a durable override; bugs are already fixed in the draft and never block on their own. Changing the plan at any later stage — new draft, awaiting approval, approved, or replanning — goes through this same loop: `--revise` clears the review, and the revised plan is reviewed and approved as a whole.
 
 ## Coverage convergence preview
 

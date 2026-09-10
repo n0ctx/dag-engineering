@@ -66,4 +66,6 @@ Save a project-relative JSON artifact and include the final reviewed head:
 - omit `worker_head` (or set it null) when the reviewer lands no fix commit; it is required when `fix_commit` is present;
 - `fix_commit` must equal `head_ref` and be an independent, non-empty, in-scope descendant of `worker_head`.
 
+When the node produced no commit — an investigation, a decision recorded in an artifact — the review and the completion both omit `--head-ref`, and the artifacts set `head_ref`/`commit` to null and carry empty file lists. Such a review records only `unsure` findings; bugs and fix commits require a commit to bind to.
+
 The runtime derives the outcome from `unsure`: any `reason: "contract"` entry gives `cannot_verify`; any other `unsure` entry gives `escalated`; otherwise `approved`. Neither worker nor controller supplies an unverified approval flag. After review, the controller independently verifies a real acceptance criterion and records the runtime transition.

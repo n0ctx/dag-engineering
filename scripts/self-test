@@ -212,44 +212,33 @@ class RuntimeTests(unittest.TestCase):
         self.write(changed)
         self.assertNotEqual(before, json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"])
 
-    def test_compact_review_rejects_missing_lane_fingerprint_and_bad_finding(self):
+    def test_compact_review_rejects_missing_checks_fingerprint_and_bad_finding(self):
         self.write(dag([node("A")]))
         review_path = self.root / ".dag" / "artifacts" / "design-review" / "review.json"
         review_path.parent.mkdir(parents=True, exist_ok=True)
         fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
-        lanes = {lane: {"checks_performed": [f"{lane} checks"], "bugs": [], "unsure": []} for lane in ("requirements", "graph", "execution")}
-        review_path.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes}), encoding="utf-8")
+        review_path.write_text(json.dumps({
+            "dag_id": "fixture", "plan_fingerprint": fingerprint,
+            "checks_performed": ["checked"], "bugs": [], "unsure": [],
+        }), encoding="utf-8")
         review = json.loads(review_path.read_text())
-        review["lanes"].pop("graph")
+
+        review["checks_performed"] = []
         review_path.write_text(json.dumps(review), encoding="utf-8")
         result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
-        self.assertIn("required lane", result.stderr)
+        self.assertIn("checks_performed", result.stderr)
 
-        review = json.loads(review_path.read_text())
-        review["lanes"] = lanes
+        review["checks_performed"] = ["checked"]
         review["plan_fingerprint"] = "0" * 64
         review_path.write_text(json.dumps(review), encoding="utf-8")
         result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
         self.assertIn("fingerprint", result.stderr)
 
-        review = json.loads(review_path.read_text())
         review["plan_fingerprint"] = fingerprint
-        review["lanes"]["requirements"]["bugs"] = ["bad"]
+        review["bugs"] = ["bad"]
         review_path.write_text(json.dumps(review), encoding="utf-8")
         result = self.run_cmd("update-task", "--decomposition-review", ".dag/artifacts/design-review/review.json", expect=3)
         self.assertIn("must be an object", result.stderr)
-
-    def test_review_finding_lane_is_owned_by_enclosing_lane(self):
-        self.write(dag([node("A")]))
-        folder = self.root / ".dag" / "artifacts" / "lane-review"
-        folder.mkdir(parents=True, exist_ok=True)
-        fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
-        lanes = {lane: {"checks_performed": ["checked"], "bugs": [], "unsure": []} for lane in ("requirements", "graph", "execution")}
-        lanes["requirements"]["bugs"] = [{"id": "f1", "lane": "graph", "kind": "scope", "nodes": ["A"], "detail": "ambiguous owner", "fix": "clarified the owner in the draft"}]
-        review = folder / "review.json"
-        review.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes}), encoding="utf-8")
-        result = self.run_cmd("update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3)
-        self.assertIn("controlled by its enclosing lane", result.stderr)
 
     def test_cycle_and_missing_dependency_fail(self):
         cycle = dag([node("A", depends=("B",)), node("B", depends=("A",))])
@@ -352,45 +341,19 @@ class RuntimeTests(unittest.TestCase):
     def design_review(self, bugs=(), unsure=(), dag_id="fixture"):
         review_dir = self.root / ".dag" / "artifacts" / "design-review"
         review_dir.mkdir(parents=True, exist_ok=True)
-        state = json.loads(self.path.read_text())
-        pending = state.get("decomposition_review") or {}
-        mode = pending.get("mode") if pending.get("verdict") is None else "full"
-        mode = mode or "full"
-        lanes = pending.get("required_lanes") or ["requirements", "graph", "execution"]
         plan = json.loads(self.run_cmd("status", "--plan-view").stdout)
         fingerprint = plan["plan_fingerprint"]
-        grouped_bugs = {lane: [] for lane in lanes}
-        grouped_unsure = {lane: [] for lane in lanes}
-        kind_lanes = {
-            "coverage": "requirements", "assumption_laundering": "requirements",
-            "missing_dependency": "graph", "fabricated_dependency": "graph", "granularity": "graph",
-            "acceptance": "execution", "context": "execution", "scope_realism": "execution",
-        }
-        for index, raw in enumerate(bugs, 1):
-            item = {"id": raw.get("id", f"bug-{index}"), **raw}
-            lane = item.pop("lane", kind_lanes.get(item.get("kind"), lanes[0]))
-            grouped_bugs[lane].append(item)
-        for index, raw in enumerate(unsure, 1):
-            item = {"id": raw.get("id", f"unsure-{index}"), **raw}
-            lane = item.pop("lane", kind_lanes.get(item.get("kind"), lanes[0]))
-            grouped_unsure[lane].append(item)
-        request = review_dir / "review-request.json"
-        request.write_text(json.dumps({"dag_id": dag_id, "mode": mode, "plan_fingerprint": fingerprint, "required_lanes": lanes}), encoding="utf-8")
-        lane_results = {}
-        for lane in lanes:
-            section = {
-                "checks_performed": [f"{lane} checks"],
-                "bugs": grouped_bugs[lane],
-                "unsure": grouped_unsure[lane],
-            }
-            if mode == "repair":
-                section["resolutions"] = [
-                    {"id": finding["id"], "status": "ADDRESSED", "detail": "fixed by amendment"}
-                    for finding in pending.get("open_findings", []) if finding["lane"] == lane
-                ]
-            lane_results[lane] = section
+        bugs = [{"id": raw.get("id", f"bug-{index}"), **raw} for index, raw in enumerate(bugs, 1)]
+        unsure = [{"id": raw.get("id", f"unsure-{index}"), **raw} for index, raw in enumerate(unsure, 1)]
         review = review_dir / "review.json"
-        review.write_text(json.dumps({"dag_id": dag_id, "plan_fingerprint": fingerprint, "mode": mode, "lanes": lane_results, "draft_ref": None}), encoding="utf-8")
+        review.write_text(json.dumps({
+            "dag_id": dag_id,
+            "plan_fingerprint": fingerprint,
+            "checks_performed": ["fixture checks"],
+            "bugs": bugs,
+            "unsure": unsure,
+            "draft_ref": None,
+        }), encoding="utf-8")
         ref = str(review.relative_to(self.root))
         self.run_cmd("update-task", "--decomposition-review", ref)
         return ref
@@ -448,7 +411,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(saved["planning_session"])
         self.assertEqual(saved["nodes"][0]["status"], "running")
 
-    def test_amend_keeps_the_original_planning_session(self):
+    def test_replan_keeps_the_original_planning_session(self):
         self.awaiting([node("A")])
         self.approve_as("session-plan")
         self.complete("A")
@@ -641,7 +604,7 @@ class RuntimeTests(unittest.TestCase):
         self.run_cmd("validate-dag")
         self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["fingerprint"], before)
 
-    def test_local_plan_fix_needs_only_affected_review_lanes(self):
+    def test_local_plan_fix_restarts_the_review_cycle(self):
         self.awaiting([node("A"), node("B")])
         self.design_review(unsure=[
             {"id": "edge-1", "kind": "missing_dependency", "nodes": ["B"], "question": "add the edge?",
@@ -650,46 +613,57 @@ class RuntimeTests(unittest.TestCase):
         fixed = dag([node("A"), node("B", depends=("A",))])
         fixed["planning_status"] = "awaiting_approval"
         fixed["approval_ref"] = None
-        self.run_cmd("update-task", "--amend", self.draft(fixed, name="fixed-edge.json"))
-        pending = json.loads(self.path.read_text())["decomposition_review"]
-        self.assertEqual(pending["mode"], "repair")
-        self.assertEqual(pending["required_lanes"], ["graph"])
+        self.run_cmd("update-task", "--revise", self.draft(fixed, name="fixed-edge.json"),
+                     "--reason", "review found a missing edge")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][1]["depends_on"], ["A"])
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertIsNone(saved["decomposition_review"])
+        self.assertIsNone(saved["approval_ref"])
         self.design_review()
         reviewed = json.loads(self.path.read_text())["decomposition_review"]
-        self.assertEqual(reviewed["mode"], "repair")
         self.assertEqual(reviewed["verdict"], "approved")
+        self.approve_as("session-plan")
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_deliverable_change_requires_a_new_full_review(self):
+    def test_deliverable_change_goes_through_the_same_cycle(self):
         self.awaiting([node("A")])
         self.design_review()
         changed = json.loads(self.path.read_text())
         changed["objective"] = "A different observable outcome"
-        changed["decomposition_review"] = None
-        self.run_cmd("update-task", "--amend", self.draft(changed, name="new-outcome.json"))
-        self.assertIsNone(json.loads(self.path.read_text())["decomposition_review"])
+        self.run_cmd("update-task", "--revise", self.draft(changed, name="new-outcome.json"),
+                     "--reason", "the objective moved with the sources")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["objective"], "A different observable outcome")
+        self.assertIsNone(saved["decomposition_review"])
 
     def test_plan_review_bugs_require_a_draft(self):
         self.awaiting([node("A")])
         fingerprint = json.loads(self.run_cmd("status", "--plan-view").stdout)["plan_fingerprint"]
         folder = self.root / ".dag" / "artifacts" / "draft-review"
         folder.mkdir(parents=True, exist_ok=True)
-        lanes = {lane: {"checks_performed": ["checked"], "bugs": [], "unsure": []} for lane in ("requirements", "graph", "execution")}
-        lanes["graph"]["bugs"] = [{"id": "g1", "kind": "granularity", "nodes": ["A"], "detail": "A is two nodes", "fix": "split in the draft"}]
         review = folder / "review.json"
-        review.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes, "draft_ref": None}), encoding="utf-8")
+        review.write_text(json.dumps({
+            "dag_id": "fixture", "plan_fingerprint": fingerprint,
+            "checks_performed": ["checked"],
+            "bugs": [{"id": "g1", "kind": "granularity", "nodes": ["A"], "detail": "A is two nodes", "fix": "split in the draft"}],
+            "unsure": [], "draft_ref": None,
+        }), encoding="utf-8")
         result = self.run_cmd("update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3)
         self.assertIn("bugs require a reviewer draft", result.stderr)
 
-        lanes["graph"]["bugs"] = []
-        review.write_text(json.dumps({"dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full", "lanes": lanes, "draft_ref": ".dag/reviewer-draft.json"}), encoding="utf-8")
+        review.write_text(json.dumps({
+            "dag_id": "fixture", "plan_fingerprint": fingerprint,
+            "checks_performed": ["checked"],
+            "bugs": [], "unsure": [], "draft_ref": ".dag/reviewer-draft.json",
+        }), encoding="utf-8")
         result = self.run_cmd("update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3)
         self.assertIn("draft_ref requires at least one bug", result.stderr)
 
     def reviewer_draft(self, edit, name="reviewer-draft.json"):
         """A draft the plan reviewer produced by copying the review request and fixing it."""
         request = json.loads(self.run_cmd("status", "--review-request").stdout)
-        for key in ("mode", "plan_fingerprint", "required_lanes", "base_fingerprint", "open_findings"):
-            request.pop(key, None)
+        request.pop("plan_fingerprint", None)
         edit(request)
         return self.draft(request, name=name)
 
@@ -697,6 +671,7 @@ class RuntimeTests(unittest.TestCase):
         self.awaiting([node("A"), node("B")])
         request = json.loads(self.run_cmd("status", "--review-request").stdout)
         old_fingerprint = request["plan_fingerprint"]
+        self.assertNotIn("mode", request)
 
         def add_edge(draft):
             draft["nodes"][1]["depends_on"] = ["A"]
@@ -704,16 +679,16 @@ class RuntimeTests(unittest.TestCase):
         draft_ref = self.reviewer_draft(add_edge)
         folder = self.root / ".dag" / "artifacts" / "draft-review"
         folder.mkdir(parents=True, exist_ok=True)
-        lanes = {lane: {"checks_performed": [f"{lane} checks"], "bugs": [], "unsure": []} for lane in ("requirements", "graph", "execution")}
-        lanes["graph"]["bugs"] = [{
-            "id": "g1", "kind": "missing_dependency", "nodes": ["B"],
-            "detail": "B consumes A's interface but declares no dependency",
-            "fix": "B.depends_on = [A] in the draft",
-        }]
         review = folder / "review.json"
         review.write_text(json.dumps({
-            "dag_id": "fixture", "plan_fingerprint": old_fingerprint, "mode": "full",
-            "lanes": lanes, "draft_ref": draft_ref,
+            "dag_id": "fixture", "plan_fingerprint": old_fingerprint,
+            "checks_performed": ["checked dependencies"],
+            "bugs": [{
+                "id": "g1", "kind": "missing_dependency", "nodes": ["B"],
+                "detail": "B consumes A's interface but declares no dependency",
+                "fix": "B.depends_on = [A] in the draft",
+            }],
+            "unsure": [], "draft_ref": draft_ref,
         }), encoding="utf-8")
         result = self.run_cmd(
             "update-task", "--decomposition-review", str(review.relative_to(self.root)),
@@ -723,13 +698,13 @@ class RuntimeTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         record = saved["decomposition_review"]
         self.assertEqual(record["verdict"], "approved")
-        self.assertEqual(record["base_fingerprint"], old_fingerprint)
         self.assertNotEqual(record["fingerprint"], old_fingerprint)
         self.assertEqual(record["draft_ref"], draft_ref)
         self.assertEqual(next(n for n in saved["nodes"] if n["id"] == "B")["depends_on"], ["A"])
         self.assertEqual(saved["planning_status"], "awaiting_approval")
         request_after = json.loads(self.run_cmd("status", "--review-request").stdout)
-        self.assertEqual(request_after["mode"], "full")
+        self.assertIn("plan_fingerprint", request_after)
+        self.assertNotIn("mode", request_after)
 
     def test_reviewer_draft_cannot_change_deliverables(self):
         self.awaiting([node("A")])
@@ -741,16 +716,16 @@ class RuntimeTests(unittest.TestCase):
         draft_ref = self.reviewer_draft(new_objective)
         folder = self.root / ".dag" / "artifacts" / "draft-review"
         folder.mkdir(parents=True, exist_ok=True)
-        lanes = {lane: {"checks_performed": ["checked"], "bugs": [], "unsure": []} for lane in ("requirements", "graph", "execution")}
-        lanes["requirements"]["bugs"] = [{
-            "id": "r1", "kind": "coverage", "nodes": ["A"],
-            "detail": "the objective no longer matches the sources",
-            "fix": "rewrote the objective in the draft",
-        }]
         review = folder / "review.json"
         review.write_text(json.dumps({
-            "dag_id": "fixture", "plan_fingerprint": fingerprint, "mode": "full",
-            "lanes": lanes, "draft_ref": draft_ref,
+            "dag_id": "fixture", "plan_fingerprint": fingerprint,
+            "checks_performed": ["checked coverage"],
+            "bugs": [{
+                "id": "r1", "kind": "coverage", "nodes": ["A"],
+                "detail": "the objective no longer matches the sources",
+                "fix": "rewrote the objective in the draft",
+            }],
+            "unsure": [], "draft_ref": draft_ref,
         }), encoding="utf-8")
         result = self.run_cmd(
             "update-task", "--decomposition-review", str(review.relative_to(self.root)),
@@ -776,7 +751,8 @@ class RuntimeTests(unittest.TestCase):
         value["nodes"][0]["read_first"] = ["docs"]
         value["planning_status"] = "awaiting_approval"
         value["approval_ref"] = None
-        self.run_cmd("update-task", "--amend", self.draft(value, name="directory-read-first.json"))
+        self.run_cmd("update-task", "--revise", self.draft(value, name="directory-read-first.json"),
+                     "--reason", "scope reading surface grew")
         result = self.run_cmd("preflight-plan")
         self.assertIn("regular files, not directories", result.stderr)
 
@@ -787,7 +763,7 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_cmd("update-task", "--init", ref, expect=3)
         self.assertIn("starts as 'draft' or 'awaiting_approval'", result.stderr)
 
-    def test_amend_replaces_the_plan_and_requests_a_scoped_repair_review(self):
+    def test_revise_replaces_the_plan_and_restarts_review(self):
         self.awaiting([node("A"), node("B")])
         self.design_review(unsure=[
             {"id": "edge-1", "kind": "missing_dependency", "nodes": ["B"], "question": "add the edge?",
@@ -796,68 +772,53 @@ class RuntimeTests(unittest.TestCase):
         fixed = dag([node("A"), node("B", depends=("A",))])
         fixed["planning_status"] = "awaiting_approval"
         fixed["approval_ref"] = None
-        ref = self.draft(fixed, name="amended.json")
-        self.run_cmd("update-task", "--amend", ref)
+        ref = self.draft(fixed, name="reworked.json")
+        self.run_cmd("update-task", "--revise", ref, "--reason", "review found a missing edge")
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["nodes"][1]["depends_on"], ["A"])
-        self.assertEqual(saved["decomposition_review"]["mode"], "repair")
-        self.assertEqual(saved["decomposition_review"]["required_lanes"], ["graph"])
-        self.assertEqual(saved["decomposition_review"]["open_findings"][0]["id"], "edge-1")
-        self.assertTrue((self.root / ".dag" / "amended.json").exists())
-        self.assertEqual(saved["replans"][-1]["ref"], ".dag/amended.json")
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertIsNone(saved["decomposition_review"])
+        self.assertTrue((self.root / ".dag" / "reworked.json").exists())
+        self.assertEqual(saved["replans"][-1]["ref"], ".dag/reworked.json")
+        self.assertEqual(saved["replans"][-1]["kind"], "revision")
 
         request = json.loads(self.run_cmd("status", "--review-request").stdout)
         for field in ("objective", "source_refs", "assumptions", "global_acceptance", "max_parallel"):
             self.assertIn(field, request)
-        review = self.root / ".dag" / "artifacts" / "design-review" / "review.json"
-        review.write_text(json.dumps({
-            "dag_id": "fixture",
-            "plan_fingerprint": request["plan_fingerprint"],
-            "mode": "repair",
-            "lanes": {
-                "graph": {
-                    "checks_performed": ["checked amended graph"],
-                    "bugs": [],
-                    "unsure": [{
-                        "id": "edge-1",
-                        "kind": "missing_dependency",
-                        "nodes": ["B"],
-                        "detail": "new finding reused a prior ID",
-                        "question": "add the edge?",
-                    }],
-                    "resolutions": [{
-                        "id": "edge-1",
-                        "status": "ADDRESSED",
-                        "detail": "original dependency finding was fixed",
-                    }],
-                },
-            },
-            "draft_ref": None,
-        }), encoding="utf-8")
-        result = self.run_cmd(
-            "update-task", "--decomposition-review", str(review.relative_to(self.root)), expect=3,
-        )
-        self.assertIn("must not reuse prior finding IDs", result.stderr)
-
         self.design_review()
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_amend_refuses_an_approved_or_started_plan(self):
-        self.awaiting([node("A")])
-        self.approve_as("session-plan")
-        ref = self.draft(dag([node("A")]), name="amended.json")
-        result = self.run_cmd("update-task", "--amend", ref, expect=3)
-        self.assertIn("--revise", result.stderr)
+    def test_revise_accepts_any_incomplete_planning_status(self):
+        for index, setup in enumerate(
+            (
+                lambda: self.write({**dag([node("A")]), "planning_status": "draft", "approval_ref": None}),
+                lambda: self.awaiting([node("A")]),
+                lambda: self.live_plan([node("A")]),
+                lambda: self.broken_plan([node("A"), node("B")]),
+            )
+        ):
+            setup()
+            proposed = json.loads(self.path.read_text())
+            proposed["nodes"].append(node(f"N{index}"))
+            ref = self.draft(proposed, name=f"status-{index}.json")
+            self.run_cmd("update-task", "--revise", ref, "--reason", "frontier grew")
+            saved = json.loads(self.path.read_text())
+            self.assertEqual(saved["planning_status"], "awaiting_approval")
+            self.assertIsNone(saved["approval_ref"])
+            self.assertIsNone(saved["decomposition_review"])
+            self.assertEqual(saved["replans"][-1]["kind"], "revision")
+            self.assertEqual(saved["replans"][-1]["added"], [f"N{index}"])
 
-    def test_amend_keeps_the_same_effort(self):
+    def test_revise_keeps_the_same_effort(self):
         self.awaiting([node("A")])
         other = dag([node("A")])
         other["dag_id"] = "different"
         other["planning_status"] = "awaiting_approval"
         other["approval_ref"] = None
-        ref = self.draft(other, name="amended.json")
-        result = self.run_cmd("update-task", "--amend", ref, expect=3)
+        ref = self.draft(other, name="other.json")
+        result = self.run_cmd("update-task", "--revise", ref, "--reason", "wrong effort",
+                              expect=3)
         self.assertIn("must stay 'fixture'", result.stderr)
 
     def live_plan(self, nodes):
@@ -867,24 +828,9 @@ class RuntimeTests(unittest.TestCase):
         return json.loads(self.path.read_text())
 
     def revise(self, proposed, *, name="revision.json", reason="execution disproved the slice",
-               review=None, reference=None, expect=0):
+               expect=0):
         args = ["update-task", "--revise", self.draft(proposed, name=name), "--reason", reason]
-        if review:
-            args += ["--revision-review", review]
-        if reference:
-            args += ["--reference", reference]
         return self.run_cmd(*args, expect=expect)
-
-    def scoped_review(self, bugs=(), unsure=(), name="scoped-review.json"):
-        artifact = self.root / ".dag" / "artifacts" / name
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        bugs = [{"id": item.get("id", f"b{index}"), **item} for index, item in enumerate(bugs, 1)]
-        unsure = [{"id": item.get("id", f"u{index}"), **item} for index, item in enumerate(unsure, 1)]
-        artifact.write_text(json.dumps(
-            {"dag_id": "fixture", "bugs": bugs, "unsure": unsure,
-             "checks_performed": ["blast radius", "interface continuity"]}
-        ), encoding="utf-8")
-        return str(artifact.relative_to(self.root))
 
     def test_revise_reorganises_a_leaf_without_ceremony(self):
         current = self.live_plan([node("A"), node("B")])
@@ -893,40 +839,37 @@ class RuntimeTests(unittest.TestCase):
         proposed["nodes"][1]["title"] = "Node B, re-scoped"
         self.revise(proposed)
         saved = json.loads(self.path.read_text())
-        self.assertEqual(saved["planning_status"], "approved")
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertIsNone(saved["approval_ref"])
+        self.assertIsNone(saved["decomposition_review"])
         self.assertEqual(saved["nodes"][1]["read_first"], ["docs/spec.md"])
         self.assertEqual(saved["replans"][-1]["retouched"], ["B"])
         self.assertEqual(saved["replans"][-1]["reason"], "execution disproved the slice")
-        self.assertEqual(saved["approval_ref"], current["approval_ref"])
 
-    def test_revise_cannot_change_what_the_project_delivers(self):
+    def test_revise_can_change_what_the_project_delivers(self):
         current = self.live_plan([node("A")])
         proposed = copy.deepcopy(current)
         proposed["global_acceptance"] = [{"id": "G1", "criterion": "something else entirely"}]
-        result = self.revise(proposed, expect=3)
-        self.assertIn("global_acceptance", result.stderr)
-        self.assertIn("--amend", result.stderr)
+        self.revise(proposed, reason="the sources moved")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["global_acceptance"], [{"id": "G1", "criterion": "something else entirely"}])
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
 
-    def test_revise_escalates_when_a_node_is_dropped(self):
+    def test_revise_drops_a_leaf_without_a_review_gate(self):
         current = self.live_plan([node("A"), node("B", depends=("A",))])
         proposed = copy.deepcopy(current)
-        proposed["nodes"] = [n for n in proposed["nodes"] if n["id"] != "A"]
+        proposed["nodes"] = [proposed["nodes"][1]]
         proposed["nodes"][0]["depends_on"] = []
-        result = self.revise(proposed, expect=3)
-        self.assertIn("--revision-review", result.stderr)
-        self.assertIn("still covered once work leaves the plan", result.stderr)
-        self.revise(proposed, name="r2.json", review=self.scoped_review())
+        self.revise(proposed, reason="A is no longer needed")
         saved = json.loads(self.path.read_text())
         self.assertEqual([n["id"] for n in saved["nodes"]], ["B"])
         self.assertEqual(saved["replans"][-1]["dropped"], ["A"])
 
-    def test_revise_escalates_when_an_interface_moves(self):
+    def test_revise_moving_an_interface_needs_no_review_gate(self):
         current = self.live_plan([node("A"), node("B", depends=("A",))])
         proposed = copy.deepcopy(current)
         proposed["nodes"][0]["outputs"] = ["a completely different artifact"]
-        result = self.revise(proposed, expect=3)
-        self.assertIn("--revision-review", result.stderr)
-        self.revise(proposed, name="r2.json", review=self.scoped_review())
+        self.revise(proposed, reason="the interface moved with the sources")
         self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"],
                          ["a completely different artifact"])
 
@@ -934,51 +877,10 @@ class RuntimeTests(unittest.TestCase):
         current = self.live_plan([node("A")])
         proposed = copy.deepcopy(current)
         proposed["nodes"].append(node("C", depends=("A",)))
-        self.revise(proposed)
+        self.revise(proposed, reason="frontier grew")
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["replans"][-1]["added"], ["C"])
-        self.assertEqual(saved["planning_status"], "approved")
-
-    def test_scoped_review_unsure_blocks_the_revision(self):
-        current = self.live_plan([node("A"), node("B", depends=("A",))])
-        proposed = copy.deepcopy(current)
-        proposed["nodes"][0]["outputs"] = ["something else"]
-        review = self.scoped_review(unsure=[
-            {"kind": "missing_dependency", "nodes": ["B"], "question": "what replaces A's old output for B?",
-             "detail": "B consumes A's old output and nothing replaces it"},
-        ])
-        result = self.revise(proposed, review=review, expect=3)
-        self.assertIn("unsure item(s)", result.stderr)
-        self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"], ["output A"])
-
-    def test_scoped_review_bugs_do_not_block_the_revision(self):
-        current = self.live_plan([node("A"), node("B", depends=("A",))])
-        proposed = copy.deepcopy(current)
-        proposed["nodes"][0]["outputs"] = ["something else"]
-        review = self.scoped_review(bugs=[
-            {"kind": "interface", "nodes": ["A"], "fix": "reworded the output in the revision draft",
-             "detail": "the output text did not match the interface B reads"},
-        ])
-        self.revise(proposed, review=review)
-        saved = json.loads(self.path.read_text())
-        self.assertEqual(saved["nodes"][0]["outputs"], ["something else"])
-        self.assertNotIn("decision_ref", saved["replans"][-1])
-
-    def test_revision_reference_is_required_persistent_and_recorded_for_override(self):
-        current = self.live_plan([node("A"), node("B", depends=("A",))])
-        proposed = copy.deepcopy(current)
-        proposed["nodes"][0]["outputs"] = ["something else"]
-        review = self.scoped_review(unsure=[
-            {"kind": "scope_realism", "nodes": ["A"], "question": "accept the narrower scope?",
-             "detail": "subjective concern"},
-        ])
-        result = self.revise(copy.deepcopy(proposed), review=review, reference=".dag/sources/missing-decision.md", expect=3)
-        self.assertIn("does not exist", result.stderr)
-        decision = self.root / ".dag" / "sources" / "decision.md"
-        decision.parent.mkdir(parents=True, exist_ok=True)
-        decision.write_text("user decision\n", encoding="utf-8")
-        self.revise(proposed, review=review, reference=".dag/sources/decision.md")
-        self.assertEqual(json.loads(self.path.read_text())["replans"][-1]["decision_ref"], ".dag/sources/decision.md")
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
 
     def test_revise_freezes_running_and_done_contracts(self):
         self.live_plan([node("A"), node("B")])
@@ -998,14 +900,19 @@ class RuntimeTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["nodes"][0]["objective"], "Deliver A with the brief execution proved it needs")
         self.assertEqual(len(saved["nodes"][0]["attempts"]), 1)
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
 
-    def test_revision_drift_from_its_review_is_reported(self):
-        current = self.live_plan([node("A")])
-        proposed = copy.deepcopy(current)
-        proposed["nodes"][0]["title"] = "Node A, retitled"
-        self.revise(proposed)
+    def test_stale_review_fingerprint_is_reported(self):
+        self.awaiting([node("A")])
+        self.design_review()
+        value = json.loads(self.path.read_text())
+        value["nodes"].append(node("B"))
+        value["decomposition_review"] = {"ref": ".dag/artifacts/design-review/review.json",
+                                         "fingerprint": "0" * 64, "verdict": "approved",
+                                         "findings": [], "recorded_at": now()}
+        self.write(value)
         result = self.run_cmd("validate-dag")
-        self.assertIn("revised 1 time(s) since its decomposition review", result.stdout + result.stderr)
+        self.assertIn("since its decomposition review", result.stdout + result.stderr)
 
     def broken_plan(self, nodes):
         """An approved DAG with A done, declared no longer fit for purpose."""
@@ -1016,12 +923,12 @@ class RuntimeTests(unittest.TestCase):
                      "--reference", ".dag/sources/fixture.md")
         return json.loads(self.path.read_text())
 
-    def test_amend_reworks_unstarted_work_and_keeps_the_record(self):
+    def test_revise_reworks_unstarted_work_and_keeps_the_record(self):
         current = self.broken_plan([node("A"), node("B")])
         proposed = copy.deepcopy(current)
         proposed["nodes"] = [proposed["nodes"][0], node("C", depends=("A",))]
         ref = self.draft(proposed, name="replan.json")
-        self.run_cmd("update-task", "--amend", ref)
+        self.run_cmd("update-task", "--revise", ref, "--reason", "replan after disproof")
         saved = json.loads(self.path.read_text())
         self.assertEqual([n["id"] for n in saved["nodes"]], ["A", "C"])
         self.assertEqual(saved["nodes"][0]["attempts"], current["nodes"][0]["attempts"])
@@ -1029,32 +936,35 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(saved["decomposition_review"])
         self.assertEqual(saved["replans"][-1]["added"], ["C"])
         self.assertEqual(saved["replans"][-1]["dropped"], ["B"])
-        self.assertEqual(saved["replans"][-1]["kept"], ["A"])
+        self.assertEqual(saved["replans"][-1]["retouched"], [])
         self.design_review()
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_amend_cannot_rewrite_an_execution_record(self):
+    def test_revise_cannot_rewrite_an_execution_record(self):
         current = self.broken_plan([node("A"), node("B")])
         proposed = copy.deepcopy(current)
         proposed["nodes"][0]["attempts"] = []
         proposed["nodes"][0]["status"] = "pending"
         ref = self.draft(proposed, name="replan.json")
-        result = self.run_cmd("update-task", "--amend", ref, expect=3)
+        result = self.run_cmd("update-task", "--revise", ref, "--reason", "rewrite history",
+                              expect=3)
         self.assertIn("execution record", result.stderr)
 
-    def test_amend_cannot_drop_or_retouch_a_done_node(self):
+    def test_revise_cannot_drop_or_retouch_a_done_node(self):
         current = self.broken_plan([node("A"), node("B")])
         proposed = copy.deepcopy(current)
         proposed["nodes"] = [proposed["nodes"][1]]
-        result = self.run_cmd("update-task", "--amend", self.draft(proposed, name="d1.json"), expect=3)
+        result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d1.json"),
+                              "--reason", "drop the evidence", expect=3)
         self.assertIn("cannot be dropped", result.stderr)
         proposed = copy.deepcopy(current)
         proposed["nodes"][0]["scope"]["files"] = ["src/A.py", "src/extra.py"]
-        result = self.run_cmd("update-task", "--amend", self.draft(proposed, name="d2.json"), expect=3)
+        result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d2.json"),
+                              "--reason", "widen a done contract", expect=3)
         self.assertIn("frozen", result.stderr)
 
-    def test_amend_can_reslice_a_failed_node(self):
+    def test_revise_can_reslice_a_failed_node(self):
         self.awaiting([node("A"), node("B")])
         self.approve_as("session-plan")
         self.start("B")
@@ -1064,7 +974,7 @@ class RuntimeTests(unittest.TestCase):
         proposed = json.loads(self.path.read_text())
         proposed["nodes"][1]["objective"] = "Deliver B, correctly sliced this time"
         ref = self.draft(proposed, name="replan.json")
-        self.run_cmd("update-task", "--amend", ref)
+        self.run_cmd("update-task", "--revise", ref, "--reason", "reslice after failure")
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["nodes"][1]["objective"], "Deliver B, correctly sliced this time")
         self.assertEqual(len(saved["nodes"][1]["attempts"]), 1)
@@ -1077,7 +987,8 @@ class RuntimeTests(unittest.TestCase):
         self.run_cmd("update-task", "--planning-status", "replan_required",
                      "--reference", ".dag/sources/fixture.md")
         reworked = json.loads(self.path.read_text())
-        self.run_cmd("update-task", "--amend", self.draft(reworked, name="rework.json"))
+        self.run_cmd("update-task", "--revise", self.draft(reworked, name="rework.json"),
+                     "--reason", "replan the rejected shape")
         self.design_review(unsure=[
             {"kind": "coverage", "nodes": ["B"], "question": "what delivers G1?",
              "detail": "nothing delivers G1"},
@@ -1088,7 +999,8 @@ class RuntimeTests(unittest.TestCase):
 
         fixed = copy.deepcopy(state)
         fixed["nodes"].append(node("G1", depends=("A",)))
-        self.run_cmd("update-task", "--amend", self.draft(fixed, name="fixed.json"))
+        self.run_cmd("update-task", "--revise", self.draft(fixed, name="fixed.json"),
+                     "--reason", "add the missing coverage")
         saved = json.loads(self.path.read_text())
         self.assertEqual([n["id"] for n in saved["nodes"]], ["A", "B", "G1"])
         self.assertEqual(saved["nodes"][0]["status"], "done")
@@ -1097,30 +1009,32 @@ class RuntimeTests(unittest.TestCase):
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "approved")
 
-    def test_every_amendment_is_recorded_and_its_draft_survives(self):
+    def test_every_revision_is_recorded_and_its_draft_survives(self):
         """`replans` points at the proposed plan, so the file it names must still be there."""
         self.awaiting([node("A")])
         proposed = json.loads(self.path.read_text())
         proposed["nodes"][0]["title"] = "Node A, retitled"
         ref = self.draft(proposed, name="first.json")
-        self.run_cmd("update-task", "--amend", ref)
+        self.run_cmd("update-task", "--revise", ref, "--reason", "retitle")
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["replans"][-1]["ref"], ref)
-        self.assertEqual(saved["replans"][-1]["kind"], "amendment")
+        self.assertEqual(saved["replans"][-1]["kind"], "revision")
         self.assertTrue((self.root / ref).exists())
 
-    def test_amend_requires_a_declared_break_and_a_settled_graph(self):
+    def test_revise_requires_a_reason_and_refuses_completed_or_failed_convergence(self):
         self.awaiting([node("A"), node("B")])
         self.approve_as("session-plan")
         proposed = json.loads(self.path.read_text())
-        result = self.run_cmd("update-task", "--amend", self.draft(proposed, name="d1.json"), expect=3)
-        self.assertIn("replan_required", result.stderr)
+        result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d1.json"),
+                              expect=3)
+        self.assertIn("--revise requires --reason", result.stderr)
         self.start("A")
         self.run_cmd("update-task", "--planning-status", "replan_required",
                      "--reference", ".dag/sources/fixture.md")
         proposed = json.loads(self.path.read_text())
-        result = self.run_cmd("update-task", "--amend", self.draft(proposed, name="d2.json"), expect=3)
-        self.assertIn("settle running nodes", result.stderr)
+        self.run_cmd("update-task", "--revise", self.draft(proposed, name="d2.json"),
+                     "--reason", "replan while A runs")
+        self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
 
     def test_failed_convergence_still_belongs_to_gap_nodes(self):
         self.awaiting([node("A")])
@@ -1133,8 +1047,24 @@ class RuntimeTests(unittest.TestCase):
                      "--reference", ".dag/artifacts/conv.md", "--gap", "G1 uncovered")
         proposed = json.loads(self.path.read_text())
         self.assertEqual(proposed["planning_status"], "replan_required")
-        result = self.run_cmd("update-task", "--amend", self.draft(proposed, name="d.json"), expect=3)
+        result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d.json"),
+                              "--reason", "skip the gaps", expect=3)
         self.assertIn("--add-gap-nodes", result.stderr)
+
+    def test_revise_refuses_a_completed_plan(self):
+        self.awaiting([node("A")])
+        self.approve_as("session-plan")
+        self.complete("A")
+        report = self.root / ".dag" / "artifacts" / "conv.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("passed\n", encoding="utf-8")
+        self.run_cmd("update-task", "--convergence", "passed", "--reference", ".dag/artifacts/conv.md")
+        self.run_cmd("update-task", "--planning-status", "complete",
+                     "--reference", ".dag/artifacts/conv.md")
+        proposed = json.loads(self.path.read_text())
+        result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d.json"),
+                              "--reason", "reopen", expect=3)
+        self.assertIn("completed plan cannot be revised", result.stderr)
 
     def test_archive_requires_a_complete_dag(self):
         self.write(dag([node("A")]))
@@ -1237,6 +1167,102 @@ class RuntimeTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["nodes"][0]["status"], "done")
         self.assertEqual(saved["nodes"][0]["attempts"][0]["outcome"], "done")
+
+    def test_done_without_a_commit_binding(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        folder = self.root / ".dag" / "artifacts" / "A"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "handoff.json").write_text(json.dumps({
+            "node": "A",
+            "status": "DONE",
+            "files_changed": [],
+            "outputs": ["output A"],
+            "decisions": [],
+            "verification": [{"command": "fixture check", "result": "exit 0"}],
+            "context_used": [],
+            "concerns": [],
+            "unresolved": [],
+            "downstream_notes": [],
+            "commit": None,
+        }), encoding="utf-8")
+        (folder / "review.json").write_text(json.dumps({
+            "node": "A",
+            "head_ref": None,
+            "round": 1,
+            "worker_head": None,
+            "fix_commit": None,
+            "bugs": [],
+            "unsure": [],
+        }), encoding="utf-8")
+        (folder / "master.json").write_text(json.dumps({
+            "node": "A",
+            "head_ref": None,
+            "checked_at": now(),
+            "acceptance_ids": ["AC1"],
+            "checks": [{"command": "fixture check", "exit_code": 0, "result": "passed"}],
+            "scope_files": [],
+        }), encoding="utf-8")
+        self.run_cmd(
+            "update-task", "A", "review",
+            "--handoff-ref", ".dag/artifacts/A/handoff.json",
+            "--review-ref", ".dag/artifacts/A/review.json",
+        )
+        self.run_cmd(
+            "update-task", "A", "done",
+            "--handoff-ref", ".dag/artifacts/A/handoff.json",
+            "--verification-ref", ".dag/artifacts/A/master.json",
+            "--summary", "A delivered",
+        )
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][0]["status"], "done")
+        self.assertIsNone(saved["nodes"][0]["attempts"][0]["head_ref"])
+
+    def test_done_without_head_ref_after_a_commit_bound_review_fails(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        head = self.commit_node("A")
+        handoff, review, master = self.artifacts("A", head)
+        self.run_cmd("update-task", "A", "review", "--handoff-ref", handoff, "--review-ref", review, "--head-ref", head)
+        self.run_cmd(
+            "update-task", "A", "done",
+            "--handoff-ref", handoff, "--verification-ref", master,
+            "--summary", "A delivered", expect=3,
+        )
+
+    def test_commitless_review_cannot_report_bugs(self):
+        self.write(dag([node("A")]))
+        self.start("A")
+        folder = self.root / ".dag" / "artifacts" / "A"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "handoff.json").write_text(json.dumps({
+            "node": "A",
+            "status": "DONE",
+            "files_changed": [],
+            "outputs": ["output A"],
+            "decisions": [],
+            "verification": [{"command": "fixture check", "result": "exit 0"}],
+            "context_used": [],
+            "concerns": [],
+            "unresolved": [],
+            "downstream_notes": [],
+            "commit": None,
+        }), encoding="utf-8")
+        (folder / "review.json").write_text(json.dumps({
+            "node": "A",
+            "head_ref": None,
+            "round": 1,
+            "worker_head": None,
+            "fix_commit": None,
+            "bugs": [{"id": "b1", "detail": "something wrong", "path": "src/A.py"}],
+            "unsure": [],
+        }), encoding="utf-8")
+        self.run_cmd(
+            "update-task", "A", "review",
+            "--handoff-ref", ".dag/artifacts/A/handoff.json",
+            "--review-ref", ".dag/artifacts/A/review.json",
+            expect=3,
+        )
 
     def test_approval_and_convergence_gates(self):
         value = dag([node("A")])
@@ -1784,8 +1810,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('update-task <node> failed --reason', archive.stderr)
         self.run_cmd("update-task", "--planning-status", "replan_required",
                      "--reference", ".dag/sources/fixture.md")
-        amend = self.run_cmd("update-task", "--amend", ".dag/draft.json", expect=3)
-        self.assertIn('update-task <node> failed --reason', amend.stderr)
+        revise = self.run_cmd("update-task", "--revise", ".dag/draft.json",
+                              "--reason", "settle first", expect=3)
+        self.assertIn("draft not found", revise.stderr)
 
     def test_revision_patch_changes_only_the_nodes_it_names(self):
         self.live_plan([node("A"), node("B")])
@@ -1801,10 +1828,11 @@ class RuntimeTests(unittest.TestCase):
         self.live_plan([node("A"), node("B")])
         self.revise(
             {"dag_id": "fixture", "drop_nodes": ["B"], "update_nodes": [node("C")]},
-            name="patch.json", review=self.scoped_review(),
+            name="patch.json", reason="swap the leaf",
         )
         saved = json.loads(self.path.read_text())
         self.assertEqual([item["id"] for item in saved["nodes"]], ["A", "C"])
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
 
     def test_revision_patch_cannot_touch_an_execution_record(self):
         self.write(dag([node("A"), node("B")]))
@@ -1820,12 +1848,6 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("patch dag_id must be 'fixture'", result.stderr)
         result = self.revise({"dag_id": "fixture", "nodes_to_update": []}, name="patch2.json", expect=3)
         self.assertIn("unknown field(s) in revision patch: nodes_to_update", result.stderr)
-
-    def test_amend_takes_a_whole_plan_not_a_patch(self):
-        self.broken_plan([node("A"), node("B")])
-        ref = self.draft({"dag_id": "fixture", "update_nodes": [{"id": "B", "title": "x"}]}, name="patch.json")
-        result = self.run_cmd("update-task", "--amend", ref, expect=3)
-        self.assertIn("takes a whole plan, not a patch", result.stderr)
 
 
 if __name__ == "__main__":

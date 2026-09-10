@@ -86,16 +86,17 @@ Apply `references/verification.md`. The controller independently checks scope, r
 
 Do not fix implementation code inline while acting as the independent acceptance check.
 
+`--head-ref` binds the review and the completion to a real commit. When the node produced no commit — an investigation, a decision recorded in an artifact — omit it from both the review and the done command, and the artifacts carry null refs and empty file lists instead of a commit binding.
+
 ## Replan and converge
 
-If execution shows that the graph or contract is wrong, revise the graph or require a replan; do not widen a node silently. A revision that drops a node or moves what it produces or waits on needs a scoped review first: dispatch the reviewer with edit capability against the changed neighborhood, let it fix what it can directly in the revision draft (`bugs`), and pass its artifact with `--revision-review`; open `unsure` items take the user's durable `--reference` decision:
+If execution shows that the graph or contract is wrong, change the plan with the same loop planning uses; do not widen a node silently. `--revise` replaces the plan from a draft or patch, preserves every execution record, and returns it to `awaiting_approval` for one full review round and the approval gate, exactly like a new plan. Mark a live plan for replanning when the deliverable itself is in doubt:
 
 ```bash
-"${SKILL_ROOT}/scripts/update-task" --revise ".dag/revision.json" \
-  --reason "<one line>" --revision-review ".dag/artifacts/scoped-review.json"
+"${SKILL_ROOT}/scripts/update-task" --revise ".dag/revision.json" --reason "<one line>"
 "${SKILL_ROOT}/scripts/update-task" --planning-status replan_required \
   --reference "<durable path recording why>"
-"${SKILL_ROOT}/scripts/update-task" --amend ".dag/amendment.json"
+"${SKILL_ROOT}/scripts/update-task" --revise ".dag/replan.json" --reason "<one line>"
 ```
 
 Integrate only nodes that passed worker, review, and master gates, in semantic dependency order. After related nodes land, run integration checks and a whole-plan convergence review. If a gap exists, record it and add explicit gap nodes:

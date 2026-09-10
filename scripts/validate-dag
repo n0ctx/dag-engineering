@@ -36,8 +36,6 @@ WORK_TYPES = {"implementation", "investigation", "integration", "documentation"}
 CONVERGENCE_STATUSES = {"pending", "failed", "passed"}
 REVIEW_OUTCOMES = {"approved", "cannot_verify", "escalated"}
 UNSURE_REASONS = {"contract", "scope", "unsafe"}
-PLAN_REVIEW_LANES = ("requirements", "graph", "execution")
-PLAN_REVIEW_MODES = {"full", "repair"}
 WORKER_DONE_STATUSES = {"DONE", "DONE_WITH_CONCERNS"}
 NODE_TRANSITIONS = {
     "pending": {"running"},
@@ -458,20 +456,21 @@ def load_json_artifact(dag_path: Path, ref: Any, label: str) -> dict[str, Any]:
 
 
 def validate_handoff_artifact(
-    dag_path: Path, ref: str, node_id: str, head_ref: str, changed: list[str]
+    dag_path: Path, ref: str, node_id: str, head_ref: str | None, changed: list[str] | None
 ) -> dict[str, Any]:
     value = load_json_artifact(dag_path, ref, "handoff artifact")
     if value.get("node") != node_id:
         raise DagError(f"handoff artifact node must be {node_id!r}")
     if value.get("status") not in WORKER_DONE_STATUSES:
         raise DagError("handoff artifact status must be DONE or DONE_WITH_CONCERNS")
-    commit = value.get("commit")
-    if commit != head_ref:
-        raise DagError("handoff artifact commit must equal the reviewed head commit")
-    if not isinstance(value.get("files_changed"), list):
-        raise DagError("handoff artifact files_changed must be an array")
-    if value["files_changed"] != changed:
-        raise DagError("handoff artifact files_changed must equal the Git diff path list")
+    if head_ref is not None:
+        commit = value.get("commit")
+        if commit != head_ref:
+            raise DagError("handoff artifact commit must equal the reviewed head commit")
+        if not isinstance(value.get("files_changed"), list):
+            raise DagError("handoff artifact files_changed must be an array")
+        if value["files_changed"] != changed:
+            raise DagError("handoff artifact files_changed must equal the Git diff path list")
     if not isinstance(value.get("verification"), list) or not value["verification"]:
         raise DagError("handoff artifact verification must be a non-empty array")
     context_used = value.get("context_used")
@@ -597,43 +596,7 @@ def plan_fingerprint(dag: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def validate_design_review_artifact(
-    dag_path: Path, ref: str, dag: dict[str, Any], extra_nodes: set[str] | None = None
-) -> dict[str, Any]:
-    """Validate the scoped review of a revision, in the same fix-first shape as a plan review.
-
-    The revision reviewer is dispatched with edit capability and fixes what it can
-    directly in the controller's revision draft, so its `bugs` never block; only
-    `unsure` items, which need the user or controller, do.
-    """
-    value = load_json_artifact(dag_path, ref, "scoped revision review artifact")
-    if value.get("dag_id") != dag["dag_id"]:
-        raise DagError(f"scoped revision review artifact dag_id must be {dag['dag_id']!r}")
-    known = {node["id"] for node in dag["nodes"]} | (extra_nodes or set())
-    seen: set[str] = set()
-    normalized: list[dict[str, Any]] = []
-    buckets: dict[str, list[dict[str, Any]]] = {}
-    for name, validator in (("bugs", validate_plan_bug), ("unsure", validate_plan_unsure)):
-        entries = value.get(name)
-        if not isinstance(entries, list):
-            raise DagError(f"scoped revision review artifact {name} must be an array")
-        bucket: list[dict[str, Any]] = []
-        for index, finding in enumerate(entries):
-            finding = validator(
-                finding, f"scoped revision review {name}[{index}]", known, None, seen
-            )
-            normalized.append(finding)
-            bucket.append(finding)
-        buckets[name] = bucket
-    checks = value.get("checks_performed")
-    if not isinstance(checks, list) or not checks or any(not is_text(item) for item in checks):
-        raise DagError("scoped revision review artifact checks_performed must be a non-empty string array")
-    return {"findings": normalized, **buckets}
-
-
-def validate_plan_entry(
-    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
-) -> dict[str, Any]:
+def validate_plan_entry(finding: Any, label: str, known: set[str], seen: set[str]) -> dict[str, Any]:
     if not isinstance(finding, dict):
         raise DagError(f"{label}: must be an object")
     validate_finding_id(finding.get("id"), label)
@@ -648,31 +611,27 @@ def validate_plan_entry(
     nodes = finding.get("nodes", [])
     if not isinstance(nodes, list) or any(item not in known for item in nodes):
         raise DagError(f"{label}.nodes: must reference existing node IDs")
-    return {**finding, **({"lane": lane} if lane is not None else {})}
+    return finding
 
 
-def validate_plan_bug(
-    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
-) -> dict[str, Any]:
-    finding = validate_plan_entry(finding, label, known, lane, seen)
+def validate_plan_bug(finding: Any, label: str, known: set[str], seen: set[str]) -> dict[str, Any]:
+    finding = validate_plan_entry(finding, label, known, seen)
     if not is_text(finding.get("fix")):
         raise DagError(f"{label}.fix: must describe what the reviewer draft changes")
     return finding
 
 
-def validate_plan_unsure(
-    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
-) -> dict[str, Any]:
-    finding = validate_plan_entry(finding, label, known, lane, seen)
+def validate_plan_unsure(finding: Any, label: str, known: set[str], seen: set[str]) -> dict[str, Any]:
+    finding = validate_plan_entry(finding, label, known, seen)
     if not is_text(finding.get("question")):
         raise DagError(f"{label}.question: must state the decision the user or controller must make")
     return finding
 
 
 def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any]) -> dict[str, Any]:
-    """Validate the compact, single review.json result.
+    """Validate the compact, single-round review.json result.
 
-    The reviewer works fix-first: a lane's `bugs` are defects it already repaired in its
+    The reviewer works fix-first: its `bugs` are defects it already repaired in its
     draft plan, and its `unsure` entries are everything only the user or controller may
     decide. Bugs and a draft are two halves of one claim, so the runtime requires both
     or neither.
@@ -682,58 +641,25 @@ def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any])
         raise DagError(f"plan review artifact dag_id must be {dag['dag_id']!r}")
     if value.get("plan_fingerprint") != plan_fingerprint(dag):
         raise DagError("plan review artifact not bound to current plan fingerprint")
-    pending = dag.get("decomposition_review") or {}
-    mode = value.get("mode")
-    if mode not in PLAN_REVIEW_MODES:
-        raise DagError("plan review artifact mode must be 'full' or 'repair'")
-    if pending.get("verdict") is None and pending.get("mode") and mode != pending["mode"]:
-        raise DagError("plan review artifact mode does not match the pending request")
-    if mode == "full":
-        required = list(PLAN_REVIEW_LANES)
-    else:
-        required = pending.get("required_lanes")
-        if (
-            not isinstance(required, list)
-            or not required
-            or len(required) != len(set(required))
-            or set(required) - set(PLAN_REVIEW_LANES)
-        ):
-            raise DagError("repair review lanes must exactly match the pending request")
-    lanes = value.get("lanes")
-    if not isinstance(lanes, dict) or set(lanes) != set(required):
-        raise DagError("review.json lanes must contain every required lane and every requested lane exactly once; findings must reference existing node IDs")
+    checks = value.get("checks_performed")
+    if not isinstance(checks, list) or not checks or any(not is_text(item) for item in checks):
+        raise DagError("review.json checks_performed must be a non-empty string array")
     known = {node["id"] for node in dag["nodes"]}
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
-    bugs: list[dict[str, Any]] = []
-    open_unsure: list[dict[str, Any]] = []
-    for lane in required:
-        section = lanes[lane]
-        if not isinstance(section, dict):
-            raise DagError(f"review.json lanes[{lane!r}] must be an object")
-        checks = section.get("checks_performed")
-        if not isinstance(checks, list) or not checks or any(not is_text(item) for item in checks):
-            raise DagError(f"{lane}.checks_performed must be a non-empty string array")
-        for name, validator, bucket in (
-            ("bugs", validate_plan_bug, bugs),
-            ("unsure", validate_plan_unsure, open_unsure),
-        ):
-            entries = section.get(name)
-            if not isinstance(entries, list):
-                raise DagError(f"{lane}.{name} must be an array")
-            for index, finding in enumerate(entries):
-                label = f"{lane}.{name}[{index}]"
-                if isinstance(finding, dict) and "lane" in finding:
-                    raise DagError(f"{label}.lane is controlled by its enclosing lane")
-                finding = validator(finding, label, known, lane, seen)
-                normalized.append(finding)
-                bucket.append(finding)
-        if mode == "repair":
-            resolutions = section.get("resolutions")
-            if not isinstance(resolutions, list):
-                raise DagError(f"{lane}.resolutions must be an array")
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for name, validator in (("bugs", validate_plan_bug), ("unsure", validate_plan_unsure)):
+        entries = value.get(name)
+        if not isinstance(entries, list):
+            raise DagError(f"review.json {name} must be an array")
+        bucket: list[dict[str, Any]] = []
+        for index, finding in enumerate(entries):
+            finding = validator(finding, f"review.json {name}[{index}]", known, seen)
+            normalized.append(finding)
+            bucket.append(finding)
+        buckets[name] = bucket
     draft_ref = value.get("draft_ref")
-    if bugs and draft_ref is None:
+    if buckets["bugs"] and draft_ref is None:
         raise DagError(
             "plan review bugs require a reviewer draft: fix them in a draft plan, record "
             "its path in draft_ref, and pass it with --draft"
@@ -741,42 +667,9 @@ def validate_plan_review_artifact(dag_path: Path, ref: str, dag: dict[str, Any])
     if draft_ref is not None:
         if not is_safe_path(draft_ref):
             raise DagError("plan review draft_ref must be a safe project-relative path")
-        if not bugs:
-            raise DagError("draft_ref requires at least one bug across the review lanes")
-    if mode == "repair":
-        previous = {item["id"]: item for item in pending.get("open_findings", [])}
-        reused = set(previous) & seen
-        if reused:
-            raise DagError(
-                "repair review must not reuse prior finding IDs: " + ", ".join(sorted(reused))
-            )
-        resolutions: dict[str, dict[str, Any]] = {}
-        for lane in required:
-            for index, item in enumerate(lanes[lane]["resolutions"]):
-                if not isinstance(item, dict) or not is_text(item.get("id")) or item.get("id") in resolutions:
-                    raise DagError(f"{lane}.resolutions[{index}] must uniquely name a prior finding")
-                if item.get("status") not in {"ADDRESSED", "NOT_ADDRESSED"} or not is_text(item.get("detail")):
-                    raise DagError(f"{lane}.resolutions[{index}] must have status and detail")
-                if item["id"] not in previous:
-                    raise DagError(f"repair resolution names unknown finding {item['id']!r}")
-                if previous[item["id"]].get("lane") != lane:
-                    raise DagError(f"repair resolution for {item['id']!r} came from the wrong lane")
-                resolutions[item["id"]] = item
-        if set(resolutions) != set(previous):
-            raise DagError("repair review must resolve every prior open finding exactly once")
-        for finding_id, resolution in resolutions.items():
-            if resolution["status"] == "NOT_ADDRESSED":
-                normalized.append({**previous[finding_id], "lane": previous[finding_id].get("lane")})
-                open_unsure.append({**previous[finding_id], "lane": previous[finding_id].get("lane")})
-    return {
-        "mode": mode,
-        "refs": [ref],
-        "findings": normalized,
-        "bugs": bugs,
-        "open_findings": open_unsure,
-        "required_lanes": required,
-        "draft_ref": draft_ref,
-    }
+        if not buckets["bugs"]:
+            raise DagError("draft_ref requires at least one bug in the review")
+    return {"findings": normalized, "draft_ref": draft_ref, **buckets}
 
 
 
@@ -785,13 +678,13 @@ def validate_master_artifact(
     dag_path: Path,
     ref: str,
     node: dict[str, Any],
-    head_ref: str,
-    changed: list[str],
+    head_ref: str | None,
+    changed: list[str] | None,
 ) -> None:
     value = load_json_artifact(dag_path, ref, "master verification artifact")
     if value.get("node") != node["id"]:
         raise DagError(f"master verification artifact node must be {node['id']!r}")
-    if value.get("head_ref") != head_ref:
+    if head_ref is not None and value.get("head_ref") != head_ref:
         raise DagError("master verification artifact head_ref must equal the completed head commit")
     if not is_timestamp(value.get("checked_at")):
         raise DagError("master verification artifact checked_at must be a UTC timestamp")
@@ -807,7 +700,7 @@ def validate_master_artifact(
             raise DagError(f"master verification artifact checks[{index}] needs a command")
         if check.get("exit_code") != 0 or not is_text(check.get("result")):
             raise DagError(f"master verification artifact checks[{index}] is not a passing check")
-    if value.get("scope_files") != changed:
+    if changed is not None and value.get("scope_files") != changed:
         raise DagError("master verification artifact scope_files must equal the Git diff path list")
 
 
@@ -1075,17 +968,16 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
         if not isinstance(review, dict):
             errors.append("decomposition_review: must be null or an object")
         else:
-            pending_review = review.get("verdict") is None
-            fields = ("fingerprint", "verdict", "mode") if pending_review else (
-                "ref", "fingerprint", "verdict", "recorded_at"
-            )
-            for field in fields:
+            for field in ("ref", "fingerprint", "verdict", "findings", "recorded_at"):
                 if field not in review:
                     errors.append(f"decomposition_review: missing required field {field!r}")
-            if review.get("verdict") not in {None, "approved", "needs_changes"}:
+            if review.get("verdict") not in {"approved", "needs_changes"}:
                 errors.append("decomposition_review.verdict: must be 'approved' or 'needs_changes'")
-            if "mode" in review and review.get("mode") not in PLAN_REVIEW_MODES:
-                errors.append("decomposition_review.mode: must be 'full' or 'repair'")
+            if not isinstance(review.get("findings"), list):
+                errors.append("decomposition_review.findings: must be an array")
+            draft_ref = review.get("draft_ref")
+            if draft_ref is not None and not is_safe_path(draft_ref):
+                errors.append("decomposition_review.draft_ref: must be a safe project-relative path")
             decision_ref = review.get("decision_ref")
             if decision_ref is not None:
                 if review.get("verdict") != "needs_changes":
@@ -1098,23 +990,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                 and not is_text(decision_ref)
             ):
                 errors.append("decomposition_review.decision_ref: required when user approval overrides blocking findings")
-            if pending_review:
-                if review.get("mode") != "repair":
-                    errors.append("a pending decomposition review must be a repair review")
-                lanes = review.get("required_lanes")
-                if not isinstance(lanes, list) or not lanes or any(lane not in PLAN_REVIEW_LANES for lane in lanes):
-                    errors.append("decomposition_review.required_lanes: must name one or more known lanes")
-                elif len(lanes) != len(set(lanes)):
-                    errors.append("decomposition_review.required_lanes: duplicate lanes are not allowed")
-                findings = review.get("open_findings")
-                if not isinstance(findings, list):
-                    errors.append("decomposition_review.open_findings: must be an array")
-                if not isinstance(review.get("affected_nodes"), list):
-                    errors.append("decomposition_review.affected_nodes: must be an array")
-            elif "refs" in review:
-                expect_string_list(errors, review.get("refs"), "decomposition_review.refs", nonempty=True, paths=True)
-                if not isinstance(review.get("findings"), list):
-                    errors.append("decomposition_review.findings: must be an array")
 
     max_parallel = dag.get("max_parallel")
     if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or max_parallel < 1:
@@ -1302,8 +1177,8 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                     errors.append(f"{r_label}.ref: must be a non-empty string")
                 if not is_text(review.get("handoff_ref")):
                     errors.append(f"{r_label}.handoff_ref: must be a non-empty string")
-                if not is_text(review.get("head_ref")):
-                    errors.append(f"{r_label}.head_ref: must be a non-empty string")
+                if review.get("head_ref") is not None and not is_text(review.get("head_ref")):
+                    errors.append(f"{r_label}.head_ref: must be null or a non-empty string")
                 if not is_timestamp(review.get("reviewed_at")):
                     errors.append(f"{r_label}.reviewed_at: invalid timestamp")
                 expect_string_list(
@@ -1336,8 +1211,6 @@ def validate_dag(dag: dict[str, Any]) -> tuple[list[str], list[str]]:
                     errors.append(f"{label}.attempts: done node requires an accepted review or narrow resolution")
                 if last.get("open_escalations") or last.get("open_contract_findings"):
                     errors.append(f"{label}.attempts: done node cannot keep unresolved review findings")
-                if not is_text(last.get("head_ref")):
-                    errors.append(f"{label}.attempts: done node requires head_ref")
         elif status != "pending":
             errors.append(f"{label}.attempts: non-pending node must have at least one attempt")
 
@@ -1719,8 +1592,8 @@ def clear_handoff(node: dict[str, Any]) -> None:
 def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.Namespace) -> str:
     if node["status"] != "running":
         raise DagError(f"cannot review {node['id']!r} while status is {node['status']!r}")
-    if not is_text(args.handoff_ref) or not is_text(args.review_ref) or not is_text(args.head_ref):
-        raise DagError("review requires --handoff-ref, --review-ref, and --head-ref")
+    if not is_text(args.handoff_ref) or not is_text(args.review_ref):
+        raise DagError("review requires --handoff-ref and --review-ref")
     attempt = node["attempts"][-1]
     reviews = attempt["reviews"]
     attempt.setdefault("open_escalations", [])
@@ -1730,36 +1603,49 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     if reviews and reviews[-1]["outcome"] == "approved":
         raise DagError("the current head already has an approved final review")
     worktree = resolve_worktree(args.dag, attempt["worktree"])
-    head_ref = resolve_commit(worktree, args.head_ref, "head_ref")
-    if reviews and reviews[-1]["head_ref"] == head_ref:
+    # --head-ref is optional: a node whose outcome is not a commit (an investigation,
+    # a decision recorded in an artifact) is reviewed without Git binding.
+    head_ref = resolve_commit(worktree, args.head_ref, "head_ref") if args.head_ref else None
+    if head_ref is not None and reviews and reviews[-1]["head_ref"] == head_ref:
         if reviews[-1]["outcome"] == "escalated":
             raise DagError("unchanged escalated code is resolved with resolve-escalation, not re-reviewed")
         if reviews[-1]["outcome"] == "cannot_verify":
             raise DagError("an unchanged contract question is resolved with resolve-contract, not re-reviewed")
-    # Scope is checked before consuming reviewer claims, so malformed artifacts cannot
-    # hide an out-of-scope worker commit.
-    initial_changed = checked_changes(args.dag, node, attempt, head_ref)
+    initial_changed = None
+    if head_ref is not None:
+        # Scope is checked before consuming reviewer claims, so malformed artifacts cannot
+        # hide an out-of-scope worker commit.
+        initial_changed = checked_changes(args.dag, node, attempt, head_ref)
     review = validate_review_artifact(
         args.dag, args.review_ref, node, head_ref, len(reviews) + 1
     )
-    if review.get("fix_commit") and not review.get("worker_head"):
-        raise DagError("fix_commit requires an explicit worker_head")
-    worker_head = resolve_commit(worktree, review.get("worker_head") or head_ref, "worker_head")
-    fix_commit = review.get("fix_commit")
-    if fix_commit:
-        fix_commit = resolve_commit(worktree, fix_commit, "fix_commit")
-        if fix_commit != head_ref:
-            raise DagError("fix_commit must equal the review command's --head-ref")
-    worker_changed = checked_range_changes(worktree, node, attempt["base_ref"], worker_head)
-    final_changed = initial_changed
-    if fix_commit:
-        if fix_commit == worker_head:
-            raise DagError("fix_commit must contain an independent commit after worker_head")
-        fix_changed = checked_range_changes(worktree, node, worker_head, fix_commit)
-        if not fix_changed:
-            raise DagError("fix_commit must contain a non-empty descendant fix commit")
-    handoff_head = worker_head if review.get("worker_head") else head_ref
-    validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, worker_changed if review.get("worker_head") else final_changed)
+    if head_ref is None:
+        if review.get("worker_head") or review.get("fix_commit") or review["bugs"]:
+            raise DagError(
+                "bugs and fix commits require --head-ref; a review without one records only unsure findings"
+            )
+        worker_head = None
+        fix_commit = None
+        validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], None, None)
+    else:
+        if review.get("fix_commit") and not review.get("worker_head"):
+            raise DagError("fix_commit requires an explicit worker_head")
+        worker_head = resolve_commit(worktree, review.get("worker_head") or head_ref, "worker_head")
+        fix_commit = review.get("fix_commit")
+        if fix_commit:
+            fix_commit = resolve_commit(worktree, fix_commit, "fix_commit")
+            if fix_commit != head_ref:
+                raise DagError("fix_commit must equal the review command's --head-ref")
+        worker_changed = checked_range_changes(worktree, node, attempt["base_ref"], worker_head)
+        final_changed = initial_changed
+        if fix_commit:
+            if fix_commit == worker_head:
+                raise DagError("fix_commit must contain an independent commit after worker_head")
+            fix_changed = checked_range_changes(worktree, node, worker_head, fix_commit)
+            if not fix_changed:
+                raise DagError("fix_commit must contain a non-empty descendant fix commit")
+        handoff_head = worker_head if review.get("worker_head") else head_ref
+        validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, worker_changed if review.get("worker_head") else final_changed)
     # In-scope defects arrive already repaired by the reviewer, so the outcome turns on
     # the unsure entries alone: a contract question cannot_verify, any other unsure
     # escalates, and neither means approved.
@@ -1811,8 +1697,8 @@ def resolve_escalation(dag: dict[str, Any], node: dict[str, Any], args: argparse
     if node["status"] != "running":
         raise DagError("resolve-escalation applies only to a running node")
     attempt = node["attempts"][-1]
-    open_findings = attempt.get("open_escalations", [])
-    if not open_findings:
+    open_escalations = attempt.get("open_escalations", [])
+    if not open_escalations:
         raise DagError("this attempt has no unresolved escalation")
     owners: dict[str, str] = {}
     for value in args.owner:
@@ -1820,7 +1706,7 @@ def resolve_escalation(dag: dict[str, Any], node: dict[str, Any], args: argparse
         if not separator or not is_safe_path(path) or not is_text(owner_id) or path in owners:
             raise DagError("--owner must be repeated as project/path=node-id, once per escalated path")
         owners[path] = owner_id
-    paths = {finding["path"] for finding in open_findings}
+    paths = {finding["path"] for finding in open_escalations}
     if set(owners) != paths:
         raise DagError("--owner must assign every escalated path exactly once: " + ", ".join(sorted(paths)))
     nodes = node_map(dag)
@@ -1862,7 +1748,7 @@ def resolve_contract(dag_path: Path, node: dict[str, Any], args: argparse.Namesp
     if artifact.get("verdict") != "APPROVED":
         raise DagError("contract decision review must be APPROVED")
     if artifact.get("changes_acceptance") is not False:
-        raise DagError("a decision that changes acceptance requires a plan amendment, not resolve-contract")
+        raise DagError("a decision that changes acceptance requires a plan revision, not resolve-contract")
     expected = sorted(finding["id"] for finding in findings)
     if sorted(artifact.get("finding_ids", [])) != expected:
         raise DagError("contract decision review must cover every unresolved contract finding")
@@ -1989,8 +1875,6 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
                 raise DagError("--verification-ref is required when marking a node done")
             if not is_text(args.summary):
                 raise DagError("--summary is required when marking a node done")
-            if not is_text(args.head_ref):
-                raise DagError("--head-ref is required when marking a node done")
             reviews = attempt["reviews"]
             accepted = reviews and reviews[-1]["outcome"] == "approved"
             accepted = accepted or (
@@ -2004,18 +1888,22 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
             if attempt.get("open_escalations") or attempt.get("open_contract_findings"):
                 raise DagError("cannot mark done while review findings still lack an owner or contract decision")
             worktree = resolve_worktree(args.dag, attempt["worktree"])
-            head_ref = resolve_commit(worktree, args.head_ref, "head_ref")
+            head_ref = resolve_commit(worktree, args.head_ref, "head_ref") if args.head_ref else None
             if reviews[-1]["head_ref"] != head_ref:
                 raise DagError("done head_ref must equal the accepted review head_ref")
             if reviews[-1]["handoff_ref"] != args.handoff_ref:
                 raise DagError("done handoff_ref must equal the final reviewed handoff_ref")
-            changed = checked_changes(args.dag, node, attempt, head_ref)
-            handoff_head = attempt.get("worker_head") or head_ref
-            handoff_changed = checked_range_changes(
-                worktree, node, attempt["base_ref"], handoff_head
-            ) if handoff_head != head_ref else changed
-            validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, handoff_changed)
-            validate_master_artifact(args.dag, args.verification_ref, node, head_ref, changed)
+            if head_ref is None:
+                validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], None, None)
+                validate_master_artifact(args.dag, args.verification_ref, node, None, None)
+            else:
+                changed = checked_changes(args.dag, node, attempt, head_ref)
+                handoff_head = attempt.get("worker_head") or head_ref
+                handoff_changed = checked_range_changes(
+                    worktree, node, attempt["base_ref"], handoff_head
+                ) if handoff_head != head_ref else changed
+                validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], handoff_head, handoff_changed)
+                validate_master_artifact(args.dag, args.verification_ref, node, head_ref, changed)
             node["handoff"] = {
                 "status": "DONE",
                 "ref": args.handoff_ref,
@@ -2066,7 +1954,7 @@ def reseal_dag(dag_path: Path, reason: str) -> str:
 
 
 def apply_reviewer_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> dict[str, Any]:
-    """Apply a plan reviewer's own fixes under the amendment protections.
+    """Apply a plan reviewer's own fixes under the revision protections.
 
     The plan reviewer works fix-first like an execution reviewer: defects it can repair
     land in a draft plan, and only what it cannot decide alone reaches `unsure`. The
@@ -2134,10 +2022,10 @@ def apply_reviewer_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) ->
 def record_design_review(
     dag_path: Path, dag: dict[str, Any], ref: str, draft_ref: str | None = None
 ) -> str:
-    """Record all requested plan-review lanes after the barrier, applying the reviewer's draft in one step.
+    """Record one plan-review round, applying the reviewer's draft in the same step.
 
     A review that reports bugs carries the reviewer's repaired plan as a draft: the
-    runtime applies it under the amendment protections and records the verdict against
+    runtime applies it under the revision protections and records the verdict against
     the new fingerprint, so the reviewer's own fixes need no further repair round.
     """
     existing = dag.get("decomposition_review")
@@ -2151,33 +2039,27 @@ def record_design_review(
     if bool(draft_ref) != bool(artifact["draft_ref"]):
         raise DagError(
             "review bugs require --draft naming the reviewer draft, and --draft is only "
-            "valid for a review whose lanes report bugs"
+            "valid for a review that reports bugs"
         )
     if draft_ref and artifact["draft_ref"] != draft_ref:
         raise DagError(f"review draft_ref {artifact['draft_ref']!r} does not match --draft {draft_ref!r}")
-    base_fingerprint = plan_fingerprint(dag)
     candidate = apply_reviewer_draft(dag_path, dag, draft_ref) if draft_ref else dag
-    verdict = "needs_changes" if artifact["open_findings"] else "approved"
+    verdict = "needs_changes" if artifact["unsure"] else "approved"
     candidate["decomposition_review"] = {
         "ref": ref,
-        "refs": artifact["refs"],
         "fingerprint": plan_fingerprint(candidate),
-        "base_fingerprint": base_fingerprint,
-        "mode": artifact["mode"],
         "verdict": verdict,
         "findings": artifact["findings"],
-        "required_lanes": artifact["required_lanes"],
-        "open_findings": artifact["open_findings"],
         "recorded_at": utc_now(),
         **({"draft_ref": draft_ref} if draft_ref else {}),
     }
     if candidate is not dag:
         dag.clear()
         dag.update(candidate)
-    detail = f"{len(artifact['open_findings'])} open unsure of {len(artifact['findings'])} findings"
+    detail = f"{len(artifact['unsure'])} open unsure of {len(artifact['findings'])} findings"
     if draft_ref:
         detail += f"; {len(artifact['bugs'])} bug(s) fixed in {draft_ref}"
-    return f"{artifact['mode']} plan review: {verdict} ({detail}; {len(artifact['refs'])} lanes)"
+    return f"plan review: {verdict} ({detail})"
 
 
 def transition_planning(dag_path: Path, dag: dict[str, Any], target: str, reference: str | None) -> str:
@@ -2374,12 +2256,6 @@ def load_draft(
 
 DELIVERABLE_FIELDS = ("objective", "global_acceptance", "assumptions", "source_refs")
 FROZEN_CONTRACT_STATUSES = {"done", "running"}
-INTERFACE_FIELDS = ("outputs", "depends_on")
-REVIEW_LANE_FIELDS = {
-    "requirements": {"title", "objective", "inputs", "outputs", "acceptance"},
-    "graph": {"work_type", "depends_on", "conflicts_with", "inputs", "outputs"},
-    "execution": {"scope", "read_first", "acceptance", "verification"},
-}
 
 
 def unfinished_dependents(nodes: dict[str, dict[str, Any]], targets: set[str]) -> dict[str, list[str]]:
@@ -2394,83 +2270,32 @@ def unfinished_dependents(nodes: dict[str, dict[str, Any]], targets: set[str]) -
     return {target: sorted(dependents) for target, dependents in blast.items()}
 
 
-def repair_review_request(dag: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
-    """Describe the narrow review needed after an already reviewed plan is amended."""
-    review = dag.get("decomposition_review")
-    if not isinstance(review, dict) or "mode" not in review:
-        return None
-    if any(candidate.get(field) != dag.get(field) for field in DELIVERABLE_FIELDS):
-        return None
+def revise_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str) -> str:
+    """Replace the plan at any point before completion, restarting the review cycle.
 
-    current, proposed = node_map(dag), node_map(candidate)
-    dropped = set(current) - set(proposed)
-    if dropped:
-        return None
-    changed: dict[str, list[str]] = {}
-    for node_id in set(current) & set(proposed):
-        fields = [field for field in PLAN_NODE_FIELDS if current[node_id].get(field) != proposed[node_id].get(field)]
-        if fields:
-            changed[node_id] = fields
-    added = set(proposed) - set(current)
-    output_changes = {node_id for node_id, fields in changed.items() if "outputs" in fields}
-    if unfinished_dependents(current, output_changes):
-        return None
-
-    open_findings = list(review.get("open_findings") or [])
-    lanes = {finding["lane"] for finding in open_findings if finding.get("lane") in PLAN_REVIEW_LANES}
-    for fields in changed.values():
-        lanes.update(lane for lane, owned in REVIEW_LANE_FIELDS.items() if set(fields) & owned)
-    if added:
-        lanes.update(PLAN_REVIEW_LANES)
-    if not lanes:
-        return None
-
-    affected = set(changed) | added
-    for dependents in unfinished_dependents(current, set(changed)).values():
-        affected.update(dependents)
-    return {
-        "ref": None,
-        "fingerprint": plan_fingerprint(candidate),
-        "base_fingerprint": review.get("fingerprint"),
-        "mode": "repair",
-        "verdict": None,
-        "required_lanes": sorted(lanes),
-        "open_findings": open_findings,
-        "affected_nodes": sorted(affected),
-        "recorded_at": None,
-    }
-
-
-def revise_dag(
-    dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str, review_ref: str | None,
-    reference: str | None = None
-) -> str:
-    """Let the controller re-organise live work without renegotiating what it delivers.
-
-    Scheduling is the controller's job, so re-slicing, re-wiring, and dropping unstarted work
-    stays with it. What the project promises is not its to change: the deliverable fields are
-    frozen here and move only through a replan the user approves.
+    Whether the plan is a fresh draft, awaiting approval, approved, or sent back for
+    replanning, this is the one command that changes it. What already ran is preserved
+    regardless: the execution record cannot be rewritten, attempted nodes cannot be
+    dropped, and the contracts of running and done nodes are frozen. A changed plan is
+    unproven again, so it returns to awaiting_approval with its review cleared, and the
+    whole plan is re-reviewed and approved as one.
     """
-    if dag["planning_status"] != "approved":
+    if dag["convergence"]["status"] == "failed":
         raise DagError(
-            f"planning_status is {dag['planning_status']!r}; --revise reorganises an approved plan. "
-            "An unapproved one changes with --amend, which is also where a rejected plan is repaired"
+            "failed convergence is repaired with --add-gap-nodes, which must address exactly the recorded gaps"
+        )
+    if dag["planning_status"] == "complete":
+        raise DagError(
+            "a completed plan cannot be revised; archive this DAG and start a new control plane"
         )
     if not is_text(reason):
         raise DagError("--revise requires --reason recording why the plan no longer fits")
 
     candidate, _ = load_draft(dag_path, dag, draft_ref, allow_patch=True)
-    changed_deliverable = [field for field in DELIVERABLE_FIELDS if candidate.get(field) != dag.get(field)]
-    if changed_deliverable:
-        raise DagError(
-            f"--revise cannot change what the project delivers ({', '.join(changed_deliverable)}); "
-            "that is the user's call, so use --planning-status replan_required and --amend"
-        )
-
     proposed, current = node_map(candidate), node_map(dag)
     dropped = [node_id for node_id in current if node_id not in proposed]
     added = [node_id for node_id in proposed if node_id not in current]
-    interface_changed, retouched = [], []
+    retouched = []
     for node_id, node in current.items():
         replacement = proposed.get(node_id)
         if replacement is None:
@@ -2480,59 +2305,18 @@ def revise_dag(
         for field in ("status", "attempts", "handoff"):
             if replacement.get(field) != node[field]:
                 raise DagError(f"{node_id!r}: a revision cannot rewrite {field}, which is the execution record")
-        changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node[field]]
+        changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node.get(field)]
         if changed and node["status"] in FROZEN_CONTRACT_STATUSES:
             raise DagError(
                 f"{node_id!r} is {node['status']} and its contract is frozen; changed: {', '.join(changed)}"
             )
         if changed:
             retouched.append(node_id)
-        if any(field in changed for field in INTERFACE_FIELDS):
-            interface_changed.append(node_id)
-
-    # Reorganising a leaf costs nothing to get wrong. Dropping a node, or moving what one
-    # produces or waits on, propagates along edges the machine cannot read the meaning of.
-    blast = unfinished_dependents(current, set(dropped) | set(interface_changed))
-    if (dropped or interface_changed) and not review_ref:
-        why = []
-        if dropped:
-            why.append(
-                f"drops {', '.join(sorted(dropped))}, and nothing checks that the approved deliverable is "
-                "still covered once work leaves the plan"
-            )
-        for node_id in sorted(interface_changed):
-            dependents = blast.get(node_id)
-            why.append(
-                f"moves what {node_id} produces or waits on"
-                + (f", which {', '.join(dependents)} was written against" if dependents else "")
-            )
-        raise DagError(
-            "this revision " + "; it ".join(why) + ". Dispatch a scoped reviewer with edit capability "
-            "against those nodes, let it fix what it can directly in the revision draft, and pass its "
-            "review with --revision-review"
-        )
-    verdict = None
-    decision_ref = None
-    if review_ref:
-        artifact = validate_design_review_artifact(dag_path, review_ref, candidate, extra_nodes=set(current))
-        open_unsure = artifact["unsure"]
-        if open_unsure and not reference:
-            raise DagError(
-                f"the scoped review left {len(open_unsure)} unsure item(s) that need the user or "
-                "controller; record the user's decision with --reference or fix the draft and re-review"
-            )
-        if open_unsure:
-            if is_safe_path(reference):
-                artifact_path(dag_path, reference, "revision decision reference")
-            elif not is_source_ref(reference):
-                raise DagError("--reference must identify an existing decision artifact or durable source reference")
-            decision_ref = reference
-        verdict = review_ref
 
     candidate["planning_session"] = dag.get("planning_session")
-    candidate["planning_status"] = "approved"
-    candidate["approval_ref"] = dag["approval_ref"]
-    candidate["decomposition_review"] = dag.get("decomposition_review")
+    candidate["planning_status"] = "awaiting_approval"
+    candidate["approval_ref"] = None
+    candidate["decomposition_review"] = None
     candidate["replans"] = list(dag.get("replans") or []) + [
         {
             "ref": draft_ref,
@@ -2542,8 +2326,6 @@ def revise_dag(
             "added": added,
             "dropped": dropped,
             "retouched": retouched,
-            "review_ref": verdict,
-            **({"decision_ref": decision_ref} if decision_ref else {}),
         }
     ]
     errors, _ = validate_dag(candidate)
@@ -2551,90 +2333,20 @@ def revise_dag(
         raise DagError("revision would produce invalid DAG: " + "; ".join(errors))
     dag.clear()
     dag.update(candidate)
-    lines = [f"revised {dag['dag_id']}: +{len(added)} -{len(dropped)} ~{len(retouched)} node(s)"]
-    if blast:
-        lines.append("Downstream nodes that read the changed nodes as an interface:")
-        lines += [f"  {node_id} -> {', '.join(dependents)}" for node_id, dependents in sorted(blast.items())]
-    return "\n".join(lines)
-
-
-def amend_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str) -> str:
-    """Replace a plan that is not approved, which is how review findings get fixed.
-
-    Whether execution has started changes what may be edited, never whether editing is
-    possible: a plan awaiting approval is the one state a blocking review verdict lands in,
-    so it must always be repairable from here. What already ran is preserved regardless.
-    """
-    if dag["planning_status"] == "approved":
-        raise DagError(
-            "an approved plan is reorganised with --revise, or sent back for rework with "
-            "--planning-status replan_required followed by --amend"
-        )
-    if dag["convergence"]["status"] == "failed":
-        raise DagError(
-            "failed convergence is repaired with --add-gap-nodes, which must address exactly the recorded gaps"
-        )
-    running = [node["id"] for node in dag["nodes"] if node["status"] == "running"]
-    if running:
-        raise DagError(
-            f"settle running nodes before amending the plan: {', '.join(running)}. A worker that never "
-            "reported back, including one that died mid-run, is settled with "
-            "'update-task <node> failed --reason \"<why>\"'"
-        )
-
-    candidate, _ = load_draft(dag_path, dag, draft_ref)
-    if candidate["planning_status"] in {"approved", "complete"}:
-        raise DagError(
-            f"the draft declares itself {candidate['planning_status']!r}; an amended plan is still "
-            "unapproved, and approval runs through --planning-status"
-        )
-
-    proposed, current = node_map(candidate), node_map(dag)
-    kept, dropped = [], []
-    for node_id, node in current.items():
-        replacement = proposed.get(node_id)
-        if replacement is None:
-            if node["attempts"]:
-                raise DagError(f"{node_id!r} has an execution record and cannot be dropped by an amendment")
-            dropped.append(node_id)
-            continue
-        if not node["attempts"]:
-            continue
-        for field in ("status", "attempts", "handoff"):
-            if replacement.get(field) != node[field]:
-                raise DagError(f"{node_id!r}: an amendment cannot rewrite {field}, which is the execution record")
-        if node["status"] == "done":
-            changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node[field]]
-            if changed:
-                raise DagError(
-                    f"{node_id!r} is done and its contract is frozen, because its diff was accepted "
-                    f"against it; changed: {', '.join(changed)}"
-                )
-        kept.append(node_id)
-    added = [node_id for node_id in proposed if node_id not in current]
-
-    previous_review = dag.get("decomposition_review")
-    candidate["decomposition_review"] = repair_review_request(dag, candidate)
-    candidate["planning_session"] = dag.get("planning_session")
-    candidate["approval_ref"] = None
-    candidate["planning_status"] = "draft" if dag["planning_status"] == "draft" else "awaiting_approval"
-    candidate["replans"] = list(dag.get("replans") or []) + [
-        {"ref": draft_ref, "at": utc_now(), "kind": "amendment",
-         "added": added, "dropped": dropped, "kept": kept,
-         "review_ref": previous_review.get("ref") if isinstance(previous_review, dict) else None,
-         "next_review": candidate["decomposition_review"].get("mode")
-         if candidate["decomposition_review"] else "full"}
+    lines = [
+        f"revised {dag['dag_id']}: +{len(added)} -{len(dropped)} ~{len(retouched)} node(s); "
+        "planning_status -> awaiting_approval, plan review required"
     ]
-    errors, _ = validate_dag(candidate)
-    if errors:
-        raise DagError("amendment would produce invalid DAG: " + "; ".join(errors))
-    dag.clear()
-    dag.update(candidate)
-    # The draft stays on disk: `replans` points at it as the record of what was proposed,
-    # and deleting the file the record names would leave the audit trail pointing at nothing.
-    detail = f", {len(kept)} with an execution record preserved" if kept else ""
-    mode = "repair" if dag["decomposition_review"] else "full"
-    return f"amended {dag['dag_id']} to {len(dag['nodes'])} nodes{detail}; {mode} plan review required"
+    if dropped:
+        remaining = {node["id"] for node in candidate["nodes"]}
+        blast = {
+            target: [dependent for dependent in dependents if dependent in remaining]
+            for target, dependents in unfinished_dependents(current, set(dropped)).items()
+        }
+        if blast:
+            lines.append("Downstream nodes that read the dropped nodes as an interface:")
+            lines += [f"  {node_id} -> {', '.join(dependents)}" for node_id, dependents in sorted(blast.items())]
+    return "\n".join(lines)
 
 
 def retire_dag(dag_path: Path, dag: dict[str, Any], reason: str | None, reference: str | None) -> str:
@@ -2687,9 +2399,7 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--draft", metavar="DRAFT", help="reviewer-fixed draft plan applied with a decomposition review that reports bugs")
-    parser.add_argument("--amend", metavar="DRAFT", help="replace an unapproved plan from a draft, clearing its review")
-    parser.add_argument("--revise", metavar="DRAFT", help="reorganise an approved plan without changing what it delivers")
-    parser.add_argument("--revision-review", metavar="REF", help="scoped review of a revision that drops or re-wires a node")
+    parser.add_argument("--revise", metavar="DRAFT", help="replace the plan from a draft or patch, clearing its review; requires --reason")
     parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
@@ -2705,7 +2415,7 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--worktree", help="Git worktree path; required when entering running")
     parser.add_argument("--branch", help="expected current branch when entering running")
     parser.add_argument("--base-ref", help="expected start commit; defaults to worktree HEAD")
-    parser.add_argument("--head-ref", help="reviewed or completed Git commit")
+    parser.add_argument("--head-ref", help="reviewed or completed Git commit; omit when the attempt produced no commit")
     parser.add_argument("--summary")
     parser.add_argument("--reason")
     parser.add_argument("--gap", action="append", default=[], help="short convergence gap; repeat as needed")
@@ -2721,7 +2431,6 @@ def cmd_update(argv: list[str]) -> int:
             args.add_gap_nodes,
             args.init,
             args.decomposition_review,
-            args.amend,
             args.revise,
             args.reseal,
             args.archive,
@@ -2732,7 +2441,7 @@ def cmd_update(argv: list[str]) -> int:
     if operations != 1:
         parser.error(
             "choose exactly one node, planning-status, convergence, gap-plan, init, "
-            "decomposition-review, amend, revise, reseal, archive, or abandon operation"
+            "decomposition-review, revise, reseal, archive, or abandon operation"
         )
     if args.reseal and not args.reason:
         parser.error("--reseal requires --reason recording why the control file needed repair")
@@ -2762,10 +2471,8 @@ def cmd_update(argv: list[str]) -> int:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
             elif args.decomposition_review:
                 message = record_design_review(args.dag, dag, args.decomposition_review, args.draft)
-            elif args.amend:
-                message = amend_dag(args.dag, dag, args.amend)
             elif args.revise:
-                message = revise_dag(args.dag, dag, args.revise, args.reason, args.revision_review, args.reference)
+                message = revise_dag(args.dag, dag, args.revise, args.reason)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),
@@ -2854,27 +2561,11 @@ def plan_view(dag: dict[str, Any]) -> dict[str, Any]:
 
 
 def review_request_view(dag: dict[str, Any]) -> dict[str, Any]:
+    """Emit the single-round review request: the whole plan without its execution record."""
     plan = {field: dag[field] for field in PLAN_VIEW_FIELDS}
-    review = dag.get("decomposition_review") or {}
-    if review.get("verdict") is None and review.get("mode") == "repair":
-        affected = set(review["affected_nodes"])
-        return {
-            **plan,
-            "mode": "repair",
-            "plan_fingerprint": plan_fingerprint(dag),
-            "base_fingerprint": review.get("base_fingerprint"),
-            "required_lanes": review["required_lanes"],
-            "open_findings": review["open_findings"],
-            "nodes": [
-                {field: node[field] for field in PLAN_NODE_FIELDS}
-                for node in dag["nodes"] if node["id"] in affected
-            ],
-        }
     return {
         **plan,
-        "mode": "full",
         "plan_fingerprint": plan_fingerprint(dag),
-        "required_lanes": list(PLAN_REVIEW_LANES),
         "nodes": [
             {field: node[field] for field in PLAN_NODE_FIELDS}
             for node in dag["nodes"]
@@ -2898,7 +2589,7 @@ def cmd_status(argv: list[str]) -> int:
     parser.add_argument(
         "--review-request",
         action="store_true",
-        help="emit the current full or repair review request and its bounded affected contracts",
+        help="emit the single-round plan review request without execution records",
     )
     args = parser.parse_args(argv)
     if sum(bool(value) for value in (args.node, args.plan_view, args.review_request)) > 1:
@@ -3025,11 +2716,9 @@ def cmd_status(argv: list[str]) -> int:
         print(f"Planning: {dag['planning_status']} | Convergence: {dag['convergence']['status']}")
         decomposition = dag.get("decomposition_review")
         if decomposition:
-            pending = decomposition.get("verdict") is None
             print(
                 "Decomposition review: "
-                + (f"pending {decomposition.get('mode')}" if pending else f"{decomposition.get('mode')} {decomposition.get('verdict')}")
-                + f" fingerprint={decomposition.get('fingerprint', '')[:12]}"
+                + f"{decomposition.get('verdict')} fingerprint={decomposition.get('fingerprint', '')[:12]}"
             )
         print(
             "States: "

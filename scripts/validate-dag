@@ -584,7 +584,6 @@ PLAN_NODE_FIELDS = (
     "id", "title", "objective", "execution_plan", "work_type", "scope", "read_first",
     "depends_on", "conflicts_with", "inputs", "outputs", "acceptance", "verification",
 )
-DESIGN_SEVERITIES = {"critical", "important", "minor"}
 
 
 def plan_fingerprint(dag: dict[str, Any]) -> str:
@@ -665,31 +664,39 @@ def validate_execution_tiering(
 def validate_design_review_artifact(
     dag_path: Path, ref: str, dag: dict[str, Any], extra_nodes: set[str] | None = None
 ) -> dict[str, Any]:
-    value = load_json_artifact(dag_path, ref, "decomposition review artifact")
+    """Validate the scoped review of a revision, in the same fix-first shape as a plan review.
+
+    The revision reviewer is dispatched with edit capability and fixes what it can
+    directly in the controller's revision draft, so its `bugs` never block; only
+    `unsure` items, which need the user or controller, do.
+    """
+    value = load_json_artifact(dag_path, ref, "scoped revision review artifact")
     if value.get("dag_id") != dag["dag_id"]:
-        raise DagError(f"decomposition review artifact dag_id must be {dag['dag_id']!r}")
+        raise DagError(f"scoped revision review artifact dag_id must be {dag['dag_id']!r}")
     known = {node["id"] for node in dag["nodes"]} | (extra_nodes or set())
-    findings = value.get("findings")
-    if not isinstance(findings, list):
-        raise DagError("decomposition review artifact findings must be an array")
-    for index, finding in enumerate(findings):
-        label = f"decomposition review findings[{index}]"
-        if not isinstance(finding, dict):
-            raise DagError(f"{label}: must be an object")
-        if finding.get("severity") not in DESIGN_SEVERITIES:
-            raise DagError(f"{label}.severity: must be one of {', '.join(sorted(DESIGN_SEVERITIES))}")
-        if not is_text(finding.get("detail")):
-            raise DagError(f"{label}.detail: must be a non-empty string")
-        nodes = finding.get("nodes", [])
-        if not isinstance(nodes, list) or any(item not in known for item in nodes):
-            raise DagError(f"{label}.nodes: must reference existing node IDs")
-    if not value.get("checks_performed"):
-        raise DagError("decomposition review artifact must record the checks it performed")
-    return value
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for name, validator in (("bugs", validate_plan_bug), ("unsure", validate_plan_unsure)):
+        entries = value.get(name)
+        if not isinstance(entries, list):
+            raise DagError(f"scoped revision review artifact {name} must be an array")
+        bucket: list[dict[str, Any]] = []
+        for index, finding in enumerate(entries):
+            finding = validator(
+                finding, f"scoped revision review {name}[{index}]", known, None, seen
+            )
+            normalized.append(finding)
+            bucket.append(finding)
+        buckets[name] = bucket
+    checks = value.get("checks_performed")
+    if not isinstance(checks, list) or not checks or any(not is_text(item) for item in checks):
+        raise DagError("scoped revision review artifact checks_performed must be a non-empty string array")
+    return {"findings": normalized, **buckets}
 
 
 def validate_plan_entry(
-    finding: Any, label: str, known: set[str], lane: str, seen: set[str]
+    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
 ) -> dict[str, Any]:
     if not isinstance(finding, dict):
         raise DagError(f"{label}: must be an object")
@@ -705,11 +712,11 @@ def validate_plan_entry(
     nodes = finding.get("nodes", [])
     if not isinstance(nodes, list) or any(item not in known for item in nodes):
         raise DagError(f"{label}.nodes: must reference existing node IDs")
-    return {**finding, "lane": lane}
+    return {**finding, **({"lane": lane} if lane is not None else {})}
 
 
 def validate_plan_bug(
-    finding: Any, label: str, known: set[str], lane: str, seen: set[str]
+    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
 ) -> dict[str, Any]:
     finding = validate_plan_entry(finding, label, known, lane, seen)
     if not is_text(finding.get("fix")):
@@ -718,7 +725,7 @@ def validate_plan_bug(
 
 
 def validate_plan_unsure(
-    finding: Any, label: str, known: set[str], lane: str, seen: set[str]
+    finding: Any, label: str, known: set[str], lane: str | None, seen: set[str]
 ) -> dict[str, Any]:
     finding = validate_plan_entry(finding, label, known, lane, seen)
     if not is_text(finding.get("question")):
@@ -2615,20 +2622,21 @@ def revise_dag(
                 + (f", which {', '.join(dependents)} was written against" if dependents else "")
             )
         raise DagError(
-            "this revision " + "; it ".join(why) + ". Dispatch a scoped decomposition review of the change "
-            "against those nodes and pass it with --revision-review"
+            "this revision " + "; it ".join(why) + ". Dispatch a scoped reviewer with edit capability "
+            "against those nodes, let it fix what it can directly in the revision draft, and pass its "
+            "review with --revision-review"
         )
     verdict = None
     decision_ref = None
     if review_ref:
         artifact = validate_design_review_artifact(dag_path, review_ref, candidate, extra_nodes=set(current))
-        blocking = [f for f in artifact["findings"] if f["severity"] in {"critical", "important"}]
-        if blocking and not reference:
+        open_unsure = artifact["unsure"]
+        if open_unsure and not reference:
             raise DagError(
-                f"the scoped review reported {len(blocking)} blocking finding(s); "
-                "resolve them in the draft and re-review"
+                f"the scoped review left {len(open_unsure)} unsure item(s) that need the user or "
+                "controller; record the user's decision with --reference or fix the draft and re-review"
             )
-        if blocking:
+        if open_unsure:
             if is_safe_path(reference):
                 artifact_path(dag_path, reference, "revision decision reference")
             elif not is_source_ref(reference):

@@ -128,7 +128,7 @@ The runtime derives the verdict; a reviewer does not pass its own approval flag.
 
 ## Scoped review revision
 
-When the controller reorganizes a live plan, use scoped review rather than full decomposition review. It answers only whether the change breaks downstream work.
+When the controller reorganizes a live plan, use scoped review rather than full decomposition review. It answers only whether the change breaks downstream work. Dispatch the scoped reviewer with edit capability and fix-first instructions, the same shape as a plan review: it repairs what it can directly in the controller's revision draft and records each fix as a bug; what needs the user or controller becomes an unsure entry.
 
 Give it the changed neighborhood, never the whole DAG or repository:
 
@@ -137,7 +137,7 @@ Give it the changed neighborhood, never the whole DAG or repository:
 - unfinished contracts that transitively depend on changed nodes;
 - nothing else.
 
-The validator reruns structural checks. Scoped review judges the prose interface: whether downstream nodes still receive what their `inputs` and `outputs` promise. Findings use the same severities; `critical` and `important` block the revision.
+The reviewer returns one JSON artifact with `checks_performed`, `bugs` (each naming ID, kind, detail, nodes, and the fix applied to the draft), and `unsure` (each naming ID, kind, detail, nodes, and the question to decide). The validator reruns structural checks. Scoped review judges the prose interface: whether downstream nodes still receive what their `inputs` and `outputs` promise. Bugs never block the revision, because they are already fixed in the draft being revised; an open `unsure` entry blocks it until the reviewer reworks the draft or the user records a durable decision.
 
 ## Coverage convergence preview
 

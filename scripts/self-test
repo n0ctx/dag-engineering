@@ -924,11 +924,13 @@ class RuntimeTests(unittest.TestCase):
             args += ["--reference", reference]
         return self.run_cmd(*args, expect=expect)
 
-    def scoped_review(self, findings=(), name="scoped-review.json"):
+    def scoped_review(self, bugs=(), unsure=(), name="scoped-review.json"):
         artifact = self.root / ".dag" / "artifacts" / name
         artifact.parent.mkdir(parents=True, exist_ok=True)
+        bugs = [{"id": item.get("id", f"b{index}"), **item} for index, item in enumerate(bugs, 1)]
+        unsure = [{"id": item.get("id", f"u{index}"), **item} for index, item in enumerate(unsure, 1)]
         artifact.write_text(json.dumps(
-            {"dag_id": "fixture", "findings": list(findings),
+            {"dag_id": "fixture", "bugs": bugs, "unsure": unsure,
              "checks_performed": ["blast radius", "interface continuity"]}
         ), encoding="utf-8")
         return str(artifact.relative_to(self.root))
@@ -986,24 +988,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(saved["replans"][-1]["added"], ["C"])
         self.assertEqual(saved["planning_status"], "approved")
 
-    def test_scoped_review_findings_block_the_revision(self):
+    def test_scoped_review_unsure_blocks_the_revision(self):
         current = self.live_plan([node("A"), node("B", depends=("A",))])
         proposed = copy.deepcopy(current)
         proposed["nodes"][0]["outputs"] = ["something else"]
-        review = self.scoped_review([
-            {"severity": "important", "kind": "missing_dependency", "nodes": ["B"],
+        review = self.scoped_review(unsure=[
+            {"kind": "missing_dependency", "nodes": ["B"], "question": "what replaces A's old output for B?",
              "detail": "B consumes A's old output and nothing replaces it"},
         ])
         result = self.revise(proposed, review=review, expect=3)
-        self.assertIn("blocking finding", result.stderr)
+        self.assertIn("unsure item(s)", result.stderr)
         self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["outputs"], ["output A"])
+
+    def test_scoped_review_bugs_do_not_block_the_revision(self):
+        current = self.live_plan([node("A"), node("B", depends=("A",))])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["outputs"] = ["something else"]
+        review = self.scoped_review(bugs=[
+            {"kind": "interface", "nodes": ["A"], "fix": "reworded the output in the revision draft",
+             "detail": "the output text did not match the interface B reads"},
+        ])
+        self.revise(proposed, review=review)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["nodes"][0]["outputs"], ["something else"])
+        self.assertNotIn("decision_ref", saved["replans"][-1])
 
     def test_revision_reference_is_required_persistent_and_recorded_for_override(self):
         current = self.live_plan([node("A"), node("B", depends=("A",))])
         proposed = copy.deepcopy(current)
         proposed["nodes"][0]["outputs"] = ["something else"]
-        review = self.scoped_review([
-            {"severity": "important", "kind": "scope_realism", "nodes": ["A"], "detail": "subjective concern"},
+        review = self.scoped_review(unsure=[
+            {"kind": "scope_realism", "nodes": ["A"], "question": "accept the narrower scope?",
+             "detail": "subjective concern"},
         ])
         result = self.revise(copy.deepcopy(proposed), review=review, reference=".dag/sources/missing-decision.md", expect=3)
         self.assertIn("does not exist", result.stderr)

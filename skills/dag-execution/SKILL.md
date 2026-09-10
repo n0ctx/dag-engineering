@@ -84,11 +84,11 @@ Do not fix implementation code inline while acting as the independent acceptance
 
 ## Replan and converge
 
-If execution shows that the graph or contract is wrong, revise the graph or require a replan; do not widen a node silently:
+If execution shows that the graph or contract is wrong, revise the graph or require a replan; do not widen a node silently. A revision that drops a node or moves what it produces or waits on needs a scoped review first: dispatch the reviewer with edit capability against the changed neighborhood, let it fix what it can directly in the revision draft (`bugs`), and pass its artifact with `--revision-review`; open `unsure` items take the user's durable `--reference` decision:
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --revise ".dag/revision.json" \
-  --reason "<one line>"
+  --reason "<one line>" --revision-review ".dag/artifacts/scoped-review.json"
 "${SKILL_ROOT}/scripts/update-task" --planning-status replan_required \
   --reference "<durable path recording why>"
 "${SKILL_ROOT}/scripts/update-task" --amend ".dag/amendment.json"

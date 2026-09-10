@@ -47,7 +47,7 @@ Independent review and all findings remain durable. A user’s persisted `approv
 
 ## Control-plane lifecycle
 
-`.dag/` exists only at the main worktree root. The runtime seals `dag.json` beside it and obtains an exclusive lock for updates. `update-task --init` is the only creation path. `--amend` replaces an unapproved plan and clears its review; `--revise` reorganizes an approved plan while preserving execution records and requiring scoped review when interfaces or dependent contracts change. Running nodes cannot be amended, and running nodes cannot be retired. Archived DAGs are records, not control files.
+`.dag/` exists only at the main worktree root. The runtime seals `dag.json` beside it and obtains an exclusive lock for updates. `update-task --init` is the only creation path. `--amend` replaces an unapproved plan and clears its review; `--revise` reorganizes an approved plan while preserving execution records and requiring scoped review when interfaces or dependent contracts change. A scoped revision review uses the same fix-first `bugs`/`unsure` artifact shape as a plan review, without lanes or a draft reference — the revision draft itself is what the reviewer fixes; open `unsure` entries are recorded with `--reference` to the user's durable decision. Running nodes cannot be amended, and running nodes cannot be retired. Archived DAGs are records, not control files.
 
 `status --node <id>` emits a dispatch brief, `status --plan-view` emits every node contract without execution records, and `status --review-request` emits the current review request. No worker reads or writes the control file directly.
 

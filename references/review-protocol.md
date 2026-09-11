@@ -19,7 +19,7 @@ Do not attach a controller summary, restated contract, whole DAG, unrelated repo
 
 The controller starts the reviewer prompt with this fixed preamble:
 
-> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, read at most five additional files, each to settle one specific named claim, and re-run at most one cheap verification command, only when a specific evidence claim looks doubtful. A claim that cannot be settled within this budget becomes an `unsure` entry naming the exact missing context — never a reason to keep exploring. Every in-scope defect you find, fix on the spot in one commit on the node branch and record it under `bugs`; the runtime rejects `bugs` without a `fix_commit`. Anything you cannot safely repair or should not decide alone goes under `unsure`.
+> Review only the supplied package; do not survey the repository. Work the checklist below in order. Beyond the files in the diff and the node's `read_first`, prefer at most five additional files, each to settle one specific named claim. Re-run a cheap verification command when a specific evidence claim looks doubtful, and record it in `checks_performed`. A claim that still cannot be settled becomes an `unsure` entry naming the exact missing context — extra reads are a cost, not a stop. Every in-scope defect you find, fix on the spot in one commit on the node branch and record it under `bugs`; the runtime rejects `bugs` without a `fix_commit`. Anything you cannot safely repair or should not decide alone goes under `unsure`.
 
 Checklist, in order:
 

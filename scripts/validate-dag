@@ -326,19 +326,41 @@ def is_control_plane_path(path: str) -> bool:
     return path == ".dag" or path.startswith(".dag/")
 
 
-def dirty_paths(worktree: Path) -> list[str]:
+def classify_worktree_dirtiness(
+    worktree: Path, scope: dict[str, Any] | None = None
+) -> tuple[list[str], list[str]]:
+    """Split dirtiness into blocking paths and untracked leftovers.
+
+    Tracked modifications always block: they can hide in a later diff. Untracked
+    files block only when a node scope is supplied and the path is inside it —
+    that is an uncommitted deliverable. Other untracked paths warn and do not
+    stop start or review.
+    """
     result = run_git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if result.returncode != 0:
         raise DagError(f"cannot inspect worktree status: {result.stderr.strip()}")
-    paths: list[str] = []
+    blocking: list[str] = []
+    untracked: list[str] = []
     for record in result.stdout.split("\0"):
         if not record:
             continue
         raw = record[3:] if len(record) >= 4 and record[2] == " " else record
         if is_control_plane_path(raw):
             continue
-        paths.append(raw)
-    return paths
+        xy = record[:2] if len(record) >= 2 else ""
+        if xy == "??":
+            if scope is not None and in_scope(raw, scope):
+                blocking.append(raw)
+            else:
+                untracked.append(raw)
+        else:
+            blocking.append(raw)
+    return blocking, untracked
+
+
+def note_untracked(untracked: list[str], warnings: list[str] | None) -> None:
+    if untracked and warnings is not None:
+        warnings.append("untracked files outside .dag/ (not in the commit range): " + ", ".join(untracked))
 
 
 def in_scope(path: str, scope: dict[str, Any]) -> bool:
@@ -382,8 +404,14 @@ def context_size(root: Path, nodes: list[dict[str, Any]]) -> dict[str, dict[str,
     return sizes
 
 
-def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
-    """Return the attempt's changed paths, refusing an unclean or non-linear worktree."""
+def node_diff(
+    dag_path: Path,
+    node: dict[str, Any],
+    attempt: dict[str, Any],
+    head_ref: str,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    """Return the attempt's changed paths, refusing tracked dirtiness or a non-linear worktree."""
     worktree = resolve_worktree(dag_path, attempt["worktree"])
     base_ref = resolve_commit(worktree, attempt["base_ref"], "base_ref")
     head_ref = resolve_commit(worktree, head_ref, "head_ref")
@@ -393,14 +421,21 @@ def node_diff(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], hea
     diff = run_git(worktree, "diff", "--name-only", f"{base_ref}..{head_ref}")
     if diff.returncode != 0:
         raise DagError(f"cannot compute node diff: {diff.stderr.strip()}")
-    dirty = dirty_paths(worktree)
-    if dirty:
-        raise DagError("worktree has uncommitted changes outside .dag/: " + ", ".join(dirty))
+    blocking, untracked = classify_worktree_dirtiness(worktree, node["scope"])
+    if blocking:
+        raise DagError("worktree has uncommitted changes outside .dag/: " + ", ".join(blocking))
+    note_untracked(untracked, warnings)
     return [line for line in diff.stdout.splitlines() if line and not is_control_plane_path(line)]
 
 
-def checked_changes(dag_path: Path, node: dict[str, Any], attempt: dict[str, Any], head_ref: str) -> list[str]:
-    changed = node_diff(dag_path, node, attempt, head_ref)
+def checked_changes(
+    dag_path: Path,
+    node: dict[str, Any],
+    attempt: dict[str, Any],
+    head_ref: str,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    changed = node_diff(dag_path, node, attempt, head_ref, warnings)
     allowed = node["scope"]["files"]
     forbidden = node["scope"]["forbidden"]
     for changed_path in changed:
@@ -1490,12 +1525,13 @@ def cmd_check_scope(argv: list[str]) -> int:
     nodes = node_map(dag)
     node = nodes.get(args.node_id)
 
+    extra_warnings: list[str] = []
     try:
         if node is None:
             raise DagError(f"unknown node {args.node_id!r}")
         if not node["attempts"] or node["attempts"][-1]["outcome"] is not None:
             raise DagError(f"{args.node_id!r} has no open attempt to check")
-        changed = node_diff(args.dag, node, node["attempts"][-1], args.head_ref)
+        changed = node_diff(args.dag, node, node["attempts"][-1], args.head_ref, extra_warnings)
         context_used: list[str] = []
         if args.handoff_ref:
             handoff = load_json_artifact(args.dag, args.handoff_ref, "handoff artifact")
@@ -1522,6 +1558,7 @@ def cmd_check_scope(argv: list[str]) -> int:
         "violations": violations,
         "also_claimed_by": claims,
         "context_beyond_contract": beyond_contract,
+        "warnings": extra_warnings,
     }
     if args.json:
         print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -1539,6 +1576,8 @@ def cmd_check_scope(argv: list[str]) -> int:
             print("\nRead beyond read_first and scope (self-reported; a long list means the contract was thin):")
             for path in beyond_contract:
                 print(f"  {path}")
+        for warning in extra_warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
     return EXIT_INVALID if violations else 0
 
 
@@ -1554,7 +1593,9 @@ def clear_handoff(node: dict[str, Any]) -> None:
     }
 
 
-def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.Namespace) -> str:
+def transition_review(
+    dag: dict[str, Any], node: dict[str, Any], args: argparse.Namespace, warnings: list[str]
+) -> str:
     if node["status"] != "running":
         raise DagError(f"cannot review {node['id']!r} while status is {node['status']!r}")
     if not is_text(args.handoff_ref) or not is_text(args.review_ref):
@@ -1580,7 +1621,7 @@ def transition_review(dag: dict[str, Any], node: dict[str, Any], args: argparse.
     if head_ref is not None:
         # Scope is checked before consuming reviewer claims, so malformed artifacts cannot
         # hide an out-of-scope worker commit.
-        initial_changed = checked_changes(args.dag, node, attempt, head_ref)
+        initial_changed = checked_changes(args.dag, node, attempt, head_ref, warnings)
     review = validate_review_artifact(
         args.dag, args.review_ref, node, head_ref, len(reviews) + 1
     )
@@ -1768,7 +1809,7 @@ def resolve_contract(dag_path: Path, node: dict[str, Any], args: argparse.Namesp
     return f"{node['id']}: contract decision approved without re-reviewing unchanged code"
 
 
-def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
+def transition_node(dag: dict[str, Any], args: argparse.Namespace, warnings: list[str]) -> str:
     if not args.node_id or not args.status:
         raise DagError("node ID and action are required for a node transition")
     nodes = node_map(dag)
@@ -1778,7 +1819,7 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
     current = node["status"]
     target = args.status
     if target == "review":
-        return transition_review(dag, node, args)
+        return transition_review(dag, node, args, warnings)
     if target == "resolve-escalation":
         return resolve_escalation(dag, node, args)
     if target == "resolve-contract":
@@ -1794,9 +1835,8 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
             raise DagError("cannot start a node before planning_status is 'approved'")
         session = os.environ.get("CLAUDE_CODE_SESSION_ID")
         if session and session == dag.get("planning_session"):
-            raise DagError(
-                "cannot execute in the session that planned this DAG; start a new session "
-                "and run '/dag-engineering continue'"
+            warnings.append(
+                "executing in the session that planned this DAG; independent execution is weaker"
             )
         incomplete = [dependency for dependency in node["depends_on"] if nodes[dependency]["status"] != "done"]
         if incomplete:
@@ -1819,9 +1859,10 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
                 f"{worktree} holds its own .dag/dag.json; a worktree must not carry a second control "
                 "plane, and artifacts written there would not resolve against the real one"
             )
-        dirty = dirty_paths(worktree)
-        if dirty:
-            raise DagError("worktree is not clean outside .dag/: " + ", ".join(dirty))
+        blocking, untracked = classify_worktree_dirtiness(worktree)
+        if blocking:
+            raise DagError("worktree is not clean outside .dag/: " + ", ".join(blocking))
+        note_untracked(untracked, warnings)
         # By now every dependency is done, so a read_first path that still does not exist is a
         # contract defect, and the worker would go looking for its own inputs to make up for it.
         invalid = [path for path in node["read_first"] if (worktree / path).exists() and not (worktree / path).is_file()]
@@ -1896,7 +1937,7 @@ def transition_node(dag: dict[str, Any], args: argparse.Namespace) -> str:
                 validate_handoff_artifact(args.dag, args.handoff_ref, node["id"], None, None)
                 validate_master_artifact(args.dag, args.verification_ref, node, None, None)
             else:
-                changed = checked_changes(args.dag, node, attempt, head_ref)
+                changed = checked_changes(args.dag, node, attempt, head_ref, warnings)
                 handoff_head = attempt.get("worker_head") or head_ref
                 handoff_changed = checked_range_changes(
                     worktree, node, attempt["base_ref"], handoff_head
@@ -2017,7 +2058,11 @@ def apply_reviewer_draft(dag_path: Path, dag: dict[str, Any], draft_ref: str) ->
 
 
 def record_design_review(
-    dag_path: Path, dag: dict[str, Any], ref: str, draft_ref: str | None = None
+    dag_path: Path,
+    dag: dict[str, Any],
+    ref: str,
+    draft_ref: str | None = None,
+    warnings: list[str] | None = None,
 ) -> str:
     """Record one plan-review round, applying the reviewer's draft in the same step.
 
@@ -2028,7 +2073,13 @@ def record_design_review(
     existing = dag.get("decomposition_review")
     if isinstance(existing, dict) and existing.get("verdict") is not None:
         if existing.get("fingerprint") == plan_fingerprint(dag):
-            raise DagError("this plan fingerprint already has a recorded decomposition review; a duplicate review is refused")
+            if warnings is not None:
+                warnings.append(
+                    "this plan fingerprint already has a recorded decomposition review; leaving it unchanged"
+                )
+            return (
+                f"plan review: unchanged ({existing.get('verdict')} already recorded for this fingerprint)"
+            )
     preflight_errors, _ = plan_preflight(dag_path, dag)
     if preflight_errors:
         raise DagError("plan preflight failed before review: " + "; ".join(preflight_errors))
@@ -2253,6 +2304,58 @@ def load_draft(
 
 DELIVERABLE_FIELDS = ("objective", "global_acceptance", "assumptions", "source_refs")
 FROZEN_CONTRACT_STATUSES = {"done", "running"}
+NARROW_NODE_FIELDS = {"execution_plan", "read_first", "verification", "scope"}
+
+
+def verification_is_narrow(old: Any, new: Any) -> bool:
+    """True when only run/expect changed; ids, covers, and other keys stay the same."""
+    if not isinstance(old, list) or not isinstance(new, list) or len(old) != len(new):
+        return False
+    for current, proposed in zip(old, new):
+        if not isinstance(current, dict) or not isinstance(proposed, dict):
+            return False
+        if {key: value for key, value in current.items() if key not in {"run", "expect"}} != {
+            key: value for key, value in proposed.items() if key not in {"run", "expect"}
+        }:
+            return False
+    return True
+
+
+def scope_is_tighter_or_equal(old: Any, new: Any) -> bool:
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return False
+    return set(new.get("files") or []) <= set(old.get("files") or []) and set(old.get("forbidden") or []) <= set(
+        new.get("forbidden") or []
+    )
+
+
+def revision_is_narrow(
+    dag: dict[str, Any],
+    candidate: dict[str, Any],
+    added: list[str],
+    dropped: list[str],
+    current: dict[str, dict[str, Any]],
+    proposed: dict[str, dict[str, Any]],
+) -> bool:
+    """A revision that only retouches execution maps, read_first, verification commands, or tighter scope."""
+    if added or dropped:
+        return False
+    if any(candidate.get(field) != dag.get(field) for field in DELIVERABLE_FIELDS):
+        return False
+    for node_id, node in current.items():
+        replacement = proposed.get(node_id)
+        if replacement is None:
+            return False
+        changed = [field for field in PLAN_NODE_FIELDS if replacement.get(field) != node.get(field)]
+        if not changed:
+            continue
+        if any(field not in NARROW_NODE_FIELDS for field in changed):
+            return False
+        if "verification" in changed and not verification_is_narrow(node.get("verification"), replacement.get("verification")):
+            return False
+        if "scope" in changed and not scope_is_tighter_or_equal(node.get("scope"), replacement.get("scope")):
+            return False
+    return True
 
 
 def unfinished_dependents(nodes: dict[str, dict[str, Any]], targets: set[str]) -> dict[str, list[str]]:
@@ -2267,26 +2370,24 @@ def unfinished_dependents(nodes: dict[str, dict[str, Any]], targets: set[str]) -
     return {target: sorted(dependents) for target, dependents in blast.items()}
 
 
-def revise_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str) -> str:
-    """Replace the plan at any point before completion, restarting the review cycle.
+def revise_dag(
+    dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str, warnings: list[str]
+) -> str:
+    """Replace the plan at any point before completion.
 
-    Whether the plan is a fresh draft, awaiting approval, approved, or sent back for
-    replanning, this is the one command that changes it. What already ran is preserved
-    regardless: the execution record cannot be rewritten, attempted nodes cannot be
-    dropped, and the contracts of running and done nodes are frozen. A changed plan is
-    unproven again, so it returns to awaiting_approval with its review cleared, and the
-    whole plan is re-reviewed and approved as one.
+    A material change returns the plan to awaiting_approval with its review cleared.
+    A narrow change to execution maps, read_first, verification commands, or tighter
+    scope on an already-approved plan keeps that approval and warns instead.
     """
-    if dag["convergence"]["status"] == "failed":
-        raise DagError(
-            "failed convergence is repaired with --add-gap-nodes, which must address exactly the recorded gaps"
-        )
     if dag["planning_status"] == "complete":
         raise DagError(
             "a completed plan cannot be revised; archive this DAG and start a new control plane"
         )
     if not is_text(reason):
         raise DagError("--revise requires --reason recording why the plan no longer fits")
+
+    previous_gaps = list(dag.get("convergence", {}).get("gaps") or [])
+    failed_convergence = dag.get("convergence", {}).get("status") == "failed"
 
     candidate, _ = load_draft(dag_path, dag, draft_ref, allow_patch=True)
     proposed, current = node_map(candidate), node_map(dag)
@@ -2310,15 +2411,35 @@ def revise_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str)
         if changed:
             retouched.append(node_id)
 
+    narrow = dag["planning_status"] == "approved" and revision_is_narrow(
+        dag, candidate, added, dropped, current, proposed
+    )
     candidate["planning_session"] = dag.get("planning_session")
-    candidate["planning_status"] = "awaiting_approval"
-    candidate["approval_ref"] = None
-    candidate["decomposition_review"] = None
+    if narrow:
+        candidate["planning_status"] = dag["planning_status"]
+        candidate["approval_ref"] = dag.get("approval_ref")
+        candidate["decomposition_review"] = dag.get("decomposition_review")
+        warnings.append("narrow revision left planning_status approved without a new decomposition review")
+    else:
+        candidate["planning_status"] = "awaiting_approval"
+        candidate["approval_ref"] = None
+        candidate["decomposition_review"] = None
+    if failed_convergence:
+        warnings.append(
+            "revising after failed convergence; previous gaps must still be addressed: "
+            + ("; ".join(previous_gaps) if previous_gaps else "(none recorded)")
+        )
+        candidate["convergence"] = {
+            "status": "pending",
+            "verification_ref": None,
+            "checked_at": None,
+            "gaps": [],
+        }
     candidate["replans"] = list(dag.get("replans") or []) + [
         {
             "ref": draft_ref,
             "at": utc_now(),
-            "kind": "revision",
+            "kind": "narrow_revision" if narrow else "revision",
             "reason": reason,
             "added": added,
             "dropped": dropped,
@@ -2330,9 +2451,12 @@ def revise_dag(dag_path: Path, dag: dict[str, Any], draft_ref: str, reason: str)
         raise DagError("revision would produce invalid DAG: " + "; ".join(errors))
     dag.clear()
     dag.update(candidate)
+    if narrow:
+        status_note = f"narrow revision, planning_status stays {dag['planning_status']}"
+    else:
+        status_note = "planning_status -> awaiting_approval, plan review required"
     lines = [
-        f"revised {dag['dag_id']}: +{len(added)} -{len(dropped)} ~{len(retouched)} node(s); "
-        "planning_status -> awaiting_approval, plan review required"
+        f"revised {dag['dag_id']}: +{len(added)} -{len(dropped)} ~{len(retouched)} node(s); {status_note}"
     ]
     if dropped:
         remaining = {node["id"] for node in candidate["nodes"]}
@@ -2396,7 +2520,11 @@ def cmd_update(argv: list[str]) -> int:
     parser.add_argument("--init", metavar="DRAFT", help="install a validated draft as a new control file")
     parser.add_argument("--decomposition-review", metavar="REF", help="record a fresh reviewer's verdict on the plan")
     parser.add_argument("--draft", metavar="DRAFT", help="reviewer-fixed draft plan applied with a decomposition review that reports bugs")
-    parser.add_argument("--revise", metavar="DRAFT", help="replace the plan from a draft or patch, clearing its review; requires --reason")
+    parser.add_argument(
+        "--revise",
+        metavar="DRAFT",
+        help="replace the plan from a draft or patch; material changes clear review, narrow ones warn; requires --reason",
+    )
     parser.add_argument("--reseal", action="store_true", help="re-seal a control file after a deliberate repair")
     parser.add_argument("--archive", action="store_true", help="retire a completed DAG into .dag/archive/")
     parser.add_argument("--abandon", action="store_true", help="retire an unfinished DAG; requires --reason")
@@ -2460,6 +2588,7 @@ def cmd_update(argv: list[str]) -> int:
             errors, _ = validate_dag(dag)
             if errors:
                 raise DagError("DAG is invalid before transition: " + "; ".join(errors))
+            op_warnings: list[str] = []
             if args.planning_status:
                 message = transition_planning(args.dag, dag, args.planning_status, args.reference)
             elif args.convergence:
@@ -2467,9 +2596,11 @@ def cmd_update(argv: list[str]) -> int:
             elif args.add_gap_nodes:
                 message = add_gap_nodes(args.dag, dag, args.add_gap_nodes)
             elif args.decomposition_review:
-                message = record_design_review(args.dag, dag, args.decomposition_review, args.draft)
+                message = record_design_review(
+                    args.dag, dag, args.decomposition_review, args.draft, op_warnings
+                )
             elif args.revise:
-                message = revise_dag(args.dag, dag, args.revise, args.reason)
+                message = revise_dag(args.dag, dag, args.revise, args.reason, op_warnings)
             elif args.archive or args.abandon:
                 message, warnings = (
                     retire_dag(args.dag, dag, args.reason if args.abandon else None, args.reference),
@@ -2482,9 +2613,10 @@ def cmd_update(argv: list[str]) -> int:
                 )
                 return 0
             else:
-                message = transition_node(dag, args)
+                message = transition_node(dag, args, op_warnings)
             dag["updated_at"] = utc_now()
             errors, warnings = validate_dag(dag)
+            warnings = op_warnings + warnings
             if errors:
                 raise DagError("transition would produce invalid DAG: " + "; ".join(errors))
             atomic_write(args.dag, dag)

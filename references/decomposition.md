@@ -113,7 +113,7 @@ The validator already proves graph structure: no cycles, symmetric conflicts, un
 
 Every finding names the offending nodes and the failure, not a style preference. Bugs carry a `fix` describing what the reviewer's draft changes; unsure entries carry a `question` stating the decision only the user or controller may make. The single `review.json` binds its entries to the request fingerprint and names the reviewer's draft in `draft_ref` when it reports bugs.
 
-The runtime derives the verdict; a reviewer does not pass its own approval flag. Any open `unsure` entry blocks approval until the controller settles it with a further `--revise` or the user records a durable override; bugs are already fixed in the draft and never block on their own. Changing the plan at any later stage — new draft, awaiting approval, approved, or replanning — goes through this same loop: `--revise` clears the review, and the revised plan is reviewed and approved as a whole.
+The runtime derives the verdict; a reviewer does not pass its own approval flag. Any open `unsure` entry blocks approval until the controller settles it with a further `--revise` or the user records a durable override; bugs are already fixed in the draft and never block on their own. A material `--revise` at any later stage clears the review, and the revised plan is reviewed and approved as a whole. A narrow revision of execution maps, `read_first`, verification commands, or tighter `scope` on an approved plan keeps that approval.
 
 ## Coverage convergence preview
 

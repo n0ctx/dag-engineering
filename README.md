@@ -12,7 +12,7 @@ It is intentionally not for small single-session changes, quick fixes, isolated 
 
 The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. Workers execute bounded node contracts; they do not directly rewrite the control plane.
 
-The target repository's `.dag/` directory is the control plane. `.dag/dag.json` stores the current plan and execution state. The runtime validates paths, scope, dependencies, conflicts, evidence, Git references, and state transitions, and seals the control file after writes.
+The target repository's `.dag/` directory is the control plane. `.dag/dag.json` stores the current plan and execution state. The runtime validates paths, scope, dependencies, conflicts, evidence, Git references, and state transitions, seals the control file after writes, and warns on process-cost issues that do not break those facts.
 
 The main repository remains the source of code truth. Project documentation remains the source of knowledge truth. The DAG remains the source of execution-state truth.
 
@@ -20,7 +20,7 @@ The main repository remains the source of code truth. Project documentation rema
 
 ### Planning
 
-Planning normalizes the source, records durable references, separates facts from assumptions, identifies ownership and boundaries, and decomposes the work into node contracts. A new or changed plan enters the approval gate after one fix-first decomposition review and controller close-out. Planning stops until the user explicitly approves the plan.
+Planning normalizes the source, records durable references, separates facts from assumptions, identifies ownership and boundaries, and decomposes the work into node contracts. A new or materially changed plan enters the approval gate after one fix-first decomposition review and controller close-out. Planning stops until the user explicitly approves the plan. A narrow revision of execution maps, `read_first`, verification commands, or tighter scope on an approved plan keeps that approval.
 
 ### Execution
 
@@ -28,7 +28,7 @@ Execution dispatches only approved ready nodes, records bounded attempts and han
 
 ### Replanning and convergence
 
-When implementation reveals that a contract or graph is wrong, revise the plan through the runtime and restart the review and approval loop. Integrate completed nodes in dependency order, run whole-plan checks, record gaps as explicit nodes, and mark the DAG complete only after every node is done and convergence has passed.
+When implementation reveals that a contract or graph is wrong, revise the plan through the runtime. A material change restarts the review and approval loop; a narrow revision keeps approval. Integrate completed nodes in dependency order, run whole-plan checks, record gaps as explicit nodes, and mark the DAG complete only after every node is done and convergence has passed.
 
 ## Runtime entry points
 

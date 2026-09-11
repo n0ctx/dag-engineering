@@ -11,7 +11,7 @@ Run it against real Git data as soon as the worker reports, before a reviewer is
   --handoff-ref ".dag/artifacts/<node-id>/handoff.json"
 ```
 
-It compares every changed path with `scope.files` and `scope.forbidden`, refuses an unclean worktree, and writes nothing. Generated or untracked files count. A useful out-of-scope edit is still an out-of-scope edit: reject or explicitly re-plan it rather than silently widening the node.
+It compares every changed path with `scope.files` and `scope.forbidden`, refuses tracked uncommitted edits, and writes nothing. Untracked files outside the node's scope warn and do not block; untracked files inside `scope.files` still fail as uncommitted deliverables. A useful out-of-scope edit is still an out-of-scope edit: reject or explicitly re-plan it rather than silently widening the node.
 
 Read its other two reports as evidence rather than verdicts. Paths also claimed by an unfinished node are legal — that is what `conflicts_with` is for — but they are where a worker doing a neighbour's work shows up. Context read beyond the contract is self-reported and a long list indicts the node contract, not the worker.
 

@@ -11,13 +11,13 @@ Produce `<project>/.dag/dag.json`. Do not implement its nodes.
 
 If `.dag/dag.json` did not exist at the start of the user turn and no durable plan was approved before that turn, the turn is planning-only. “Start,” “do it,” and “execute” cannot approve a DAG the user has not seen.
 
-When writing or validating an `awaiting_approval` DAG:
+When writing or validating an `awaiting_approval` DAG the user has not approved:
 
 1. show a compact summary;
 2. ask for approval;
-3. end the response.
+3. stop without dispatching or editing files outside `.dag/`.
 
-Do not load execution, record approval, dispatch workers, or edit files outside `.dag/` in that turn. The user's wish to complete a project is not approval of a particular decomposition.
+The user's wish to complete a project is not approval of a particular decomposition. If the same turn later records a durable `approval_ref` and the user also asked to execute, continue into execution; do not wait for a new session.
 
 ## Load only what planning needs
 
@@ -46,7 +46,7 @@ For natural-language, unapproved, or mutually ambiguous sources, start with `pla
 
 ## 1. Directed reconnaissance
 
-Read only enough code and documentation to identify owners, interfaces, nearby implementation, tests, and integration boundaries. Prefer targeted search and at most one bounded exploration. Record evidence and real paths; if ownership remains unknown, keep planning open or create a bounded investigation node.
+Read only enough code and documentation to identify owners, interfaces, nearby implementation, tests, and integration boundaries. Prefer targeted search; extra exploration is a cost to record as evidence, not a stop. If ownership remains unknown, keep planning open or create a bounded investigation node.
 
 ## 2. Clarify load-bearing ambiguity
 
@@ -54,7 +54,7 @@ After reconnaissance, ask only questions whose answers could change the objectiv
 
 Persist the normalized request first and verify the file exists. If read-back fails, report the persistence failure and ask no clarification questions.
 
-Facts are the controller's work; decisions belong to the user. Ask one frontier round of at most three questions. Each question must have bounded options, a recommendation, its reason, and its main tradeoff:
+Facts are the controller's work; decisions belong to the user. Prefer one frontier round of at most three questions. If more load-bearing choices remain, ask the next batch or park them as `assumptions`; do not stall planning to stay under three. Each question must have bounded options, a recommendation, its reason, and its main tradeoff:
 
 ```text
 Q1. <decision and bounded options>
@@ -88,13 +88,13 @@ If an unfinished DAG already exists, report its state and ask whether to resume 
 "${SKILL_ROOT}/scripts/update-task" --abandon --reason "<why>" --reference "<path under .dag/sources/>"
 ```
 
-A new request superseding an existing plan is not, by itself, a reason to abandon it. Changing an existing plan — whether it is still a draft, awaiting approval, approved, or sent back for replanning — is always the same command, and it always restarts the review cycle:
+A new request superseding an existing plan is not, by itself, a reason to abandon it. Changing an existing plan — whether it is still a draft, awaiting approval, approved, or sent back for replanning — is always the same command:
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --revise ".dag/draft.json" --reason "<one line: why the plan changed>"
 ```
 
-`--revise` takes a whole plan draft or a patch (`{"dag_id", "update_nodes", "drop_nodes"}`), preserves every execution record, and returns the plan to `awaiting_approval` with its review cleared, because a changed plan is unproven again. It refuses only a completed plan and a failed convergence (failed convergence is repaired with `--add-gap-nodes`). The controller judges its own changes; nothing about changing the plan requires a separate scoped review.
+`--revise` takes a whole plan draft or a patch (`{"dag_id", "update_nodes", "drop_nodes"}`) and preserves every execution record. A material change — deliverables, node add/drop, edges, widened `scope`, or `acceptance`/`outputs` — returns the plan to `awaiting_approval` with its review cleared. A narrow change on an approved plan — `execution_plan`, `read_first`, `verification.run`/`expect`, or tighter `scope` — keeps approval and warns that no new decomposition review ran. Failed convergence may be revised the same way; the runtime warns that the previous gaps must still be addressed. `--add-gap-nodes` remains the default way to close recorded gaps. A completed plan cannot be revised. The controller judges its own changes; nothing about changing the plan requires a separate scoped review.
 
 Fix validator errors before presenting the plan. Preview coverage by mapping each source requirement and global acceptance criterion to nodes and verification paths, including integration work. Audit every technology or concrete interface, payload, status code, storage, or security choice against source evidence, an `assumptions` entry, or an investigation output.
 
@@ -136,4 +136,4 @@ Record approval only after persisting the exact approval and accepted DAG versio
 "${SKILL_ROOT}/scripts/update-task" --planning-status approved --reference "<durable approval reference>"
 ```
 
-Recording approval ends the planning turn. Ask the user to start a new session for `/dag-engineering continue`; execution may not run in the session that planned the DAG, and compacting that session is not a substitute.
+Recording approval does not by itself start workers. If the user also asked to execute, continue into execution in this session; the runtime warns when the planning session dispatches. Compacting the session is not a substitute for recording `approval_ref`.

@@ -24,7 +24,7 @@ Trust Git, project artifacts, and the DAG over chat recollection. Reconcile ever
 
 ## Select and dispatch
 
-派发前追加以下读取边界：合同已经直接写出的结论就是 worker 的工作事实；除 `read_first` 外最多再读 5 个文件，每个文件只为落实一个具名主张或验收问题，不得做仓库调查。`scope.files` 是写边界；`scope.forbidden` 只是其他节点的写保护区，不是阅读任务，也不要为了熟悉上下文主动打开。若在预算内仍有不影响合同完成的未决问题，完成工作并在 handoff 以 `DONE_WITH_CONCERNS` 登记主张、证据和残余风险；只有问题阻塞合同或要求改变合同、scope、接口或架构时才返回 `NEEDS_CONTEXT`。
+派发前追加以下读取边界：合同已经直接写出的结论就是 worker 的工作事实；除 `read_first` 外优先再读不超过 5 个文件，每个文件只为落实一个具名主张或验收问题，不得做仓库调查。超出这个预算时在 handoff `concerns` 里记下多读了什么，不要因此停工。`scope.files` 是写边界；`scope.forbidden` 只是其他节点的写保护区，不是阅读任务，也不要为了熟悉上下文主动打开。若仍有不影响合同完成的未决问题，完成工作并在 handoff 以 `DONE_WITH_CONCERNS` 登记主张、证据和残余风险；只有问题阻塞合同或要求改变合同、scope、接口或架构时才返回 `NEEDS_CONTEXT`。
 
 Use:
 
@@ -73,7 +73,7 @@ The runtime derives the review outcome from the artifact and binds the head. Dis
 
 ## Controller close-out
 
-The reviewer round is the last dispatch. Whatever is still open after it — a remaining defect, a gate rejecting an artifact over a fixable discrepancy, an `unsure` item the controller can settle from evidence — the controller closes itself: make the final judgment, repair in the node's worktree, commit, and record the closing review, handoff, and verification artifacts through the same runtime gates. Never send the node back for another worker or reviewer round; the whole loop is worker, reviewer, and at most this one close-out. The runtime binds commits and artifacts, not authorship — the close-out faces the same gates, and every recorded check must actually have run.
+The reviewer round is the last dispatch for in-scope defects. Whatever is still open after it — a remaining defect, a gate rejecting an artifact over a fixable discrepancy, an `unsure` item the controller can settle from evidence — the controller closes itself: make the final judgment, repair in the node's worktree, commit, and record the closing review, handoff, and verification artifacts through the same runtime gates. Do not bounce in-scope defects back to the worker. If the worker returned `NEEDS_CONTEXT` or the contract is wrong, revise or re-dispatch and record the extra round. Unchanged escalated or `cannot_verify` heads are settled with `resolve-escalation` or `resolve-contract`, not another review. The runtime binds commits and artifacts, not authorship — the close-out faces the same gates, and every recorded check must actually have run.
 
 ## Master verification
 
@@ -92,7 +92,7 @@ Do not fix implementation code inline while acting as the independent acceptance
 
 ## Replan and converge
 
-If execution shows that the graph or contract is wrong, change the plan with the same loop planning uses; do not widen a node silently. `--revise` replaces the plan from a draft or patch, preserves every execution record, and returns it to `awaiting_approval` for one full review round and the approval gate, exactly like a new plan. Mark a live plan for replanning when the deliverable itself is in doubt:
+If execution shows that the graph or contract is wrong, change the plan with the same loop planning uses; do not widen a node silently. `--revise` replaces the plan from a draft or patch and preserves every execution record. A material change returns it to `awaiting_approval` for one full review round and the approval gate. A narrow change to `execution_plan`, `read_first`, verification commands, or tighter `scope` on an approved plan keeps approval and warns. Mark a live plan for replanning when the deliverable itself is in doubt:
 
 ```bash
 "${SKILL_ROOT}/scripts/update-task" --revise ".dag/revision.json" --reason "<one line>"

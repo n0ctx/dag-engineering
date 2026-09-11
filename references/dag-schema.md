@@ -43,7 +43,7 @@ Independent review and all findings remain durable. A user’s persisted `approv
 
 ## Control-plane lifecycle
 
-`.dag/` exists only at the main worktree root. The runtime seals `dag.json` beside it and obtains an exclusive lock for updates. `update-task --init` is the only creation path. `--revise` is the only plan-change path: it accepts a whole draft or a patch at any planning status except `complete`, preserves execution records, freezes the contracts of running and done nodes, and returns the plan to `awaiting_approval` with its review cleared for a fresh review round. Failed convergence is repaired only with `--add-gap-nodes`. Running nodes cannot be retired. Archived DAGs are records, not control files.
+`.dag/` exists only at the main worktree root. The runtime seals `dag.json` beside it and obtains an exclusive lock for updates. `update-task --init` is the only creation path. `--revise` is the only plan-change path: it accepts a whole draft or a patch at any planning status except `complete`, preserves execution records, and freezes the contracts of running and done nodes. A material change returns the plan to `awaiting_approval` with its review cleared. A narrow change to `execution_plan`, `read_first`, `verification.run`/`expect`, or tighter `scope` on an approved plan keeps approval and warns. Failed convergence may be revised; `--add-gap-nodes` remains the default way to import recorded gaps. Running nodes cannot be retired. Archived DAGs are records, not control files.
 
 `status --node <id>` emits a dispatch brief, `status --plan-view` emits every node contract without execution records, and `status --review-request` emits the single-round review request. No worker reads or writes the control file directly.
 
@@ -51,7 +51,7 @@ Independent review and all findings remain durable. A user’s persisted `approv
 
 - `source_refs` identify durable source material: project paths, stable URLs, issue IDs, or commit references. Chat-only input is first persisted as a source artifact. `assumptions` are explicit proposed choices, not facts; approval accepts them and unresolved choices belong in an investigation/decision node.
 - The runtime seals `dag.json` in `.dag/.dag.json.seal` after every write and verifies it before every read. `--reseal --reason` is the deliberate repair path and records the reason in `reseal`.
-- `planning_session` is stamped on first approval and preserved through revisions. A planning session cannot execute its own DAG.
+- `planning_session` is stamped on first approval and preserved through revisions. Dispatch in that session is allowed and warned; it does not replace the approval gate.
 - Revisions preserve attempts, handoffs, and statuses for work already run. Running contracts cannot change; done contracts cannot change.
 - Node review outcomes bind the reviewed handoff and immutable Git head. Reviewer fix commits (`fix_commit`) must be independent descendants of `worker_head`; a done node also requires a matching master verification artifact and scope/evidence checks.
-- Failed convergence gaps are imported only through a reviewed gap-node artifact whose `dag_id` and `addresses_gaps` exactly match the recorded gaps. Import appends pending nodes, records the artifact in `source_refs`, clears approval, and returns planning to `awaiting_approval`.
+- Failed convergence gaps are imported through a reviewed gap-node artifact whose `dag_id` and `addresses_gaps` exactly match the recorded gaps. Import appends pending nodes, records the artifact in `source_refs`, clears approval, and returns planning to `awaiting_approval`. `--revise` may replace the plan after failed convergence; the runtime warns that those gaps must still be addressed.

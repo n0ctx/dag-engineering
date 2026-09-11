@@ -378,15 +378,22 @@ class RuntimeTests(unittest.TestCase):
         self.approve_as("session-plan")
         self.assertEqual(json.loads(self.path.read_text())["planning_session"], "session-plan")
 
-    def test_planning_session_cannot_execute_its_own_dag(self):
+    def test_planning_session_warns_when_it_executes_its_own_dag(self):
         self.awaiting([node("A")])
         self.approve_as("session-plan")
         self.session = "session-plan"
-        result = self.run_cmd("update-task", "A", "running", "--worktree", str(self.root), expect=3)
-        self.assertIn("start a new session", result.stderr)
-        self.session = "session-exec"
-        self.start("A")
+        result = self.run_cmd("update-task", "A", "running", "--worktree", str(self.root))
+        self.assertIn("executing in the session that planned this DAG", result.stderr)
         self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["status"], "running")
+
+    def test_duplicate_decomposition_review_is_idempotent(self):
+        self.awaiting([node("A")])
+        ref = self.design_review()
+        first = json.loads(self.path.read_text())["decomposition_review"]
+        result = self.run_cmd("update-task", "--decomposition-review", ref)
+        self.assertIn("already has a recorded decomposition review", result.stderr)
+        self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["verdict"], first["verdict"])
+        self.assertEqual(json.loads(self.path.read_text())["decomposition_review"]["fingerprint"], first["fingerprint"])
 
     def test_session_gate_fails_open_without_a_session_id(self):
         self.awaiting([node("A")])
@@ -845,6 +852,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(saved["replans"][-1]["retouched"], ["B"])
         self.assertEqual(saved["replans"][-1]["reason"], "execution disproved the slice")
 
+    def test_narrow_revision_keeps_approval(self):
+        current = self.live_plan([node("A"), node("B")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][1]["read_first"] = ["docs/spec.md"]
+        proposed["nodes"][1]["execution_plan"] = ["docs/spec.md—implement B; covers AC1/V1"]
+        proposed["nodes"][1]["verification"][0]["run"] = "python3 -m pytest tests/test_b.py"
+        proposed["nodes"][1]["scope"]["files"] = ["src/B.py"]
+        result = self.revise(proposed, reason="tighten the execution map")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["planning_status"], "approved")
+        self.assertEqual(saved["approval_ref"], current["approval_ref"])
+        self.assertEqual(saved["decomposition_review"], current["decomposition_review"])
+        self.assertEqual(saved["replans"][-1]["kind"], "narrow_revision")
+        self.assertIn("without a new decomposition review", result.stderr)
+
+    def test_widening_scope_is_not_a_narrow_revision(self):
+        current = self.live_plan([node("A")])
+        proposed = copy.deepcopy(current)
+        proposed["nodes"][0]["scope"]["files"] = ["src/A.py", "src/extra.py"]
+        self.revise(proposed, reason="worker needs a second file")
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertEqual(saved["replans"][-1]["kind"], "revision")
+
     def test_revise_can_change_what_the_project_delivers(self):
         current = self.live_plan([node("A")])
         proposed = copy.deepcopy(current)
@@ -1020,7 +1051,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(saved["replans"][-1]["kind"], "revision")
         self.assertTrue((self.root / ref).exists())
 
-    def test_revise_requires_a_reason_and_refuses_completed_or_failed_convergence(self):
+    def test_revise_requires_a_reason(self):
         self.awaiting([node("A"), node("B")])
         self.approve_as("session-plan")
         proposed = json.loads(self.path.read_text())
@@ -1035,7 +1066,7 @@ class RuntimeTests(unittest.TestCase):
                      "--reason", "replan while A runs")
         self.assertEqual(json.loads(self.path.read_text())["planning_status"], "awaiting_approval")
 
-    def test_failed_convergence_still_belongs_to_gap_nodes(self):
+    def test_failed_convergence_can_be_revised_with_a_warning(self):
         self.awaiting([node("A")])
         self.approve_as("session-plan")
         self.complete("A")
@@ -1045,10 +1076,16 @@ class RuntimeTests(unittest.TestCase):
         self.run_cmd("update-task", "--convergence", "failed",
                      "--reference", ".dag/artifacts/conv.md", "--gap", "G1 uncovered")
         proposed = json.loads(self.path.read_text())
+        proposed["nodes"].append(node("C", depends=("A",)))
         self.assertEqual(proposed["planning_status"], "replan_required")
         result = self.run_cmd("update-task", "--revise", self.draft(proposed, name="d.json"),
-                              "--reason", "skip the gaps", expect=3)
-        self.assertIn("--add-gap-nodes", result.stderr)
+                              "--reason", "rebuild around the gap")
+        self.assertIn("previous gaps must still be addressed", result.stderr)
+        self.assertIn("G1 uncovered", result.stderr)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["planning_status"], "awaiting_approval")
+        self.assertEqual(saved["convergence"]["status"], "pending")
+        self.assertEqual(saved["replans"][-1]["added"], ["C"])
 
     def test_revise_refuses_a_completed_plan(self):
         self.awaiting([node("A")])
@@ -1119,6 +1156,30 @@ class RuntimeTests(unittest.TestCase):
             result = self.run_cmd("update-task", *args, expect=3)
             self.assertIn("running nodes first", result.stderr)
         self.assertTrue(self.path.exists())
+
+    def test_untracked_files_outside_scope_warn_on_start(self):
+        self.write(dag([node("A")]))
+        (self.root / "build.log").write_text("noise\n", encoding="utf-8")
+        result = self.start("A")
+        self.assertIn("untracked files outside .dag/", result.stderr)
+        self.assertEqual(json.loads(self.path.read_text())["nodes"][0]["status"], "running")
+
+    def test_tracked_dirtiness_still_blocks_start(self):
+        self.write(dag([node("A")]))
+        (self.root / "README.md").write_text("dirty\n", encoding="utf-8")
+        result = self.run_cmd("update-task", "A", "running", "--worktree", str(self.root), expect=3)
+        self.assertIn("not clean", result.stderr)
+
+    def test_in_scope_untracked_files_still_block_review(self):
+        self.write(dag([node("A", files=["src/**"])]))
+        self.start("A")
+        head = self.commit_node("A")
+        (self.root / "notes.txt").write_text("noise\n", encoding="utf-8")
+        result = self.run_cmd("check-scope", "A", "--head-ref", head)
+        self.assertIn("untracked files outside .dag/", result.stderr)
+        (self.root / "src" / "extra.py").write_text("uncommitted deliverable\n", encoding="utf-8")
+        result = self.run_cmd("check-scope", "A", "--head-ref", head, expect=3)
+        self.assertIn("uncommitted changes", result.stderr)
 
     def test_parallel_nodes_cannot_share_worktree(self):
         self.write(dag([node("A"), node("B")]))

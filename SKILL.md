@@ -12,7 +12,7 @@ Compile large engineering work into a persistent DAG, then use it as the control
 - An explicit user decision outranks this skill's recommendations and subjective review findings. Preserve the finding, record the decision durably, and use the supported state or contract transition. It does not bypass runtime-enforced schema, acyclicity, path/scope, Git-SHA, evidence-binding, or external-authorization checks.
 
 - Git is the code truth, project documentation is the knowledge truth, `.dag/dag.json` is the execution-state truth, and a session is disposable computation.
-- The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. A node's execution is bounded: one fix-first reviewer round, and — whenever anything is still open after that — one controller close-out in which the controller itself judges, repairs, commits, and records through the same gates. A node never bounces between worker and reviewer for repeated rework. Planning runs the same single loop at any stage: draft the plan, install or change it (`--init` or `--revise`), one fix-first decomposition review, one controller close-out of what the review left open, and the user's approval gate — a changed plan re-enters the loop instead of earning a narrower repair pass.
+- The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. A node's normal loop is one worker, one fix-first reviewer round, and — whenever anything is still open after that — one controller close-out in which the controller itself judges, repairs, commits, and records through the same gates. Do not bounce in-scope defects back to the worker. If the contract is wrong or the worker returned `NEEDS_CONTEXT`, revise or re-dispatch and record the extra round. Planning runs the same loop at any stage: draft the plan, install or change it (`--init` or `--revise`), one fix-first decomposition review, one controller close-out of what the review left open, and the user's approval gate. A material change re-enters that loop; a narrow revision of execution maps, `read_first`, verification commands, or tighter scope on an approved plan keeps approval and warns.
 - One project has one control plane: `.dag/` at the main worktree root, holding one `.dag/dag.json` at a time. A finished effort is archived before the next one starts.
 - `.dag/dag.json` is only ever written by this skill's runtime scripts, including its creation, and carries an integrity seal that makes any other write a hard failure. Editing it with a file tool bypasses every gate and is never the shortcut it looks like; workers and reviewers do not touch it at all.
 
@@ -28,11 +28,11 @@ Use planning when the user asks to turn a PRD, roadmap, issue, checklist, existi
 ${SKILL_ROOT}/skills/dag-planning/SKILL.md
 ```
 
-When no DAG existed at the start of the turn, that turn is planning-only unless the request points to a durable plan approved before this turn. “Start,” “do it,” and “execute” cannot approve a DAG the user has not seen. If planning creates `awaiting_approval`, present it and end the turn: do not load execution, approve it, dispatch, or edit project files.
+When no DAG existed at the start of the turn, that turn is planning-only unless the request points to a durable plan approved before this turn. “Start,” “do it,” and “execute” cannot approve a DAG the user has not seen. If planning creates `awaiting_approval` and the user has not approved this decomposition, present it and stop: do not load execution, record approval, dispatch, or edit project files.
 
-Recording approval of a pending DAG is a planning action: load planning, record it, and end the turn there. Approval never authorizes execution in the planning session.
+Recording approval is a planning action. Once `approval_ref` is recorded, a user who also asked to execute may continue into execution in the same session; the runtime warns that independent execution is weaker. Do not wait for a new session.
 
-Use execution when `.dag/dag.json` exists and the user explicitly asks to run, execute, continue, resume, or finish the remaining work. Explicitly read:
+Use execution when `.dag/dag.json` exists, `planning_status` is `approved`, and the user explicitly asks to run, execute, continue, resume, or finish the remaining work. Explicitly read:
 
 ```text
 ${SKILL_ROOT}/skills/dag-execution/SKILL.md

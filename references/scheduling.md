@@ -34,7 +34,7 @@ Treat shared migrations, schemas, generated indexes, lockfiles, bulk formatters,
 
 ## Worktrees
 
-Use the current working tree for one node or strict serial execution when it is clean and project rules permit. Use one worktree and branch per concurrently active implementation node.
+Use the current working tree for one node or strict serial execution when tracked files are clean and project rules permit. Untracked leftovers outside node scope warn and do not block. Use one worktree and branch per concurrently active implementation node.
 
 Before dispatch into a worktree:
 
@@ -55,3 +55,5 @@ Integrate only nodes that passed worker, reviewer, and master gates. Follow sema
 The controller may resolve conflicts that are purely mechanical and do not change behavior or contracts. If resolution requires choosing behavior, changing an interface, or writing new domain logic, send it back to the responsible worker or re-plan.
 
 After integrating a related group, run a targeted integration check before releasing new downstream nodes whose contract depends on the integrated behavior.
+
+Remove each merged, clean worktree.

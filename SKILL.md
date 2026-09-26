@@ -1,43 +1,125 @@
 ---
 name: dag-engineering
-description: "Use only for large-scale, multi-session code engineering: turning a PRD, roadmap, or big refactor into a DAG, or continuing an effort tracked by .dag/dag.json. NOT for small or single-session tasks, quick fixes, single-file changes, non-code work, or any request a couple of tool calls can finish — handle those directly without this skill."
+description: "Use only for large, multi-step code engineering: turning a PRD, roadmap, or big refactor into a DAG of subtasks executed by subagents in a dedicated worktree, or continuing a plan saved under .dag/. NOT for small or single-session tasks, quick fixes, single-file changes, non-code work, or any request a couple of tool calls can finish — handle those directly without this skill."
 ---
 
 # DAG Engineering
 
-Compile large engineering work into a persistent DAG, then use it as the control plane across sessions.
+把较大的工程任务拆成有依赖关系的子任务（DAG），在独立 worktree 里按依赖顺序派给子代理执行。主代理负责拆分、派发、逐个验收和提交、最终验收。
 
-## Invariants
+流程：开 worktree → 拆分 → 保存 plan → 按 DAG 派发 → 逐节点验收并 commit → 子代理整体审查修复 → 主代理最终验收并报告。
 
-- An explicit user decision outranks this skill's recommendations and subjective review findings. Preserve the finding, record the decision durably, and use the supported state or contract transition. It does not bypass runtime-enforced schema, acyclicity, path/scope, Git-SHA, evidence-binding, or external-authorization checks.
+## 1. 开 worktree
 
-- Git is the code truth, project documentation is the knowledge truth, `.dag/dag.json` is the execution-state truth, and a session is disposable computation.
-- The controller owns planning, scheduling, state transitions, review coordination, independent verification, integration, and final convergence. A node's normal loop is one worker, one fix-first reviewer round, and — whenever anything is still open after that — one controller close-out in which the controller itself judges, repairs, commits, and records through the same gates. Do not bounce in-scope defects back to the worker. If the contract is wrong or the worker returned `NEEDS_CONTEXT`, revise or re-dispatch and record the extra round. Planning runs the same loop at any stage: draft the plan, install or change it (`--init` or `--revise`), one fix-first decomposition review, one controller close-out of what the review left open, and the user's approval gate. A material change re-enters that loop; a narrow revision of execution maps, `read_first`, verification commands, or tighter scope on an approved plan keeps approval and warns.
-- One project has one control plane: `.dag/` at the main worktree root, holding one `.dag/dag.json` at a time. A finished effort is archived before the next one starts.
-- `.dag/dag.json` is only ever written by this skill's runtime scripts, including its creation, and carries an integrity seal that makes any other write a hard failure. Editing it with a file tool bypasses every gate and is never the shortcut it looks like; workers and reviewers do not touch it at all.
+每次 DAG 工作开一个独立 worktree 和分支，所有节点都在这个 worktree 里完成，主工作区保持不动。
 
-## Route
-
-Define `SKILL_ROOT` as the directory containing this top-level `SKILL.md`. This is a documentation placeholder resolved by the execution agent from that top-level path; the host does not automatically inject an environment variable with this name. Nested modules inherit this top-level root and must not treat their own directory as the root.
-
-Treat `${SKILL_ROOT}` as this skill's root. Quote it in every command.
-
-Use planning when the user asks to turn a PRD, roadmap, issue, checklist, existing plan, large refactor, or multi-step request into a plan or DAG, or when no `.dag/dag.json` exists. Read:
-
-```text
-${SKILL_ROOT}/skills/dag-planning/SKILL.md
+```bash
+git worktree add "../<repo>-<plan-id>" -b "dag/<plan-id>"
 ```
 
-When no DAG existed at the start of the turn, that turn is planning-only unless the request points to a durable plan approved before this turn. “Start,” “do it,” and “execute” cannot approve a DAG the user has not seen. If planning creates `awaiting_approval` and the user has not approved this decomposition, present it and stop: do not load execution, record approval, dispatch, or edit project files.
+`<plan-id>` 用简短的 kebab-case 描述本次工作。记下起点提交（`git rev-parse HEAD`），最终审查以它为基准。
 
-Recording approval is a planning action. Once `approval_ref` is recorded, a user who also asked to execute may continue into execution in the same session; the runtime warns that independent execution is weaker. Do not wait for a new session.
+如果 `.dag/` 下已有未完成的 plan，先读它并按其中的状态继续，不要重新拆分。
 
-Use execution when `.dag/dag.json` exists, `planning_status` is `approved`, and the user explicitly asks to run, execute, continue, resume, or finish the remaining work. Explicitly read:
+## 2. 拆分
 
-```text
-${SKILL_ROOT}/skills/dag-execution/SKILL.md
+先做有针对性的代码阅读，找到相关模块、接口、测试和集成点，不做全仓库调查。对会改变目标、范围或验收标准的歧义，先问用户；其余不确定项写进 plan 的“假设”一节。
+
+拆分规则：
+
+- **节点粒度**：一个节点是能单独测试、单独验收的最小交付。配置、脚手架、文档并入需要它们的节点；只在“验收时可能一个通过、另一个不通过”的地方切开。不要为一次重命名、一次测试运行单独建节点。
+- **依赖**：节点 B 要用到 A 产出的接口、数据结构、决定或已验证的行为，或者 A 失败会让 B 的工作作废，就写 B 依赖 A。文件不同不代表没有依赖。不要为了控制执行顺序编造依赖。
+- **冲突**：两个节点没有依赖但会改同一文件、锁文件、迁移序列或共享资源时，标为冲突，不能同时执行。
+- **不确定项**：接口位置或技术方案还不确定时，先建一个调查节点，产出结论，下游节点依赖它。
+
+每个节点写清楚：
+
+- 目标：一句话。
+- 改动范围：允许修改的文件或目录。
+- 执行步骤：几条有序步骤，每条写“文件:符号 — 具体动作”。
+- 验收标准：可观察的行为或产物，不能只是“实现了 X”。
+- 验证命令：能直接运行的真实命令。
+
+来源材料已经确定的值、条件、边界，直接写进节点，不要让子代理重新推导。
+
+避免这些写法：
+
+- “酌情实现”“处理边界情况”这类不可执行的描述；
+- 验收标准只复述实现动作，如“实现了 X”；
+- 行为类验收只靠文件存在、能导入或关键词搜索来证明；
+- 节点第一步就要做大范围架构调查。
+
+拆完后做覆盖检查：每条需求和每条全局验收标准都要对应到至少一个节点和一条验证方式，节点之间的集成也要有节点负责。节点列表看起来完整不等于需求都被覆盖。
+
+## 3. 保存 plan
+
+写到**主工作区**的 `.dag/<plan-id>.md`，不放进 worktree，避免被提交。若 `.dag/` 未被忽略，把它加到 `.git/info/exclude`。
+
+```markdown
+# <plan-id>
+
+- 目标：
+- 全局验收标准：
+- 非目标：
+- 假设：
+- worktree：<路径>  分支：dag/<plan-id>  起点：<sha>
+
+## 节点
+
+### N1 <标题>
+- 依赖：无
+- 冲突：无
+- 范围：
+- 步骤：
+- 验收：
+- 验证：
+- 状态：pending
+
+## 执行记录
+- N1：<commit sha> <一句话结果>
 ```
 
-If a DAG exists but the request does not clearly ask to execute it, inspect or explain its state without dispatching workers. Invoking this skill never by itself authorizes broad parallel execution.
+状态取值：`pending` / `running` / `done` / `blocked`。之后每次状态变化都由主代理更新这个文件，它是跨会话继续工作的依据。
 
-The nested `SKILL.md` files are modules loaded by this router. Do not rely on nested Skill discovery or invent separate `/dag-planning` or `/dag-execution` commands.
+保存后向用户简要展示节点、依赖和并行批次，然后继续执行；如果用户只要求出计划，就在这里停下。
+
+## 4. 按 DAG 派发
+
+依赖全部 `done` 的节点即为可执行节点。可执行节点之间不冲突且改动范围不重叠时，在同一条消息里并行派发；否则串行。
+
+给子代理的指令只包含：worktree 路径、该节点在 plan 中的完整内容、必须遵守的项目约束，以及以下要求：
+
+> 在给定 worktree 内工作，只修改“范围”内的文件，按“步骤”实现，运行“验证”命令。不要 commit，不要派发其他子代理。实际情况与节点描述冲突、或需要改动范围外的文件时，停下并说明原因。结束时汇报：状态（DONE / DONE_WITH_CONCERNS / BLOCKED）、改动文件、验证命令及结果、遗留问题。
+
+不要把整个 plan、聊天记录或其他节点的细节发给子代理。
+
+## 5. 逐节点验收并 commit
+
+子代理返回后，主代理自己检查，不直接采信子代理的汇报：
+
+1. `git -C <worktree> status` 和 `git diff`：改动是否都在范围内。
+2. 自己运行该节点的验证命令。
+3. 对照验收标准逐条核对 diff，至少实际验证一条行为。
+
+小问题由主代理直接修复；问题较大时，带上具体问题描述重新派发一次。节点描述本身有错时，先改 plan 再重派。
+
+验收通过后只暂存该节点的文件并提交，然后更新 plan 的状态和执行记录：
+
+```bash
+git -C <worktree> add <该节点改动的文件>
+git -C <worktree> commit -m "<plan-id>/<节点>: <摘要>"
+```
+
+并行批次中的多个节点逐个验收、逐个提交。`BLOCKED` 的节点标为 `blocked` 并记录原因；依赖它的节点不派发。
+
+## 6. 整体审查修复
+
+所有节点完成后，派一个子代理审查整个 worktree：
+
+> 在 <worktree> 中审查 `<起点sha>..HEAD` 的全部改动，对照 plan 的目标和全局验收标准检查：正确性缺陷、节点之间的集成问题、遗漏的需求、测试是否真的覆盖了声称的行为、遗留的调试代码。发现问题直接修复并运行相关测试，不要 commit。结束时列出每个问题、修复方式，以及未能修复或需要决定的事项。
+
+## 7. 最终验收并报告
+
+主代理检查审查子代理的修改，运行完整的相关测试，逐条核对全局验收标准。通过后提交审查修复，在 plan 中标记完成。
+
+最终报告包括：完成的节点和对应提交、审查发现和修复、验证结果、未完成或有风险的事项、worktree 路径和分支。合并到主分支和删除 worktree 只在用户要求时进行。

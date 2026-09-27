@@ -14,7 +14,7 @@ It is intentionally not for small single-session changes, quick fixes, isolated 
 2. Decompose the work into nodes with explicit dependencies, conflicts, scope, steps, acceptance, and verification.
 3. Save the plan as Markdown under `.dag/` in the main worktree.
 4. Dispatch ready nodes to subagents, in parallel when they are independent.
-5. The main agent verifies each node and commits it.
+5. Each subagent commits its node; the main agent reviews the commit diff and fixes problems itself in a follow-up commit.
 6. One subagent reviews and fixes the whole worktree diff.
 7. The main agent performs final acceptance and reports.
 

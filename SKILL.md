@@ -1,6 +1,6 @@
 ---
 name: dag-engineering
-description: "Use only for large, multi-step code engineering: turning a PRD, roadmap, or big refactor into a DAG of subtasks executed in parallel by subagents in isolated git worktrees, or continuing a plan saved under .dag/. NOT for small or single-session tasks, quick fixes, single-file changes, non-code work, or any request a couple of tool calls can finish — handle those directly without this skill."
+description: "Use for large software engineering work that needs dependency-aware planning and coordinated subagents: implementing a PRD or roadmap, multi-module features, substantial refactors or migrations, or resuming a plan saved under .dag/. Investigates the relevant code, decomposes the work into independently verifiable DAG tasks, runs independent tasks in parallel in isolated git worktrees, and continuously integrates and verifies the results. Also use when only a plan of this scope is requested. Do not use for small or self-contained changes (quick fixes, routine or single-file edits, anything a few tool calls can finish) or non-code tasks."
 ---
 
 # DAG Engineering
